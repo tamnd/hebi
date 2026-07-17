@@ -82,6 +82,57 @@ if __name__ == "__main__":
 	}
 }
 
+func TestModuleMaskAndUnary(t *testing.T) {
+	t.Parallel()
+	// func main() { fmt.Println(_u8(-(a))) } exercises both new nodes and the
+	// shim routing for the mask helper.
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{&ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{
+				&ir.Mask{Bits: 8, Signed: false, X: &ir.UnaryExpr{Op: "-", X: &ir.Ident{Name: "a"}}},
+			}}}},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    _hebirt.println(_hebirt._u8((-a)))
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func TestMaskHelper(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		bits   int
+		signed bool
+		want   string
+	}{
+		{8, false, "_u8"},
+		{16, true, "_i16"},
+		{32, false, "_u32"},
+		{64, true, "_i64"},
+	}
+	for _, tt := range tests {
+		if got := maskHelper(tt.bits, tt.signed); got != tt.want {
+			t.Errorf("maskHelper(%d, %v) = %q, want %q", tt.bits, tt.signed, got, tt.want)
+		}
+	}
+}
+
 func TestModuleDeterministic(t *testing.T) {
 	t.Parallel()
 	first, err := Module(hello())

@@ -82,6 +82,23 @@ type BinaryExpr struct {
 	X, Y Expr
 }
 
+// UnaryExpr is a unary operation. Op is the Go operator text, such as - for
+// negation.
+type UnaryExpr struct {
+	Op string
+	X  Expr
+}
+
+// Mask wraps an expression in a fixed-width integer helper, so a growing
+// operation on a sized Go integer wraps two's-complement the way Go does. Bits
+// is the width (8, 16, 32, or 64) and Signed picks the signed or unsigned
+// helper.
+type Mask struct {
+	Bits   int
+	Signed bool
+	X      Expr
+}
+
 // CallExpr is a call to a named function within the module.
 type CallExpr struct {
 	Name string
@@ -101,5 +118,7 @@ func (*StringLit) isExpr()  {}
 func (*BoolLit) isExpr()    {}
 func (*Ident) isExpr()      {}
 func (*BinaryExpr) isExpr() {}
+func (*UnaryExpr) isExpr()  {}
+func (*Mask) isExpr()       {}
 func (*CallExpr) isExpr()   {}
 func (*Intrinsic) isExpr()  {}

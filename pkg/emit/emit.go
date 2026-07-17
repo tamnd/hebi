@@ -36,6 +36,23 @@ var binOps = map[string]string{
 	"||": "or",
 }
 
+// unaryOps maps the Go unary operator text to its Python spelling. Negation and
+// the no-op unary plus are shared; the growing case, negation, is masked by the
+// lowering, not here.
+var unaryOps = map[string]string{
+	"-": "-",
+	"+": "+",
+}
+
+// maskHelper names the runtime helper for a width and signedness, matching the
+// definitions in the shim.
+func maskHelper(bits int, signed bool) string {
+	if signed {
+		return fmt.Sprintf("_i%d", bits)
+	}
+	return fmt.Sprintf("_u%d", bits)
+}
+
 // Module lowers a verified IR module to the source of one Python module. It
 // assumes the module has already passed ir.Verify, so structural problems are
 // not re-checked here; it returns an error only for surface the emitter does
@@ -100,10 +117,12 @@ func blockUsesShim(body []ir.Stmt) bool {
 
 func exprUsesShim(e ir.Expr) bool {
 	switch e := e.(type) {
-	case *ir.Intrinsic:
+	case *ir.Intrinsic, *ir.Mask:
 		return true
 	case *ir.BinaryExpr:
 		return exprUsesShim(e.X) || exprUsesShim(e.Y)
+	case *ir.UnaryExpr:
+		return exprUsesShim(e.X)
 	case *ir.CallExpr:
 		return argsUseShim(e.Args)
 	}
@@ -218,6 +237,22 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("(%s %s %s)", x, op, y), nil
+	case *ir.UnaryExpr:
+		op, ok := unaryOps[e.Op]
+		if !ok {
+			return "", fmt.Errorf("emit: unsupported unary operator %q", e.Op)
+		}
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("(%s%s)", op, x), nil
+	case *ir.Mask:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.%s(%s)", shim.Name, maskHelper(e.Bits, e.Signed), x), nil
 	case *ir.CallExpr:
 		args, err := emitArgs(e.Args)
 		if err != nil {

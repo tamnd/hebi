@@ -24,3 +24,46 @@ def go_str(value):
 def println(*args):
     """Match fmt.Println: operands joined by single spaces, then a newline."""
     print(" ".join(go_str(a) for a in args))
+
+
+# Fixed-width integer helpers. Go integers wrap two's-complement at their
+# declared width and Python integers do not, so the emitter wraps every growing
+# operation on a sized integer in the matching helper. The unsigned helper
+# masks; the signed helper masks then sign-extends by subtracting 2**N when the
+# top bit is set.
+
+
+def _u8(v):
+    return v & 0xFF
+
+
+def _u16(v):
+    return v & 0xFFFF
+
+
+def _u32(v):
+    return v & 0xFFFFFFFF
+
+
+def _u64(v):
+    return v & 0xFFFFFFFFFFFFFFFF
+
+
+def _i8(v):
+    v &= 0xFF
+    return v - 0x100 if v >= 0x80 else v
+
+
+def _i16(v):
+    v &= 0xFFFF
+    return v - 0x10000 if v >= 0x8000 else v
+
+
+def _i32(v):
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
+def _i64(v):
+    v &= 0xFFFFFFFFFFFFFFFF
+    return v - 0x10000000000000000 if v >= 0x8000000000000000 else v

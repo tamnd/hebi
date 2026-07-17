@@ -12,7 +12,7 @@ import (
 )
 
 // lower walks a loaded, type-checked package and builds the IR module the
-// emitter consumes. It covers the M0 hello-scale subset and returns a positioned
+// emitter consumes. It covers the supported subset and returns a positioned
 // error for any surface it does not yet handle, so an unsupported construct
 // fails loudly rather than emitting something wrong.
 func lower(pkg *frontend.Package) (*ir.Module, error) {
@@ -22,8 +22,8 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 		for _, decl := range file.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
 			if !ok {
-				// Imports and other declarations carry no runtime behavior at
-				// M0 and are skipped; the type checker already read them.
+				// Imports and package-level declarations carry no function body
+				// to lower here; the type checker already read them.
 				continue
 			}
 			fn, err := l.lowerFunc(fd)
@@ -74,13 +74,18 @@ func (l *lowerer) lowerBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, lowered)
+		out = append(out, lowered...)
 	}
 	return out, nil
 }
 
-func (l *lowerer) lowerStmt(s ast.Stmt) (ir.Stmt, error) {
+// lowerStmt returns the statements a single Go statement lowers to. Most Go
+// statements are one IR statement, but a var declaration of several names is
+// several, so the return is a slice.
+func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 	switch s := s.(type) {
+	case *ast.DeclStmt:
+		return l.lowerDecl(s)
 	case *ast.AssignStmt:
 		return l.lowerAssign(s)
 	case *ast.IfStmt:
@@ -92,13 +97,64 @@ func (l *lowerer) lowerStmt(s ast.Stmt) (ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ir.ExprStmt{X: x}, nil
+		return []ir.Stmt{&ir.ExprStmt{X: x}}, nil
 	default:
 		return nil, l.errf(s.Pos(), "statement %T is not supported yet", s)
 	}
 }
 
-func (l *lowerer) lowerAssign(s *ast.AssignStmt) (ir.Stmt, error) {
+func (l *lowerer) lowerDecl(s *ast.DeclStmt) ([]ir.Stmt, error) {
+	gen, ok := s.Decl.(*ast.GenDecl)
+	if !ok || gen.Tok != token.VAR {
+		return nil, l.errf(s.Pos(), "declaration is not supported yet")
+	}
+	var out []ir.Stmt
+	for _, spec := range gen.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			return nil, l.errf(spec.Pos(), "declaration spec %T is not supported yet", spec)
+		}
+		if len(vs.Values) == 0 {
+			for _, name := range vs.Names {
+				zero, err := l.zeroValue(name)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, &ir.AssignStmt{Name: name.Name, Value: zero, Define: true})
+			}
+			continue
+		}
+		if len(vs.Names) != len(vs.Values) {
+			return nil, l.errf(vs.Pos(), "multiple assignment is not supported yet")
+		}
+		for i, name := range vs.Names {
+			value, err := l.lowerExpr(vs.Values[i])
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, &ir.AssignStmt{Name: name.Name, Value: value, Define: true})
+		}
+	}
+	return out, nil
+}
+
+// zeroValue produces the Go zero value for a declared name's type.
+func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
+	basic, ok := l.pkg.Info.TypeOf(name).Underlying().(*types.Basic)
+	if ok {
+		switch info := basic.Info(); {
+		case info&types.IsInteger != 0:
+			return &ir.IntLit{Text: "0"}, nil
+		case info&types.IsBoolean != 0:
+			return &ir.BoolLit{Value: false}, nil
+		case info&types.IsString != 0:
+			return &ir.StringLit{Value: ""}, nil
+		}
+	}
+	return nil, l.errf(name.Pos(), "zero value of %s is not supported yet", l.pkg.Info.TypeOf(name))
+}
+
+func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN {
 		return nil, l.errf(s.Pos(), "compound assignment %s is not supported yet", s.Tok)
 	}
@@ -113,10 +169,10 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) (ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ir.AssignStmt{Name: name.Name, Value: value, Define: s.Tok == token.DEFINE}, nil
+	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value, Define: s.Tok == token.DEFINE}}, nil
 }
 
-func (l *lowerer) lowerIf(s *ast.IfStmt) (ir.Stmt, error) {
+func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
 	if s.Init != nil {
 		return nil, l.errf(s.Pos(), "if with an init statement is not supported yet")
 	}
@@ -139,20 +195,20 @@ func (l *lowerer) lowerIf(s *ast.IfStmt) (ir.Stmt, error) {
 		}
 		out.Else = els
 	case *ast.IfStmt:
-		// An else-if chain: lower the nested if as the single statement of the
+		// An else-if chain: the nested if becomes the single statement of the
 		// else block, which reads the same in Python.
 		nested, err := l.lowerIf(e)
 		if err != nil {
 			return nil, err
 		}
-		out.Else = []ir.Stmt{nested}
+		out.Else = nested
 	default:
 		return nil, l.errf(s.Else.Pos(), "else branch %T is not supported yet", s.Else)
 	}
-	return out, nil
+	return []ir.Stmt{out}, nil
 }
 
-func (l *lowerer) lowerFor(s *ast.ForStmt) (ir.Stmt, error) {
+func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
 	if s.Init != nil || s.Post != nil {
 		return nil, l.errf(s.Pos(), "for with an init or post statement is not supported yet")
 	}
@@ -168,7 +224,7 @@ func (l *lowerer) lowerFor(s *ast.ForStmt) (ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ir.ForStmt{Cond: cond, Body: body}, nil
+	return []ir.Stmt{&ir.ForStmt{Cond: cond, Body: body}}, nil
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
@@ -186,21 +242,64 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		default:
 			return &ir.Ident{Name: e.Name}, nil
 		}
+	case *ast.UnaryExpr:
+		return l.lowerUnary(e)
 	case *ast.BinaryExpr:
-		x, err := l.lowerExpr(e.X)
-		if err != nil {
-			return nil, err
-		}
-		y, err := l.lowerExpr(e.Y)
-		if err != nil {
-			return nil, err
-		}
-		return &ir.BinaryExpr{Op: e.Op.String(), X: x, Y: y}, nil
+		return l.lowerBinary(e)
 	case *ast.CallExpr:
 		return l.lowerCall(e)
 	default:
 		return nil, l.errf(e.Pos(), "expression %T is not supported yet", e)
 	}
+}
+
+func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
+	x, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	y, err := l.lowerExpr(e.Y)
+	if err != nil {
+		return nil, err
+	}
+	inner := &ir.BinaryExpr{Op: e.Op.String(), X: x, Y: y}
+	return l.wrapGrowing(e, e.Op, inner), nil
+}
+
+func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
+	switch e.Op {
+	case token.ADD, token.SUB:
+		x, err := l.lowerExpr(e.X)
+		if err != nil {
+			return nil, err
+		}
+		inner := &ir.UnaryExpr{Op: e.Op.String(), X: x}
+		// Negation can grow, MinInt has no positive counterpart, so it masks;
+		// unary plus is a no-op and never does.
+		return l.wrapGrowing(e, e.Op, inner), nil
+	default:
+		return nil, l.errf(e.Pos(), "unary %s is not supported yet", e.Op)
+	}
+}
+
+// wrapGrowing wraps inner in the width mask for e's result type when the
+// operator can grow the value past the type's range. Constant expressions are
+// exact and already in range, so they are never masked, which keeps ordinary
+// constant arithmetic readable.
+func (l *lowerer) wrapGrowing(e ast.Expr, op token.Token, inner ir.Expr) ir.Expr {
+	switch op {
+	case token.ADD, token.SUB, token.MUL:
+	default:
+		return inner
+	}
+	if tv := l.pkg.Info.Types[e]; tv.Value != nil {
+		return inner
+	}
+	bits, signed, ok := intWidth(l.pkg.Info.TypeOf(e))
+	if !ok {
+		return inner
+	}
+	return &ir.Mask{Bits: bits, Signed: signed, X: inner}
 }
 
 func (l *lowerer) lowerBasicLit(e *ast.BasicLit) (ir.Expr, error) {
@@ -219,6 +318,9 @@ func (l *lowerer) lowerBasicLit(e *ast.BasicLit) (ir.Expr, error) {
 }
 
 func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
+	if l.isConversion(e) {
+		return l.lowerConversion(e)
+	}
 	args, err := l.lowerArgs(e.Args)
 	if err != nil {
 		return nil, err
@@ -234,6 +336,35 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 	default:
 		return nil, l.errf(e.Pos(), "call target %T is not supported yet", e.Fun)
 	}
+}
+
+// isConversion reports whether a call is a type conversion T(x) rather than a
+// function call, read off the type information.
+func (l *lowerer) isConversion(e *ast.CallExpr) bool {
+	tv, ok := l.pkg.Info.Types[e.Fun]
+	return ok && tv.IsType()
+}
+
+// lowerConversion lowers a T(x) conversion. A conversion to a fixed-width
+// integer is exactly the destination's mask helper, except when the whole
+// conversion is a constant, which the type checker has already proven in range.
+func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
+	if len(e.Args) != 1 {
+		return nil, l.errf(e.Pos(), "conversion takes one argument")
+	}
+	dest := l.pkg.Info.TypeOf(e.Fun)
+	bits, signed, ok := intWidth(dest)
+	if !ok {
+		return nil, l.errf(e.Pos(), "conversion to %s is not supported yet", dest)
+	}
+	x, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if tv := l.pkg.Info.Types[e]; tv.Value != nil {
+		return x, nil
+	}
+	return &ir.Mask{Bits: bits, Signed: signed, X: x}, nil
 }
 
 // isFmtPrintln reports whether a selector is fmt.Println, checked through the
@@ -264,6 +395,36 @@ func (l *lowerer) lowerArgs(exprs []ast.Expr) ([]ir.Expr, error) {
 		out[i] = lowered
 	}
 	return out, nil
+}
+
+// intWidth returns the width in bits and signedness of a fixed-width integer
+// type, and whether the type is one. int and uint are 64-bit by hebi's target
+// contract, so output is deterministic across a 32-bit and 64-bit host.
+func intWidth(t types.Type) (bits int, signed bool, ok bool) {
+	basic, isBasic := t.Underlying().(*types.Basic)
+	if !isBasic {
+		return 0, false, false
+	}
+	switch basic.Kind() {
+	case types.Int8:
+		return 8, true, true
+	case types.Int16:
+		return 16, true, true
+	case types.Int32:
+		return 32, true, true
+	case types.Int, types.Int64:
+		return 64, true, true
+	case types.Uint8:
+		return 8, false, true
+	case types.Uint16:
+		return 16, false, true
+	case types.Uint32:
+		return 32, false, true
+	case types.Uint, types.Uint64, types.Uintptr:
+		return 64, false, true
+	default:
+		return 0, false, false
+	}
 }
 
 func exprName(e ast.Expr) string {
