@@ -70,6 +70,16 @@ type ForRange struct {
 	Body  []Stmt
 }
 
+// Break leaves the innermost enclosing loop, matching Go's unlabeled break; it
+// carries nothing because the target is always that innermost loop.
+type Break struct{}
+
+// Continue advances the innermost enclosing loop to its next iteration, matching
+// Go's unlabeled continue. When the loop is a while form with a step at the
+// bottom of its body, the lowering runs that step before the continue, so the
+// loop still advances the way Go's for does.
+type Continue struct{}
+
 // RangeString is a range over a string, which iterates runes and yields the
 // byte index of each rune's start and the decoded rune, matching Go's for range
 // over a string. Key is the byte-index variable and Value is the rune variable,
@@ -91,6 +101,8 @@ func (*AssignStmt) isStmt()  {}
 func (*IfStmt) isStmt()      {}
 func (*ForStmt) isStmt()     {}
 func (*ForRange) isStmt()    {}
+func (*Break) isStmt()       {}
+func (*Continue) isStmt()    {}
 func (*RangeString) isStmt() {}
 
 // Expr is an expression node.

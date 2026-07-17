@@ -183,7 +183,7 @@ func TestVerifyStringSurface(t *testing.T) {
 func TestVerifyForRange(t *testing.T) {
 	t.Parallel()
 	good := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
-		&ForRange{Var: "i", Stop: &Ident{Name: "n"}, Body: nil},
+		&ForRange{Var: "i", Stop: &Ident{Name: "n"}, Body: []Stmt{&Break{}, &Continue{}}},
 		&ForRange{Var: "j", Start: &IntLit{Text: "1"}, Stop: &IntLit{Text: "9"}, Step: &IntLit{Text: "2"}, Body: nil},
 	}}}}
 	if err := Verify(good); err != nil {

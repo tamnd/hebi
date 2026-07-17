@@ -226,6 +226,12 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		if err := emitForRange(b, s, depth); err != nil {
 			return err
 		}
+	case *ir.Break:
+		writeIndent(b, depth)
+		b.WriteString("break\n")
+	case *ir.Continue:
+		writeIndent(b, depth)
+		b.WriteString("continue\n")
 	case *ir.RangeString:
 		if err := emitRangeString(b, s, depth); err != nil {
 			return err
