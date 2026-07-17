@@ -66,6 +66,12 @@ type Expr interface{ isExpr() }
 // precision is lost before the emitter decides how to render it.
 type IntLit struct{ Text string }
 
+// FloatLit is a floating-point literal carried as its exact source text, such
+// as 0.1 or 1e10, which is already valid Python. A float32 literal is wrapped
+// by the lowering in the single-precision helper, since Python's float is
+// always 64-bit.
+type FloatLit struct{ Text string }
+
 // StringLit is a string literal carried as its decoded Go value, not the quoted
 // source.
 type StringLit struct{ Value string }
@@ -99,6 +105,16 @@ type Mask struct {
 	X      Expr
 }
 
+// Convert wraps an expression in a Python builtin conversion, int or float,
+// which is how a Go conversion between the number kinds lowers: int(x)
+// truncates a float toward zero, float(x) widens an integer. The integer width
+// mask, when the destination is a sized integer, is a separate Mask node around
+// this one.
+type Convert struct {
+	To string
+	X  Expr
+}
+
 // CallExpr is a call to a named function within the module.
 type CallExpr struct {
 	Name string
@@ -114,11 +130,13 @@ type Intrinsic struct {
 }
 
 func (*IntLit) isExpr()     {}
+func (*FloatLit) isExpr()   {}
 func (*StringLit) isExpr()  {}
 func (*BoolLit) isExpr()    {}
 func (*Ident) isExpr()      {}
 func (*BinaryExpr) isExpr() {}
 func (*UnaryExpr) isExpr()  {}
 func (*Mask) isExpr()       {}
+func (*Convert) isExpr()    {}
 func (*CallExpr) isExpr()   {}
 func (*Intrinsic) isExpr()  {}

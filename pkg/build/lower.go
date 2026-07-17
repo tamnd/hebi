@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"strconv"
+	"strings"
 
 	"github.com/tamnd/hebi/pkg/frontend"
 	"github.com/tamnd/hebi/pkg/ir"
@@ -145,6 +146,11 @@ func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
 		switch info := basic.Info(); {
 		case info&types.IsInteger != 0:
 			return &ir.IntLit{Text: "0"}, nil
+		case info&types.IsFloat != 0:
+			if basic.Kind() == types.Float32 {
+				return &ir.Intrinsic{Name: "_f32", Args: []ir.Expr{&ir.FloatLit{Text: "0.0"}}}, nil
+			}
+			return &ir.FloatLit{Text: "0.0"}, nil
 		case info&types.IsBoolean != 0:
 			return &ir.BoolLit{Value: false}, nil
 		case info&types.IsString != 0:
@@ -263,7 +269,7 @@ func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
 		return nil, err
 	}
 	inner := &ir.BinaryExpr{Op: e.Op.String(), X: x, Y: y}
-	return l.wrapGrowing(e, e.Op, inner), nil
+	return l.narrow(e, e.Op, inner), nil
 }
 
 func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
@@ -276,16 +282,19 @@ func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
 		inner := &ir.UnaryExpr{Op: e.Op.String(), X: x}
 		// Negation can grow, MinInt has no positive counterpart, so it masks;
 		// unary plus is a no-op and never does.
-		return l.wrapGrowing(e, e.Op, inner), nil
+		return l.narrow(e, e.Op, inner), nil
 	default:
 		return nil, l.errf(e.Pos(), "unary %s is not supported yet", e.Op)
 	}
 }
 
-// wrapGrowing wraps inner in the width mask for e's result type when the
-// operator can grow the value past the type's range. Constant expressions are
-// exact and already in range, so they are never masked, which keeps ordinary
-// constant arithmetic readable.
+// narrow renarrows inner to e's result type when the carrier is wider than the
+// Go type. A float32 result round-trips through the single-precision helper,
+// since Python's float is always 64-bit; a float64 result passes through
+// because Python's float already is one. An integer result masks when the
+// operator can grow the value past the type's range, and a constant integer is
+// left bare because it is exact and the type checker has proven it in range,
+// which keeps ordinary constant arithmetic readable.
 //
 // Left shift is a growing op and masks like the others: Python computes the
 // full-precision result and the mask truncates it, which also gives Go's
@@ -294,7 +303,12 @@ func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
 // holds its true signed form, which the mask-then-sign-extend discipline
 // guarantees, and an unsigned right shift is logical because the value is a
 // non-negative Python int, so neither needs a helper.
-func (l *lowerer) wrapGrowing(e ast.Expr, op token.Token, inner ir.Expr) ir.Expr {
+func (l *lowerer) narrow(e ast.Expr, op token.Token, inner ir.Expr) ir.Expr {
+	if _, ok := floatWidth(l.pkg.Info.TypeOf(e)); ok {
+		// A float32 result renarrows even when constant, because Go rounds each
+		// step at single precision and Python does not; float64 passes through.
+		return l.float32Wrap(e, inner)
+	}
 	switch op {
 	case token.ADD, token.SUB, token.MUL, token.SHL:
 	default:
@@ -310,10 +324,27 @@ func (l *lowerer) wrapGrowing(e ast.Expr, op token.Token, inner ir.Expr) ir.Expr
 	return &ir.Mask{Bits: bits, Signed: signed, X: inner}
 }
 
+// float32Wrap wraps inner in the single-precision helper when e's type is
+// float32, and leaves it alone otherwise. Every producing float32 operation,
+// including a literal and a conversion, is renarrowed this way.
+func (l *lowerer) float32Wrap(e ast.Expr, inner ir.Expr) ir.Expr {
+	if bits, ok := floatWidth(l.pkg.Info.TypeOf(e)); ok && bits == 32 {
+		return &ir.Intrinsic{Name: "_f32", Args: []ir.Expr{inner}}
+	}
+	return inner
+}
+
 func (l *lowerer) lowerBasicLit(e *ast.BasicLit) (ir.Expr, error) {
 	switch e.Kind {
 	case token.INT:
 		return &ir.IntLit{Text: e.Value}, nil
+	case token.FLOAT:
+		// A decimal float literal is already valid Python; a hexadecimal float
+		// literal is not, and waits on a later slice.
+		if strings.ContainsAny(e.Value, "xX") {
+			return nil, l.errf(e.Pos(), "hexadecimal float literal is not supported yet")
+		}
+		return l.float32Wrap(e, &ir.FloatLit{Text: e.Value}), nil
 	case token.STRING:
 		value, err := strconv.Unquote(e.Value)
 		if err != nil {
@@ -329,21 +360,44 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 	if l.isConversion(e) {
 		return l.lowerConversion(e)
 	}
-	args, err := l.lowerArgs(e.Args)
-	if err != nil {
-		return nil, err
-	}
 	switch fun := e.Fun.(type) {
 	case *ast.SelectorExpr:
 		if l.isFmtPrintln(fun) {
+			args, err := l.lowerPrintlnArgs(e.Args)
+			if err != nil {
+				return nil, err
+			}
 			return &ir.Intrinsic{Name: "println", Args: args}, nil
 		}
 		return nil, l.errf(e.Pos(), "call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
 	case *ast.Ident:
+		args, err := l.lowerArgs(e.Args)
+		if err != nil {
+			return nil, err
+		}
 		return &ir.CallExpr{Name: fun.Name, Args: args}, nil
 	default:
 		return nil, l.errf(e.Pos(), "call target %T is not supported yet", e.Fun)
 	}
+}
+
+// lowerPrintlnArgs lowers the arguments of fmt.Println, wrapping a float32 in
+// the single-precision formatter. A float32 loses its type once it is a Python
+// float, so go_str would otherwise print it with float64's shortest digits;
+// the wrapper prints the digits Go prints for a float32.
+func (l *lowerer) lowerPrintlnArgs(exprs []ast.Expr) ([]ir.Expr, error) {
+	out := make([]ir.Expr, len(exprs))
+	for i, a := range exprs {
+		lowered, err := l.lowerExpr(a)
+		if err != nil {
+			return nil, err
+		}
+		if bits, ok := floatWidth(l.pkg.Info.TypeOf(a)); ok && bits == 32 {
+			lowered = &ir.Intrinsic{Name: "_gofloat32", Args: []ir.Expr{lowered}}
+		}
+		out[i] = lowered
+	}
+	return out, nil
 }
 
 // isConversion reports whether a call is a type conversion T(x) rather than a
@@ -353,26 +407,47 @@ func (l *lowerer) isConversion(e *ast.CallExpr) bool {
 	return ok && tv.IsType()
 }
 
-// lowerConversion lowers a T(x) conversion. A conversion to a fixed-width
-// integer is exactly the destination's mask helper, except when the whole
-// conversion is a constant, which the type checker has already proven in range.
+// lowerConversion lowers a T(x) conversion between the number kinds. A
+// conversion to float32 renarrows to single precision; to float64 it widens,
+// which is exact and needs only a float() when the source is an integer. A
+// conversion to a fixed-width integer is the destination's mask helper, with an
+// int() truncation toward zero first when the source is a float, except when
+// the source is itself an integer and the whole conversion is a constant the
+// type checker has already proven in range.
 func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
 	if len(e.Args) != 1 {
 		return nil, l.errf(e.Pos(), "conversion takes one argument")
 	}
 	dest := l.pkg.Info.TypeOf(e.Fun)
-	bits, signed, ok := intWidth(dest)
-	if !ok {
-		return nil, l.errf(e.Pos(), "conversion to %s is not supported yet", dest)
-	}
 	x, err := l.lowerExpr(e.Args[0])
 	if err != nil {
 		return nil, err
 	}
-	if tv := l.pkg.Info.Types[e]; tv.Value != nil {
-		return x, nil
+	_, srcIsFloat := floatWidth(l.pkg.Info.TypeOf(e.Args[0]))
+
+	if bits, ok := floatWidth(dest); ok {
+		if bits == 32 {
+			return &ir.Intrinsic{Name: "_f32", Args: []ir.Expr{x}}, nil
+		}
+		if srcIsFloat {
+			// float64 from a float is identity: the value already holds a Python
+			// float, and widening from single precision is exact.
+			return x, nil
+		}
+		return &ir.Convert{To: "float", X: x}, nil
 	}
-	return &ir.Mask{Bits: bits, Signed: signed, X: x}, nil
+
+	if bits, signed, ok := intWidth(dest); ok {
+		if srcIsFloat {
+			return &ir.Mask{Bits: bits, Signed: signed, X: &ir.Convert{To: "int", X: x}}, nil
+		}
+		if tv := l.pkg.Info.Types[e]; tv.Value != nil {
+			return x, nil
+		}
+		return &ir.Mask{Bits: bits, Signed: signed, X: x}, nil
+	}
+
+	return nil, l.errf(e.Pos(), "conversion to %s is not supported yet", dest)
 }
 
 // isFmtPrintln reports whether a selector is fmt.Println, checked through the
@@ -432,6 +507,24 @@ func intWidth(t types.Type) (bits int, signed bool, ok bool) {
 		return 64, false, true
 	default:
 		return 0, false, false
+	}
+}
+
+// floatWidth returns the width in bits of a floating-point type, and whether
+// the type is one. An untyped float constant defaults to 64-bit, matching Go's
+// default type for an untyped float.
+func floatWidth(t types.Type) (bits int, ok bool) {
+	basic, isBasic := t.Underlying().(*types.Basic)
+	if !isBasic {
+		return 0, false
+	}
+	switch basic.Kind() {
+	case types.Float32:
+		return 32, true
+	case types.Float64, types.UntypedFloat:
+		return 64, true
+	default:
+		return 0, false
 	}
 }
 

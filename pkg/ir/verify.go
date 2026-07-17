@@ -80,6 +80,10 @@ func verifyExpr(where string, e Expr) error {
 		if e.Text == "" {
 			return fmt.Errorf("ir: %s is an integer literal with no text", where)
 		}
+	case *FloatLit:
+		if e.Text == "" {
+			return fmt.Errorf("ir: %s is a float literal with no text", where)
+		}
 	case *StringLit:
 		// Any string value is valid, including the empty string.
 	case *BoolLit:
@@ -108,6 +112,13 @@ func verifyExpr(where string, e Expr) error {
 			return fmt.Errorf("ir: %s masks to an invalid width %d", where, e.Bits)
 		}
 		return verifyExpr(where+": masked", e.X)
+	case *Convert:
+		switch e.To {
+		case "int", "float":
+		default:
+			return fmt.Errorf("ir: %s converts with an unknown builtin %q", where, e.To)
+		}
+		return verifyExpr(where+": converted", e.X)
 	case *CallExpr:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s calls an empty name", where)

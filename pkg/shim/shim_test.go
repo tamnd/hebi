@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -44,6 +44,38 @@ func TestWidthHelpers(t *testing.T) {
 	want := "44 -56 4294967295 -1 18446744073709551615 -9223372036854775808\n"
 	if got := string(out); got != want {
 		t.Errorf("helper output = %q, want %q", got, want)
+	}
+}
+
+// TestFloatHelpers runs the float helpers under CPython and pins Go's float
+// formatting: the shortest form, the exponent-notation threshold that differs
+// from Python's, the integer-valued float that drops its point, the special
+// values, and the single-precision narrowing and its shortest form.
+func TestFloatHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"print(r._gofloat(3.14), r._gofloat(3.0), r._gofloat(1000000.0), r._gofloat(1e-5), r._gofloat(-2.5))\n" +
+		"print(r._gofloat(float('nan')), r._gofloat(float('inf')), r._gofloat(float('-inf')))\n" +
+		"print(r._gofloat32(r._f32(0.1)), r._gofloat32(r._f32(r._f32(0.1) + r._f32(0.2))))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run float helpers: %v\n%s", err, out)
+	}
+	want := "3.14 3 1e+06 1e-05 -2.5\n" +
+		"NaN +Inf -Inf\n" +
+		"0.1 0.3\n"
+	if got := string(out); got != want {
+		t.Errorf("float helper output = %q, want %q", got, want)
 	}
 }
 
