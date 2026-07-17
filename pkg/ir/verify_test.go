@@ -183,6 +183,92 @@ func TestVerifyStringSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyStructSurface accepts a well-formed struct definition alongside the
+// nodes that use it, the field access, the constructor call, the clone, and the
+// field assignment, and rejects a struct with no name, a duplicate struct, a
+// scalar field with a nil zero, a value-struct field with no type, a keyed
+// literal field with no name, and the nil operands of the new nodes.
+func TestVerifyStructSurface(t *testing.T) {
+	t.Parallel()
+	good := &Module{
+		Package: "main",
+		Structs: []*StructDef{
+			{Name: "Inner", Fields: []StructField{{Name: "N", Kind: FieldScalar, Zero: &IntLit{Text: "0"}}}},
+			{Name: "Outer", Fields: []StructField{
+				{Name: "V", Kind: FieldStruct, Struct: "Inner"},
+				{Name: "K", Kind: FieldScalar, Zero: &IntLit{Text: "0"}},
+			}},
+		},
+		Funcs: []*Func{{Name: "main", Body: []Stmt{
+			&AssignStmt{Name: "a", Define: true, Value: &StructLit{Type: "Outer", Keyed: true, Fields: []StructArg{
+				{Name: "K", Value: &IntLit{Text: "2"}},
+			}}},
+			&AssignStmt{Name: "b", Define: true, Value: &Clone{X: &Ident{Name: "a"}}},
+			&SetField{Object: &Ident{Name: "b"}, Name: "K", Value: &IntLit{Text: "9"}},
+			&ExprStmt{X: &FieldAccess{X: &Ident{Name: "a"}, Name: "K"}},
+		}}},
+	}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed struct surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"nil struct", func(m *Module) { m.Structs[0] = nil }, "struct 0 is nil"},
+		{"struct no name", func(m *Module) { m.Structs[0].Name = "" }, "struct 0 has no name"},
+		{"duplicate struct", func(m *Module) { m.Structs[1].Name = "Inner" }, "defined more than once"},
+		{"field no name", func(m *Module) { m.Structs[0].Fields[0].Name = "" }, "field 0 has no name"},
+		{"scalar nil zero", func(m *Module) { m.Structs[0].Fields[0].Zero = nil }, "nil expression"},
+		{"struct field no type", func(m *Module) { m.Structs[1].Fields[0].Struct = "" }, "struct field with no type"},
+		{"keyed field no name", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*StructLit).Fields[0].Name = ""
+		}, "keyed field 0 has no name"},
+		{"struct lit no type", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*StructLit).Type = ""
+		}, "struct with no type"},
+		{"nil clone operand", func(m *Module) { m.Funcs[0].Body[1].(*AssignStmt).Value.(*Clone).X = nil }, "nil expression"},
+		{"set field no name", func(m *Module) { m.Funcs[0].Body[2].(*SetField).Name = "" }, "empty field name"},
+		{"nil set field object", func(m *Module) { m.Funcs[0].Body[2].(*SetField).Object = nil }, "nil expression"},
+		{"field access no name", func(m *Module) {
+			m.Funcs[0].Body[3].(*ExprStmt).X.(*FieldAccess).Name = ""
+		}, "reads a field with no name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// Rebuild from scratch so parallel subtests do not share mutations.
+			m := &Module{
+				Package: "main",
+				Structs: []*StructDef{
+					{Name: "Inner", Fields: []StructField{{Name: "N", Kind: FieldScalar, Zero: &IntLit{Text: "0"}}}},
+					{Name: "Outer", Fields: []StructField{
+						{Name: "V", Kind: FieldStruct, Struct: "Inner"},
+						{Name: "K", Kind: FieldScalar, Zero: &IntLit{Text: "0"}},
+					}},
+				},
+				Funcs: []*Func{{Name: "main", Body: []Stmt{
+					&AssignStmt{Name: "a", Define: true, Value: &StructLit{Type: "Outer", Keyed: true, Fields: []StructArg{
+						{Name: "K", Value: &IntLit{Text: "2"}},
+					}}},
+					&AssignStmt{Name: "b", Define: true, Value: &Clone{X: &Ident{Name: "a"}}},
+					&SetField{Object: &Ident{Name: "b"}, Name: "K", Value: &IntLit{Text: "9"}},
+					&ExprStmt{X: &FieldAccess{X: &Ident{Name: "a"}, Name: "K"}},
+				}}},
+			}
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.

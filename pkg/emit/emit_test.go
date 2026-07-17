@@ -82,6 +82,78 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleStruct covers the class a struct lowers to and the new nodes that
+// use it: the __slots__ tuple with the single-field trailing comma, a scalar
+// field defaulting to its zero and a value-struct field defaulting to None with
+// the sentinel guard, the copy that recurses only into the value-struct field,
+// and the field read, field assignment, constructor call, and clone in main. The
+// module never touches an intrinsic, so it must not import the runtime.
+func TestModuleStruct(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Structs: []*ir.StructDef{
+			{Name: "Inner", Fields: []ir.StructField{
+				{Name: "N", Kind: ir.FieldScalar, Zero: &ir.IntLit{Text: "0"}},
+			}},
+			{Name: "Outer", Fields: []ir.StructField{
+				{Name: "V", Kind: ir.FieldStruct, Struct: "Inner"},
+				{Name: "K", Kind: ir.FieldScalar, Zero: &ir.IntLit{Text: "0"}},
+			}},
+		},
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "a", Define: true, Value: &ir.StructLit{Type: "Outer", Keyed: true, Fields: []ir.StructArg{
+					{Name: "V", Value: &ir.StructLit{Type: "Inner", Fields: []ir.StructArg{{Value: &ir.IntLit{Text: "1"}}}}},
+					{Name: "K", Value: &ir.IntLit{Text: "2"}},
+				}}},
+				&ir.AssignStmt{Name: "b", Define: true, Value: &ir.Clone{X: &ir.Ident{Name: "a"}}},
+				&ir.SetField{Object: &ir.Ident{Name: "b"}, Name: "K", Value: &ir.IntLit{Text: "9"}},
+				&ir.ExprStmt{X: &ir.FieldAccess{X: &ir.Ident{Name: "a"}, Name: "K"}},
+			},
+		}},
+	}
+	want := `class Inner:
+    __slots__ = ("N",)
+
+    def __init__(self, N=0):
+        self.N = N
+
+    def copy(self):
+        return Inner(self.N)
+
+
+class Outer:
+    __slots__ = ("V", "K")
+
+    def __init__(self, V=None, K=0):
+        self.V = V if V is not None else Inner()
+        self.K = K
+
+    def copy(self):
+        return Outer(self.V.copy(), self.K)
+
+
+def main():
+    a = Outer(V=Inner(1), K=2)
+    b = a.copy()
+    b.K = 9
+    a.K
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestModuleMaskAndUnary(t *testing.T) {
 	t.Parallel()
 	// func main() { fmt.Println(_u8(-(a))) } exercises both new nodes and the

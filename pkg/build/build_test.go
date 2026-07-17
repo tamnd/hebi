@@ -576,6 +576,9 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"non-tail break in switch", "package main\n\nfunc main() {\n\tx := 1\n\tswitch x {\n\tcase 1:\n\t\tbreak\n\t\tprintln(\"after\")\n\t}\n}\n"},
 		{"statement label", "package main\n\nfunc main() {\nDone:\n\tprintln(\"hi\")\n\t_ = 0\n\tgoto Done\n}\n"},
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
+		{"embedded field", "package main\n\ntype Inner struct{ N int }\n\ntype Outer struct {\n\tInner\n\tM int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"},
+		{"pointer field", "package main\n\ntype Node struct {\n\tV int\n\tNext *Node\n}\n\nfunc main() {\n\tvar n Node\n\t_ = n\n}\n"},
+		{"slice field", "package main\n\ntype Bag struct{ Items []int }\n\nfunc main() {\n\tvar b Bag\n\t_ = b\n}\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -586,5 +589,149 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 				t.Fatal("Build accepted unsupported source")
 			}
 		})
+	}
+}
+
+// assertProgramMatchesGo runs a whole Go program through go run as the oracle
+// and through hebi, and requires stdout and exit status to agree. Struct tests
+// need this rather than assertMatchesGo because a struct type is declared at
+// package level, outside the main body assertMatchesGo wraps.
+func assertProgramMatchesGo(t *testing.T, source string) {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go tool not on PATH")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	file := writeModule(t, source)
+
+	goCmd := exec.CommandContext(t.Context(), "go", "run", file)
+	goOut, err := goCmd.Output()
+	if err != nil {
+		t.Fatalf("go run: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	code, err := Run(context.Background(), file, &out, &errb)
+	if err != nil {
+		t.Fatalf("Run: %v (stderr: %s)", err, errb.String())
+	}
+	if code != 0 {
+		t.Fatalf("hebi exit = %d (stderr: %s)", code, errb.String())
+	}
+	if got, want := out.String(), string(goOut); got != want {
+		t.Errorf("hebi output = %q, go run output = %q", got, want)
+	}
+}
+
+// TestStructs checks the struct surface against go run: a struct is a class,
+// construction is a constructor call, field access reads an attribute, and value
+// copy on assignment makes an independent instance so a later field write to one
+// does not touch the other. It covers the positional and keyed literals, the
+// omitted-field zero default, the zero-value var declaration, field assignment,
+// the copy on plain assignment and on var-with-value, a nested value-struct field
+// that copies deeply, and the field read that yields a value and so copies.
+func TestStructs(t *testing.T) {
+	t.Parallel()
+	const point = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\n"
+	const mixed = "package main\n\nimport \"fmt\"\n\ntype Inner struct {\n\tN int\n}\n\ntype Outer struct {\n\tV Inner\n\tK int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"positional literal and field read", point + "func main() {\n\tp := Point{1, 2}\n\tfmt.Println(p.X, p.Y)\n}\n"},
+		{"keyed literal", point + "func main() {\n\tp := Point{X: 3, Y: 4}\n\tfmt.Println(p.X, p.Y)\n}\n"},
+		{"keyed literal omits a field", point + "func main() {\n\tp := Point{X: 7}\n\tfmt.Println(p.X, p.Y)\n}\n"},
+		{"zero value var", point + "func main() {\n\tvar p Point\n\tfmt.Println(p.X, p.Y)\n}\n"},
+		{"field assignment", point + "func main() {\n\tvar p Point\n\tp.X = 5\n\tp.Y = 6\n\tfmt.Println(p.X, p.Y)\n}\n"},
+		{"copy on assignment is independent", point + "func main() {\n\ta := Point{1, 2}\n\tb := a\n\tb.X = 99\n\tfmt.Println(a.X, b.X)\n}\n"},
+		{"copy on var with value", point + "func main() {\n\ta := Point{1, 2}\n\tvar b Point = a\n\tb.Y = 42\n\tfmt.Println(a.Y, b.Y)\n}\n"},
+		{"plain assignment copies", point + "func main() {\n\ta := Point{1, 2}\n\tvar b Point\n\tb = a\n\tb.X = 8\n\tfmt.Println(a.X, b.X)\n}\n"},
+		{"nested value struct copies deeply", mixed + "func main() {\n\ta := Outer{V: Inner{N: 1}, K: 2}\n\tb := a\n\tb.V.N = 9\n\tfmt.Println(a.V.N, b.V.N)\n}\n"},
+		{"field read of value struct copies", mixed + "func main() {\n\to := Outer{V: Inner{N: 3}, K: 4}\n\tinner := o.V\n\tinner.N = 5\n\tfmt.Println(o.V.N, inner.N)\n}\n"},
+		{"literal element copies", mixed + "func main() {\n\ti := Inner{N: 1}\n\to := Outer{V: i, K: 0}\n\ti.N = 8\n\tfmt.Println(o.V.N, i.N)\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestStructsEmit pins the exact Python a struct lowers to: a class with a
+// __slots__ tuple, a zero-value constructor, and a copy method, plus the
+// constructor call, the copy at the value assignment, and the field reads in
+// main.
+func TestStructsEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\ta := Point{1, 2}\n\tb := a\n\tb.X = 99\n\tfmt.Println(a.X, b.X)\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+
+def main():
+    a = Point(1, 2)
+    b = a.copy()
+    b.X = 99
+    ` + shim.Name + `.println(a.X, b.X)
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestStructValueFieldEmit pins the constructor's None-sentinel default and the
+// deep copy for a value-struct field, the shape that keeps a keyed literal from
+// aliasing a shared zero instance and a copy from aliasing the nested value.
+func TestStructValueFieldEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Inner struct {\n\tN int\n}\n\ntype Outer struct {\n\tV Inner\n\tK int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"
+	want := `class Inner:
+    __slots__ = ("N",)
+
+    def __init__(self, N=0):
+        self.N = N
+
+    def copy(self):
+        return Inner(self.N)
+
+
+class Outer:
+    __slots__ = ("V", "K")
+
+    def __init__(self, V=None, K=0):
+        self.V = V if V is not None else Inner()
+        self.K = K
+
+    def copy(self):
+        return Outer(self.V.copy(), self.K)
+
+
+def main():
+    o = Outer()
+    _ = o
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
 	}
 }

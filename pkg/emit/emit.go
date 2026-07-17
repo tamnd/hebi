@@ -73,14 +73,25 @@ func Module(m *ir.Module) (string, error) {
 	if usesShim(m) {
 		fmt.Fprintf(&b, "import %s\n\n\n", shim.Name)
 	}
+	// Structs emit first as classes, in source order, so a function that
+	// constructs one refers to a name already bound.
+	wrote := false
+	for _, sd := range m.Structs {
+		if wrote {
+			b.WriteString("\n\n")
+		}
+		emitStruct(&b, sd)
+		wrote = true
+	}
 	hasMain := false
-	for i, fn := range m.Funcs {
-		if i > 0 {
+	for _, fn := range m.Funcs {
+		if wrote {
 			b.WriteString("\n\n")
 		}
 		if err := emitFunc(&b, fn); err != nil {
 			return "", err
 		}
+		wrote = true
 		if fn.Name == "main" {
 			hasMain = true
 		}
@@ -94,6 +105,13 @@ func Module(m *ir.Module) (string, error) {
 // usesShim reports whether the module contains any intrinsic, which is the only
 // thing that needs the runtime import at M0.
 func usesShim(m *ir.Module) bool {
+	for _, sd := range m.Structs {
+		for _, f := range sd.Fields {
+			if f.Kind == ir.FieldScalar && exprUsesShim(f.Zero) {
+				return true
+			}
+		}
+	}
 	for _, fn := range m.Funcs {
 		if blockUsesShim(fn.Body) {
 			return true
@@ -111,6 +129,10 @@ func blockUsesShim(body []ir.Stmt) bool {
 			}
 		case *ir.AssignStmt:
 			if exprUsesShim(s.Value) {
+				return true
+			}
+		case *ir.SetField:
+			if exprUsesShim(s.Object) || exprUsesShim(s.Value) {
 				return true
 			}
 		case *ir.IfStmt:
@@ -147,6 +169,16 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.X) || exprUsesShim(e.Index)
 	case *ir.CallExpr:
 		return argsUseShim(e.Args)
+	case *ir.FieldAccess:
+		return exprUsesShim(e.X)
+	case *ir.Clone:
+		return exprUsesShim(e.X)
+	case *ir.StructLit:
+		for _, f := range e.Fields {
+			if exprUsesShim(f.Value) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -158,6 +190,72 @@ func argsUseShim(args []ir.Expr) bool {
 func emitFunc(b *strings.Builder, fn *ir.Func) error {
 	fmt.Fprintf(b, "def %s():\n", fn.Name)
 	return emitBlock(b, fn.Body, 1)
+}
+
+// emitStruct writes the Python class a Go struct lowers to: a __slots__ tuple of
+// the field names, a constructor whose defaults are each field's zero value, and
+// a copy method that copies scalar fields by assignment and recurses into
+// value-struct fields. A scalar field defaults to its zero literal and copies by
+// sharing; a value-struct field defaults to None and builds a fresh zero instance
+// in the constructor body, so a keyword literal that omits it still gets an
+// independent value, and copies by calling that field's own copy.
+func emitStruct(b *strings.Builder, sd *ir.StructDef) {
+	fmt.Fprintf(b, "class %s:\n", sd.Name)
+	writeIndent(b, 1)
+	b.WriteString("__slots__ = (")
+	for i, f := range sd.Fields {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%q", f.Name)
+	}
+	if len(sd.Fields) == 1 {
+		// A one-element Python tuple needs a trailing comma to be a tuple.
+		b.WriteString(",")
+	}
+	b.WriteString(")\n\n")
+
+	writeIndent(b, 1)
+	b.WriteString("def __init__(self")
+	for _, f := range sd.Fields {
+		def := "None"
+		if f.Kind == ir.FieldScalar {
+			// A scalar zero always emits without the shim's help, so this cannot
+			// error; a struct field defaults to None and is built in the body.
+			def, _ = emitExpr(f.Zero)
+		}
+		fmt.Fprintf(b, ", %s=%s", f.Name, def)
+	}
+	b.WriteString("):\n")
+	if len(sd.Fields) == 0 {
+		writeIndent(b, 2)
+		b.WriteString("pass\n")
+	}
+	for _, f := range sd.Fields {
+		writeIndent(b, 2)
+		if f.Kind == ir.FieldStruct {
+			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s()\n", f.Name, f.Name, f.Name, f.Struct)
+		} else {
+			fmt.Fprintf(b, "self.%s = %s\n", f.Name, f.Name)
+		}
+	}
+
+	b.WriteString("\n")
+	writeIndent(b, 1)
+	b.WriteString("def copy(self):\n")
+	writeIndent(b, 2)
+	fmt.Fprintf(b, "return %s(", sd.Name)
+	for i, f := range sd.Fields {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if f.Kind == ir.FieldStruct {
+			fmt.Fprintf(b, "self.%s.copy()", f.Name)
+		} else {
+			fmt.Fprintf(b, "self.%s", f.Name)
+		}
+	}
+	b.WriteString(")\n")
 }
 
 // emitBlock writes a suite at the given indentation depth, one tab stop being
@@ -195,6 +293,17 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		}
 		writeIndent(b, depth)
 		fmt.Fprintf(b, "%s = %s\n", s.Name, value)
+	case *ir.SetField:
+		obj, err := emitExpr(s.Object)
+		if err != nil {
+			return err
+		}
+		value, err := emitExpr(s.Value)
+		if err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "%s.%s = %s\n", obj, s.Name, value)
 	case *ir.IfStmt:
 		cond, err := emitExpr(s.Cond)
 		if err != nil {
@@ -425,6 +534,32 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.%s(%s)", shim.Name, e.Name, args), nil
+	case *ir.FieldAccess:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.%s", x, e.Name), nil
+	case *ir.StructLit:
+		parts := make([]string, len(e.Fields))
+		for i, f := range e.Fields {
+			v, err := emitExpr(f.Value)
+			if err != nil {
+				return "", err
+			}
+			if e.Keyed {
+				parts[i] = fmt.Sprintf("%s=%s", f.Name, v)
+			} else {
+				parts[i] = v
+			}
+		}
+		return fmt.Sprintf("%s(%s)", e.Type, strings.Join(parts, ", ")), nil
+	case *ir.Clone:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.copy()", x), nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}

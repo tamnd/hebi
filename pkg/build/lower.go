@@ -20,6 +20,26 @@ import (
 func lower(pkg *frontend.Package) (*ir.Module, error) {
 	l := &lowerer{pkg: pkg}
 	m := &ir.Module{Package: pkg.Name}
+	// Collect struct type declarations first so the emitter has every class
+	// before the functions that construct or read one, and so a value-struct
+	// field can name a sibling struct regardless of source order.
+	for _, file := range pkg.Files {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				sd, err := l.lowerTypeSpec(spec.(*ast.TypeSpec))
+				if err != nil {
+					return nil, err
+				}
+				if sd != nil {
+					m.Structs = append(m.Structs, sd)
+				}
+			}
+		}
+	}
 	for _, file := range pkg.Files {
 		for _, decl := range file.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
@@ -36,6 +56,55 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 		}
 	}
 	return m, nil
+}
+
+// lowerTypeSpec lowers a single type declaration. A struct type becomes an IR
+// StructDef, the class the emitter generates. A defined non-struct type, such as
+// type Celsius float64, needs no class because its values already lower through
+// their underlying type, so it returns nil. Embedded fields and reference-typed
+// fields wait on later slices and fail loudly here.
+func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, error) {
+	obj, ok := l.pkg.Info.Defs[ts.Name].(*types.TypeName)
+	if !ok {
+		return nil, l.errf(ts.Pos(), "type %s is not supported yet", ts.Name.Name)
+	}
+	st, ok := obj.Type().Underlying().(*types.Struct)
+	if !ok {
+		return nil, nil
+	}
+	sd := &ir.StructDef{Name: ts.Name.Name}
+	for i := range st.NumFields() {
+		fv := st.Field(i)
+		if fv.Anonymous() {
+			return nil, l.errf(ts.Pos(), "embedded field %s is not supported yet", fv.Name())
+		}
+		field, err := l.structField(fv.Name(), fv.Type(), ts.Pos())
+		if err != nil {
+			return nil, err
+		}
+		sd.Fields = append(sd.Fields, field)
+	}
+	return sd, nil
+}
+
+// structField classifies one struct field by its type. A value-struct field
+// carries its type name, so the emitter can build its zero instance and recurse
+// in copy; a scalar field carries its zero literal. A field of any other type,
+// a pointer, slice, map, or the like, waits on a later slice and fails loudly
+// through zeroValueOfType.
+func (l *lowerer) structField(name string, t types.Type, pos token.Pos) (ir.StructField, error) {
+	if _, ok := t.Underlying().(*types.Struct); ok {
+		named, ok := t.(*types.Named)
+		if !ok {
+			return ir.StructField{}, l.errf(pos, "anonymous struct field %s is not supported yet", name)
+		}
+		return ir.StructField{Name: name, Kind: ir.FieldStruct, Struct: named.Obj().Name()}, nil
+	}
+	zero, err := l.zeroValueOfType(t, pos)
+	if err != nil {
+		return ir.StructField{}, err
+	}
+	return ir.StructField{Name: name, Kind: ir.FieldScalar, Zero: zero}, nil
 }
 
 type lowerer struct {
@@ -225,6 +294,9 @@ func (l *lowerer) lowerDecl(s *ast.DeclStmt) ([]ir.Stmt, error) {
 			if err != nil {
 				return nil, err
 			}
+			if name.Name != "_" {
+				value = l.copyIfValueRead(vs.Values[i], value)
+			}
 			out = append(out, &ir.AssignStmt{Name: name.Name, Value: value, Define: true})
 		}
 	}
@@ -233,7 +305,23 @@ func (l *lowerer) lowerDecl(s *ast.DeclStmt) ([]ir.Stmt, error) {
 
 // zeroValue produces the Go zero value for a declared name's type.
 func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
-	basic, ok := l.pkg.Info.TypeOf(name).Underlying().(*types.Basic)
+	return l.zeroValueOfType(l.pkg.Info.TypeOf(name), name.Pos())
+}
+
+// zeroValueOfType produces the Go zero value of a type. A struct's zero value is
+// its constructor called with no arguments, which the class fills with each
+// field's own zero. A scalar's zero is its literal, with a float32 renarrowed
+// through the single-precision helper. Any other type waits on a later slice and
+// fails loudly, which is also how an unsupported struct field type is caught.
+func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) {
+	if _, ok := t.Underlying().(*types.Struct); ok {
+		named, ok := t.(*types.Named)
+		if !ok {
+			return nil, l.errf(pos, "zero value of an anonymous struct is not supported yet")
+		}
+		return &ir.StructLit{Type: named.Obj().Name()}, nil
+	}
+	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
 		switch info := basic.Info(); {
 		case info&types.IsInteger != 0:
@@ -249,7 +337,7 @@ func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
 			return &ir.StringLit{Value: ""}, nil
 		}
 	}
-	return nil, l.errf(name.Pos(), "zero value of %s is not supported yet", l.pkg.Info.TypeOf(name))
+	return nil, l.errf(pos, "zero value of %s is not supported yet", t)
 }
 
 // compoundOps maps a Go compound-assignment token to the plain binary operator
@@ -274,15 +362,44 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
 	}
-	name, ok := s.Lhs[0].(*ast.Ident)
-	if !ok {
-		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
-	}
 	value, err := l.lowerExpr(s.Rhs[0])
 	if err != nil {
 		return nil, err
 	}
-	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value, Define: s.Tok == token.DEFINE}}, nil
+	// A struct value assigned to a location copies, so the reference-semantic
+	// Python instance is cloned where Go would make an independent value. A blank
+	// assignment discards the value and creates no independent copy, so it does
+	// not clone.
+	switch lhs := s.Lhs[0].(type) {
+	case *ast.Ident:
+		if lhs.Name != "_" {
+			value = l.copyIfValueRead(s.Rhs[0], value)
+		}
+		return []ir.Stmt{&ir.AssignStmt{Name: lhs.Name, Value: value, Define: s.Tok == token.DEFINE}}, nil
+	case *ast.SelectorExpr:
+		obj, err := l.lowerFieldTarget(lhs)
+		if err != nil {
+			return nil, err
+		}
+		value = l.copyIfValueRead(s.Rhs[0], value)
+		return []ir.Stmt{&ir.SetField{Object: obj, Name: lhs.Sel.Name, Value: value}}, nil
+	default:
+		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
+	}
+}
+
+// lowerFieldTarget lowers the object of a field-assignment target, s.field = v,
+// after checking the selector really is a field, not a package member or a
+// promoted field, which wait on later slices.
+func (l *lowerer) lowerFieldTarget(sel *ast.SelectorExpr) (ir.Expr, error) {
+	selection, ok := l.pkg.Info.Selections[sel]
+	if !ok || selection.Kind() != types.FieldVal {
+		return nil, l.errf(sel.Pos(), "assignment target %s is not supported yet", sel.Sel.Name)
+	}
+	if len(selection.Index()) != 1 {
+		return nil, l.errf(sel.Pos(), "assignment to a promoted field is not supported yet")
+	}
+	return l.lowerExpr(sel.X)
 }
 
 // lowerCompoundAssign lowers x op= y to x = x op y, reusing the width mask of the
@@ -1085,11 +1202,119 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		return l.lowerBinary(e)
 	case *ast.IndexExpr:
 		return l.lowerIndex(e)
+	case *ast.SelectorExpr:
+		return l.lowerSelector(e)
+	case *ast.CompositeLit:
+		return l.lowerCompositeLit(e)
 	case *ast.CallExpr:
 		return l.lowerCall(e)
 	default:
 		return nil, l.errf(e.Pos(), "expression %T is not supported yet", e)
 	}
+}
+
+// lowerSelector lowers a selector used as a value. Only a field read is supported
+// in this slice, s.field, which becomes a Python attribute access; a method value
+// and a promoted field wait on the embedding slice, and a package member such as
+// a constant waits on its own slice. The copy a struct-valued field read owes is
+// injected by the caller through copyIfValueRead, not here, so a field read that
+// is only addressed or compared is not needlessly cloned.
+func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
+	selection, ok := l.pkg.Info.Selections[e]
+	if !ok {
+		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
+	}
+	if selection.Kind() != types.FieldVal {
+		return nil, l.errf(e.Pos(), "method value %s is not supported yet", e.Sel.Name)
+	}
+	if len(selection.Index()) != 1 {
+		return nil, l.errf(e.Pos(), "promoted field %s is not supported yet", e.Sel.Name)
+	}
+	x, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.FieldAccess{X: x, Name: e.Sel.Name}, nil
+}
+
+// lowerCompositeLit lowers a struct composite literal to a constructor call.
+// Positional and keyed forms are both supported, keyed emitting keyword
+// arguments so an omitted field takes its zero default. A struct-valued element
+// that reads an existing value copies, matching Go, since the literal stores an
+// independent value in the field. Array, slice, and map literals wait on the
+// aggregate slices.
+func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
+	t := l.pkg.Info.TypeOf(e)
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil, l.errf(e.Pos(), "composite literal of %s is not supported yet", t)
+	}
+	if _, ok := named.Underlying().(*types.Struct); !ok {
+		return nil, l.errf(e.Pos(), "composite literal of %s is not supported yet", t)
+	}
+	lit := &ir.StructLit{Type: named.Obj().Name()}
+	if len(e.Elts) == 0 {
+		return lit, nil
+	}
+	_, lit.Keyed = e.Elts[0].(*ast.KeyValueExpr)
+	for _, elt := range e.Elts {
+		if lit.Keyed {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				return nil, l.errf(elt.Pos(), "mixed keyed and positional fields are not supported")
+			}
+			key, ok := kv.Key.(*ast.Ident)
+			if !ok {
+				return nil, l.errf(kv.Key.Pos(), "struct field key %T is not supported yet", kv.Key)
+			}
+			value, err := l.lowerExpr(kv.Value)
+			if err != nil {
+				return nil, err
+			}
+			value = l.copyIfValueRead(kv.Value, value)
+			lit.Fields = append(lit.Fields, ir.StructArg{Name: key.Name, Value: value})
+			continue
+		}
+		value, err := l.lowerExpr(elt)
+		if err != nil {
+			return nil, err
+		}
+		value = l.copyIfValueRead(elt, value)
+		lit.Fields = append(lit.Fields, ir.StructArg{Value: value})
+	}
+	return lit, nil
+}
+
+// copyIfValueRead wraps a lowered expression in a Clone when the source reads a
+// struct value out of a location Go would copy: a plain variable or a field
+// selector. A composite literal or a call already yields a fresh value, so it is
+// left alone, matching the rule that the copy is injected only at a value read
+// and never over an already-independent value.
+func (l *lowerer) copyIfValueRead(src ast.Expr, lowered ir.Expr) ir.Expr {
+	if !isStructValue(l.pkg.Info.TypeOf(src)) {
+		return lowered
+	}
+	switch src := src.(type) {
+	case *ast.ParenExpr:
+		return l.copyIfValueRead(src.X, lowered)
+	case *ast.Ident, *ast.SelectorExpr, *ast.IndexExpr:
+		return &ir.Clone{X: lowered}
+	default:
+		return lowered
+	}
+}
+
+// isStructValue reports whether a type is a struct value, not a pointer to one,
+// so the copy rule fires on a value read but never on a pointer that Go shares.
+func isStructValue(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if _, ok := t.(*types.Pointer); ok {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Struct)
+	return ok
 }
 
 func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {

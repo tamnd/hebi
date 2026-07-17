@@ -13,6 +13,37 @@ func Verify(m *Module) error {
 	if m.Package == "" {
 		return fmt.Errorf("ir: module has no package name")
 	}
+	structs := make(map[string]bool, len(m.Structs))
+	for i, sd := range m.Structs {
+		if sd == nil {
+			return fmt.Errorf("ir: struct %d is nil", i)
+		}
+		if sd.Name == "" {
+			return fmt.Errorf("ir: struct %d has no name", i)
+		}
+		if structs[sd.Name] {
+			return fmt.Errorf("ir: struct %s is defined more than once", sd.Name)
+		}
+		structs[sd.Name] = true
+		for j, f := range sd.Fields {
+			where := fmt.Sprintf("struct %s: field %d", sd.Name, j)
+			if f.Name == "" {
+				return fmt.Errorf("ir: %s has no name", where)
+			}
+			switch f.Kind {
+			case FieldScalar:
+				if err := verifyExpr(where+": zero", f.Zero); err != nil {
+					return err
+				}
+			case FieldStruct:
+				if f.Struct == "" {
+					return fmt.Errorf("ir: %s is a struct field with no type", where)
+				}
+			default:
+				return fmt.Errorf("ir: %s has an unknown kind %d", where, f.Kind)
+			}
+		}
+	}
 	seen := make(map[string]bool, len(m.Funcs))
 	for i, fn := range m.Funcs {
 		if fn == nil {
@@ -50,6 +81,14 @@ func verifyStmt(where string, s Stmt) error {
 	case *AssignStmt:
 		if s.Name == "" {
 			return fmt.Errorf("ir: %s assigns to an empty name", where)
+		}
+		return verifyExpr(where+": value", s.Value)
+	case *SetField:
+		if s.Name == "" {
+			return fmt.Errorf("ir: %s assigns to an empty field name", where)
+		}
+		if err := verifyExpr(where+": object", s.Object); err != nil {
+			return err
 		}
 		return verifyExpr(where+": value", s.Value)
 	case *IfStmt:
@@ -177,6 +216,25 @@ func verifyExpr(where string, e Expr) error {
 			return fmt.Errorf("ir: %s is an intrinsic with no name", where)
 		}
 		return verifyArgs(where, e.Args)
+	case *FieldAccess:
+		if e.Name == "" {
+			return fmt.Errorf("ir: %s reads a field with no name", where)
+		}
+		return verifyExpr(where+": object", e.X)
+	case *StructLit:
+		if e.Type == "" {
+			return fmt.Errorf("ir: %s constructs a struct with no type", where)
+		}
+		for i, f := range e.Fields {
+			if e.Keyed && f.Name == "" {
+				return fmt.Errorf("ir: %s: keyed field %d has no name", where, i)
+			}
+			if err := verifyExpr(fmt.Sprintf("%s: field %d", where, i), f.Value); err != nil {
+				return err
+			}
+		}
+	case *Clone:
+		return verifyExpr(where+": cloned", e.X)
 	default:
 		return fmt.Errorf("ir: %s is an unknown expression type %T", where, e)
 	}
