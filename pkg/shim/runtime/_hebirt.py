@@ -26,6 +26,12 @@ def go_str(value):
         return "false"
     if isinstance(value, float):
         return _gofloat(value)
+    if isinstance(value, bytes):
+        # A Go string is bytes internally, and printing it writes its text, so
+        # the UTF-8 is decoded back to a str, with the replacement character for
+        # any invalid byte, matching Go's decode. A []byte is a bytearray, not
+        # bytes, so it does not take this path and still prints as its ints.
+        return value.decode("utf-8", "replace")
     return str(value)
 
 
@@ -149,3 +155,50 @@ def _gofixed(ds, exp):
     if point > 0:
         return ds[:point] + "." + ds[point:]
     return "0." + "0" * -point + ds
+
+
+# String helpers. A Go string is Python bytes, so byte indexing, length, and
+# comparison need no helper, but ranging over a string decodes UTF-8 one rune at
+# a time, yielding the byte index of each rune and the rune itself. The decoder
+# reproduces Go's rules exactly, including the accept ranges for each leading
+# byte and the U+FFFD replacement for an invalid or truncated sequence, so a
+# for range over a string steps rune by rune the way Go does.
+
+
+def _decode_rune(s, i):
+    """Decode the UTF-8 rune at byte offset i, returning the rune and its width.
+
+    An invalid or truncated sequence returns the replacement rune U+FFFD with a
+    width of one byte, exactly as Go's range over a string and utf8.DecodeRune do.
+    """
+    b0 = s[i]
+    if b0 < 0x80:
+        return b0, 1
+    n = len(s)
+    if 0xC2 <= b0 < 0xE0:
+        if i + 1 < n and 0x80 <= s[i + 1] < 0xC0:
+            return ((b0 & 0x1F) << 6) | (s[i + 1] & 0x3F), 2
+        return 0xFFFD, 1
+    if 0xE0 <= b0 < 0xF0:
+        lo = 0xA0 if b0 == 0xE0 else 0x80
+        hi = 0x9F if b0 == 0xED else 0xBF
+        if i + 2 < n and lo <= s[i + 1] <= hi and 0x80 <= s[i + 2] < 0xC0:
+            return ((b0 & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F), 3
+        return 0xFFFD, 1
+    if 0xF0 <= b0 <= 0xF4:
+        lo = 0x90 if b0 == 0xF0 else 0x80
+        hi = 0x8F if b0 == 0xF4 else 0xBF
+        if (
+            i + 3 < n
+            and lo <= s[i + 1] <= hi
+            and 0x80 <= s[i + 2] < 0xC0
+            and 0x80 <= s[i + 3] < 0xC0
+        ):
+            return (
+                ((b0 & 0x07) << 18)
+                | ((s[i + 1] & 0x3F) << 12)
+                | ((s[i + 2] & 0x3F) << 6)
+                | (s[i + 3] & 0x3F)
+            ), 4
+        return 0xFFFD, 1
+    return 0xFFFD, 1

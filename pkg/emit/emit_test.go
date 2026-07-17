@@ -237,23 +237,144 @@ func TestModuleRejectsUnsupportedOperator(t *testing.T) {
 	}
 }
 
-func TestPyString(t *testing.T) {
+func TestPyBytes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		in, want string
 	}{
-		{"", `""`},
-		{"hi", `"hi"`},
-		{`a"b`, `"a\"b"`},
-		{"a\nb", `"a\nb"`},
-		{"a\tb", `"a\tb"`},
-		{`c:\x`, `"c:\\x"`},
-		{"\x00", `"\x00"`},
+		{"", `b""`},
+		{"hi", `b"hi"`},
+		{`a"b`, `b"a\"b"`},
+		{"a\nb", `b"a\nb"`},
+		{"a\tb", `b"a\tb"`},
+		{`c:\x`, `b"c:\\x"`},
+		{"\x00", `b"\x00"`},
+		{"héllo", `b"h\xc3\xa9llo"`},
 	}
 	for _, tt := range tests {
-		if got := pyString(tt.in); got != tt.want {
-			t.Errorf("pyString(%q) = %s, want %s", tt.in, got, tt.want)
+		if got := pyBytes(tt.in); got != tt.want {
+			t.Errorf("pyBytes(%q) = %s, want %s", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestModuleStringAndIndex pins the string surface: a string literal is a bytes
+// literal, an index into it reads a byte, and the length is len.
+func TestModuleStringAndIndex(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "s", Define: true, Value: &ir.StringLit{Value: "hi"}},
+				&ir.AssignStmt{Name: "c", Define: true, Value: &ir.IndexExpr{X: &ir.Ident{Name: "s"}, Index: &ir.IntLit{Text: "0"}}},
+				&ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{&ir.CallExpr{Name: "len", Args: []ir.Expr{&ir.Ident{Name: "s"}}}}}},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    s = b"hi"
+    c = s[0]
+    _hebirt.println(len(s))
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// TestModuleRangeString pins the while form a range over a string lowers to: the
+// cursor starts at zero, each step decodes the rune at the cursor and exposes
+// the byte index and rune, and the cursor advances by the rune's byte width.
+func TestModuleRangeString(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{&ir.RangeString{
+				Key:    "i",
+				Value:  "r",
+				Cursor: "_i",
+				Width:  "_w",
+				Source: &ir.Ident{Name: "s"},
+				Body: []ir.Stmt{&ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{
+					&ir.Ident{Name: "i"}, &ir.Ident{Name: "r"},
+				}}}},
+			}},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    _i = 0
+    while _i < len(s):
+        r, _w = _hebirt._decode_rune(s, _i)
+        i = _i
+        _hebirt.println(i, r)
+        _i = _i + _w
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// TestModuleRangeStringBlankValue covers the rune target dropping to the
+// throwaway name and the index assignment vanishing when the clause is blank.
+func TestModuleRangeStringBlankValue(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{&ir.RangeString{
+				Value:  "",
+				Cursor: "_i",
+				Width:  "_w",
+				Source: &ir.Ident{Name: "s"},
+				Body:   nil,
+			}},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    _i = 0
+    while _i < len(s):
+        _, _w = _hebirt._decode_rune(s, _i)
+        _i = _i + _w
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 

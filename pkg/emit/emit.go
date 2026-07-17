@@ -112,6 +112,9 @@ func blockUsesShim(body []ir.Stmt) bool {
 			if exprUsesShim(s.Cond) || blockUsesShim(s.Body) {
 				return true
 			}
+		case *ir.RangeString:
+			// A range over a string always calls the rune decoder in the shim.
+			return true
 		}
 	}
 	return false
@@ -127,6 +130,8 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.X)
 	case *ir.Convert:
 		return exprUsesShim(e.X)
+	case *ir.IndexExpr:
+		return exprUsesShim(e.X) || exprUsesShim(e.Index)
 	case *ir.CallExpr:
 		return argsUseShim(e.Args)
 	}
@@ -208,9 +213,48 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		if err := emitBlock(b, s.Body, depth+1); err != nil {
 			return err
 		}
+	case *ir.RangeString:
+		if err := emitRangeString(b, s, depth); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("emit: unsupported statement type %T", s)
 	}
+	return nil
+}
+
+// emitRangeString writes the while form a range over a string lowers to: a byte
+// cursor starts at zero, and each step decodes the rune at the cursor, exposes
+// the byte index and rune to the loop body under the user's names, runs the
+// body, and advances the cursor by the rune's byte width. A missing rune target
+// is decoded into the throwaway name so the width is still read, and a missing
+// index target drops its assignment, matching Go's blank identifier.
+func emitRangeString(b *strings.Builder, s *ir.RangeString, depth int) error {
+	src, err := emitExpr(s.Source)
+	if err != nil {
+		return err
+	}
+	writeIndent(b, depth)
+	fmt.Fprintf(b, "%s = 0\n", s.Cursor)
+	writeIndent(b, depth)
+	fmt.Fprintf(b, "while %s < len(%s):\n", s.Cursor, src)
+	value := s.Value
+	if value == "" {
+		value = "_"
+	}
+	writeIndent(b, depth+1)
+	fmt.Fprintf(b, "%s, %s = %s._decode_rune(%s, %s)\n", value, s.Width, shim.Name, src, s.Cursor)
+	if s.Key != "" {
+		writeIndent(b, depth+1)
+		fmt.Fprintf(b, "%s = %s\n", s.Key, s.Cursor)
+	}
+	for _, st := range s.Body {
+		if err := emitStmt(b, st, depth+1); err != nil {
+			return err
+		}
+	}
+	writeIndent(b, depth+1)
+	fmt.Fprintf(b, "%s = %s + %s\n", s.Cursor, s.Cursor, s.Width)
 	return nil
 }
 
@@ -221,7 +265,7 @@ func emitExpr(e ir.Expr) (string, error) {
 	case *ir.FloatLit:
 		return e.Text, nil
 	case *ir.StringLit:
-		return pyString(e.Value), nil
+		return pyBytes(e.Value), nil
 	case *ir.BoolLit:
 		if e.Value {
 			return "True", nil
@@ -265,6 +309,16 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s(%s)", e.To, x), nil
+	case *ir.IndexExpr:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		index, err := emitExpr(e.Index)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s[%s]", x, index), nil
 	case *ir.CallExpr:
 		args, err := emitArgs(e.Args)
 		if err != nil {
@@ -300,15 +354,17 @@ func writeIndent(b *strings.Builder, depth int) {
 	}
 }
 
-// pyString renders a Go string value as a double-quoted Python string literal,
-// escaping the characters that would otherwise break the literal or read
-// differently, and falling back to a hex escape for anything non-printable so
-// the output stays plain ASCII.
-func pyString(s string) string {
+// pyBytes renders a Go string value as a Python bytes literal holding its UTF-8
+// encoding, which is hebi's internal representation of a Go string. It iterates
+// bytes, not runes, escaping the ones that would break the literal and writing a
+// hex escape for anything outside printable ASCII, so a multibyte rune becomes
+// its exact bytes and the output stays plain ASCII.
+func pyBytes(s string) string {
 	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
+	b.WriteString(`b"`)
+	for i := range len(s) {
+		c := s[i]
+		switch c {
 		case '\\':
 			b.WriteString(`\\`)
 		case '"':
@@ -320,10 +376,10 @@ func pyString(s string) string {
 		case '\t':
 			b.WriteString(`\t`)
 		default:
-			if r < 0x20 || r == 0x7f {
-				fmt.Fprintf(&b, `\x%02x`, r)
+			if c < 0x20 || c >= 0x7f {
+				fmt.Fprintf(&b, `\x%02x`, c)
 			} else {
-				b.WriteRune(r)
+				b.WriteByte(c)
 			}
 		}
 	}
