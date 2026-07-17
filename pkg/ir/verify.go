@@ -67,6 +67,14 @@ func verifyStmt(where string, s Stmt) error {
 			}
 		}
 		return verifyBlock(where+": body", s.Body)
+	case *RangeString:
+		if s.Cursor == "" || s.Width == "" {
+			return fmt.Errorf("ir: %s ranges a string without a cursor or width name", where)
+		}
+		if err := verifyExpr(where+": range source", s.Source); err != nil {
+			return err
+		}
+		return verifyBlock(where+": body", s.Body)
 	default:
 		return fmt.Errorf("ir: %s is an unknown statement type %T", where, s)
 	}
@@ -119,6 +127,11 @@ func verifyExpr(where string, e Expr) error {
 			return fmt.Errorf("ir: %s converts with an unknown builtin %q", where, e.To)
 		}
 		return verifyExpr(where+": converted", e.X)
+	case *IndexExpr:
+		if err := verifyExpr(where+": indexed", e.X); err != nil {
+			return err
+		}
+		return verifyExpr(where+": index", e.Index)
 	case *CallExpr:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s calls an empty name", where)

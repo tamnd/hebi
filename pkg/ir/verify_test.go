@@ -141,6 +141,42 @@ func TestVerifyFloatAndConvert(t *testing.T) {
 	}
 }
 
+func TestVerifyStringSurface(t *testing.T) {
+	t.Parallel()
+	good := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+		&RangeString{Value: "r", Cursor: "_i", Width: "_w", Source: &Ident{Name: "s"}, Body: []Stmt{
+			&AssignStmt{Name: "c", Define: true, Value: &IndexExpr{X: &Ident{Name: "s"}, Index: &IntLit{Text: "0"}}},
+		}},
+	}}}}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed string surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		stmt    Stmt
+		wantSub string
+	}{
+		{"range without cursor", &RangeString{Cursor: "", Width: "_w", Source: &Ident{Name: "s"}}, "without a cursor or width name"},
+		{"range without width", &RangeString{Cursor: "_i", Width: "", Source: &Ident{Name: "s"}}, "without a cursor or width name"},
+		{"range nil source", &RangeString{Cursor: "_i", Width: "_w", Source: nil}, "nil expression"},
+		{"nil indexed operand", &AssignStmt{Name: "c", Value: &IndexExpr{X: nil, Index: &IntLit{Text: "0"}}}, "nil expression"},
+		{"nil index", &AssignStmt{Name: "c", Value: &IndexExpr{X: &Ident{Name: "s"}, Index: nil}}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{tt.stmt}}}}
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {

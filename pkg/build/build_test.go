@@ -97,6 +97,42 @@ func TestFloats(t *testing.T) {
 	}
 }
 
+// TestStrings checks the string surface against go run: a string is bytes, so a
+// literal prints its text, an index reads a byte, len is the byte count,
+// concatenation and comparison work byte-wise, and a range over a string steps
+// rune by rune yielding the byte index and rune, including a multibyte string, a
+// string bound to a variable, a range over an expression, an invalid UTF-8
+// sequence that decodes to the replacement rune, and a nested range whose
+// internal names must not collide.
+func TestStrings(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"literal prints text", `fmt.Println("héllo")`},
+		{"length is byte count", "s := \"héllo\"\n\tfmt.Println(len(s))"},
+		{"index reads a byte", "s := \"héllo\"\n\tfmt.Println(s[1])"},
+		{"byte in arithmetic masks", "s := \"AB\"\n\tfmt.Println(s[0] + 1)"},
+		{"concatenation", "a := \"foo\"\n\tb := \"bar\"\n\tfmt.Println(a + b)"},
+		{"comparison", `fmt.Println("abc" < "abd", "abc" == "abc")`},
+		{"range index and rune", "for i, r := range \"héllo\" {\n\t\tfmt.Println(i, r)\n\t}"},
+		{"range index only", "for i := range \"héllo\" {\n\t\tfmt.Println(i)\n\t}"},
+		{"range rune only", "for _, r := range \"héllo\" {\n\t\tfmt.Println(r)\n\t}"},
+		{"range with no vars", "for range \"héllo\" {\n\t\tfmt.Println(1)\n\t}"},
+		{"range over variable", "s := \"héllo\"\n\tfor _, r := range s {\n\t\tfmt.Println(r)\n\t}"},
+		{"range over expression", "for _, r := range \"foo\" + \"bar\" {\n\t\tfmt.Println(r)\n\t}"},
+		{"range invalid utf8", "s := \"\\xff\\xffhi\"\n\tfor _, r := range s {\n\t\tfmt.Println(r)\n\t}"},
+		{"nested range", "for _, a := range \"ab\" {\n\t\tfor _, b := range \"cd\" {\n\t\t\tfmt.Println(a, b)\n\t\t}\n\t}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")

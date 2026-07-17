@@ -39,6 +39,31 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 
 type lowerer struct {
 	pkg *frontend.Package
+	// rangeSeq numbers the internal names a range over a string allocates, so a
+	// nested or repeated range gets distinct cursor and width names. It counts
+	// across the whole module in source order, which keeps the emit deterministic.
+	rangeSeq int
+}
+
+// seqName builds an internal name from a base and a sequence number, leaving the
+// first one bare for readability and suffixing the rest, so a lone range reads
+// as _i and _w while a second range does not collide with it.
+func seqName(base string, n int) string {
+	if n == 0 {
+		return base
+	}
+	return base + strconv.Itoa(n)
+}
+
+// rangeIdent returns the name of a range clause variable, or the empty string
+// when the clause is absent or the blank identifier, in which case the lowering
+// drops the corresponding assignment.
+func rangeIdent(e ast.Expr) string {
+	id, ok := e.(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return ""
+	}
+	return id.Name
 }
 
 func (l *lowerer) errf(pos token.Pos, format string, args ...any) error {
@@ -93,6 +118,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerIf(s)
 	case *ast.ForStmt:
 		return l.lowerFor(s)
+	case *ast.RangeStmt:
+		return l.lowerRange(s)
 	case *ast.ExprStmt:
 		x, err := l.lowerExpr(s.X)
 		if err != nil {
@@ -233,6 +260,50 @@ func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
 	return []ir.Stmt{&ir.ForStmt{Cond: cond, Body: body}}, nil
 }
 
+// lowerRange lowers a for range statement. Only range over a string is supported
+// in this slice, which iterates runes and yields the byte index of each rune and
+// the decoded rune; range over the other kinds arrives in a later slice. The
+// source is bound to a fresh name first so it is evaluated once, then a cursor
+// walks it rune by rune through the shim decoder.
+func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
+	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN && s.Tok != token.ILLEGAL {
+		return nil, l.errf(s.Pos(), "range with %s is not supported yet", s.Tok)
+	}
+	srcType := l.pkg.Info.TypeOf(s.X)
+	basic, ok := srcType.Underlying().(*types.Basic)
+	if !ok || basic.Info()&types.IsString == 0 {
+		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
+	}
+	src, err := l.lowerExpr(s.X)
+	if err != nil {
+		return nil, err
+	}
+	var pre []ir.Stmt
+	source := src
+	if _, isIdent := src.(*ir.Ident); !isIdent {
+		// Bind a non-trivial source once, since the emitted loop reads it in both
+		// the length test and the decode, and Go evaluates the range source once.
+		name := seqName("_s", l.rangeSeq)
+		pre = append(pre, &ir.AssignStmt{Name: name, Value: src, Define: true})
+		source = &ir.Ident{Name: name}
+	}
+	n := l.rangeSeq
+	l.rangeSeq++
+	body, err := l.lowerBlock(s.Body)
+	if err != nil {
+		return nil, err
+	}
+	rs := &ir.RangeString{
+		Key:    rangeIdent(s.Key),
+		Value:  rangeIdent(s.Value),
+		Cursor: seqName("_i", n),
+		Width:  seqName("_w", n),
+		Source: source,
+		Body:   body,
+	}
+	return append(pre, rs), nil
+}
+
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 	switch e := e.(type) {
 	case *ast.ParenExpr:
@@ -252,6 +323,8 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		return l.lowerUnary(e)
 	case *ast.BinaryExpr:
 		return l.lowerBinary(e)
+	case *ast.IndexExpr:
+		return l.lowerIndex(e)
 	case *ast.CallExpr:
 		return l.lowerCall(e)
 	default:
@@ -270,6 +343,28 @@ func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
 	}
 	inner := &ir.BinaryExpr{Op: e.Op.String(), X: x, Y: y}
 	return l.narrow(e, e.Op, inner), nil
+}
+
+// lowerIndex lowers an index expression. Only indexing a string is supported in
+// this slice, which yields a byte as an int 0-255 because a Go string is Python
+// bytes; indexing slices, arrays, and maps arrives with those types. Generic
+// instantiation shares the IndexExpr syntax but never has a string operand, so
+// the type guard keeps the two apart.
+func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
+	xType := l.pkg.Info.TypeOf(e.X)
+	basic, ok := xType.Underlying().(*types.Basic)
+	if !ok || basic.Info()&types.IsString == 0 {
+		return nil, l.errf(e.Pos(), "indexing %s is not supported yet", xType)
+	}
+	x, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	index, err := l.lowerExpr(e.Index)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.IndexExpr{X: x, Index: index}, nil
 }
 
 func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {

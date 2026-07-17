@@ -54,10 +54,27 @@ type ForStmt struct {
 	Body []Stmt
 }
 
-func (*ExprStmt) isStmt()   {}
-func (*AssignStmt) isStmt() {}
-func (*IfStmt) isStmt()     {}
-func (*ForStmt) isStmt()    {}
+// RangeString is a range over a string, which iterates runes and yields the
+// byte index of each rune's start and the decoded rune, matching Go's for range
+// over a string. Key is the byte-index variable and Value is the rune variable,
+// either empty when the Go program used the blank identifier or omitted the
+// clause. Cursor and Width are the internal byte cursor and rune-width names the
+// lowering allocates, kept distinct from user names so a nested range does not
+// collide. Source is bound once by the lowering so it is evaluated a single time.
+type RangeString struct {
+	Key    string
+	Value  string
+	Cursor string
+	Width  string
+	Source Expr
+	Body   []Stmt
+}
+
+func (*ExprStmt) isStmt()    {}
+func (*AssignStmt) isStmt()  {}
+func (*IfStmt) isStmt()      {}
+func (*ForStmt) isStmt()     {}
+func (*RangeString) isStmt() {}
 
 // Expr is an expression node.
 type Expr interface{ isExpr() }
@@ -115,6 +132,14 @@ type Convert struct {
 	X  Expr
 }
 
+// IndexExpr is an index into an indexable value, such as s[i] on a string.
+// Because a Go string is represented as Python bytes, indexing one yields an int
+// 0-255, exactly like Go's byte.
+type IndexExpr struct {
+	X     Expr
+	Index Expr
+}
+
 // CallExpr is a call to a named function within the module.
 type CallExpr struct {
 	Name string
@@ -138,5 +163,6 @@ func (*BinaryExpr) isExpr() {}
 func (*UnaryExpr) isExpr()  {}
 func (*Mask) isExpr()       {}
 func (*Convert) isExpr()    {}
+func (*IndexExpr) isExpr()  {}
 func (*CallExpr) isExpr()   {}
 func (*Intrinsic) isExpr()  {}
