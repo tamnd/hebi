@@ -378,6 +378,14 @@ func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
 		// Negation can grow, MinInt has no positive counterpart, so it masks;
 		// unary plus is a no-op and never does.
 		return l.narrow(e, e.Op, inner), nil
+	case token.NOT:
+		// Logical not on a bool yields a bool and never grows, so no mask; the
+		// operand is already a proven bool because Go has no truthiness.
+		x, err := l.lowerExpr(e.X)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.UnaryExpr{Op: e.Op.String(), X: x}, nil
 	default:
 		return nil, l.errf(e.Pos(), "unary %s is not supported yet", e.Op)
 	}

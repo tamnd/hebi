@@ -133,6 +133,35 @@ func TestStrings(t *testing.T) {
 	}
 }
 
+// TestBooleans checks the boolean surface against go run: not, and, or, the
+// comparisons, a bool bound to a variable and used as a condition, the negation
+// of a comparison, and a short-circuit chain. Because Go has no truthiness the
+// operands are always proven bools, so Python's and and or return a bool too,
+// and every printed result is Go's true or false.
+func TestBooleans(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"literals", "fmt.Println(true, false)"},
+		{"not", "fmt.Println(!true, !false)"},
+		{"and or", "fmt.Println(true && false, true || false)"},
+		{"not of comparison", "x := 1\n\ty := 2\n\tfmt.Println(!(x < y))"},
+		{"bool variable as condition", "b := 3 > 2\n\tif b {\n\t\tfmt.Println(\"yes\")\n\t}"},
+		{"stored logical result", "a := true\n\tc := 1 < 2\n\td := a && c\n\tfmt.Println(d)"},
+		{"chain", "x := 5\n\tfmt.Println(x > 0 && x < 10 || x == 100)"},
+		{"double negation", "ok := false\n\tfmt.Println(!!ok)"},
+		{"bool zero value", "var b bool\n\tfmt.Println(b)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")
