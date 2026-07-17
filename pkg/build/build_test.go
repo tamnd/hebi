@@ -162,6 +162,36 @@ func TestBooleans(t *testing.T) {
 	}
 }
 
+// TestSwitch checks the switch lowering against go run: an expression switch
+// with a default, a multi-value case, a tagless boolean switch, a default that
+// appears in the middle but is still tested last, a single fallthrough and a
+// chain of them, a fallthrough into the default, a string switch, a switch with
+// no match and no default, and a nested switch whose tag names must not collide.
+func TestSwitch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"expression", "x := 2\n\tswitch x {\n\tcase 1:\n\t\tfmt.Println(\"one\")\n\tcase 2:\n\t\tfmt.Println(\"two\")\n\tdefault:\n\t\tfmt.Println(\"other\")\n\t}"},
+		{"multi value case", "x := 3\n\tswitch x {\n\tcase 1, 2, 3:\n\t\tfmt.Println(\"small\")\n\tdefault:\n\t\tfmt.Println(\"big\")\n\t}"},
+		{"tagless", "n := -5\n\tswitch {\n\tcase n < 0:\n\t\tfmt.Println(\"neg\")\n\tcase n == 0:\n\t\tfmt.Println(\"zero\")\n\tdefault:\n\t\tfmt.Println(\"pos\")\n\t}"},
+		{"default in middle", "x := 9\n\tswitch x {\n\tcase 1:\n\t\tfmt.Println(\"one\")\n\tdefault:\n\t\tfmt.Println(\"other\")\n\tcase 2:\n\t\tfmt.Println(\"two\")\n\t}"},
+		{"fallthrough", "x := 1\n\tswitch x {\n\tcase 1:\n\t\tfmt.Println(\"a\")\n\t\tfallthrough\n\tcase 2:\n\t\tfmt.Println(\"b\")\n\tdefault:\n\t\tfmt.Println(\"c\")\n\t}"},
+		{"fallthrough chain", "x := 1\n\tswitch x {\n\tcase 1:\n\t\tfmt.Println(\"a\")\n\t\tfallthrough\n\tcase 2:\n\t\tfmt.Println(\"b\")\n\t\tfallthrough\n\tcase 3:\n\t\tfmt.Println(\"c\")\n\t}"},
+		{"fallthrough into default", "x := 5\n\tswitch x {\n\tcase 5:\n\t\tfmt.Println(\"five\")\n\t\tfallthrough\n\tdefault:\n\t\tfmt.Println(\"def\")\n\t}"},
+		{"string switch", "s := \"hi\"\n\tswitch s {\n\tcase \"hi\":\n\t\tfmt.Println(\"greet\")\n\tcase \"bye\":\n\t\tfmt.Println(\"leave\")\n\t}"},
+		{"no match no default", "x := 7\n\tswitch x {\n\tcase 1:\n\t\tfmt.Println(\"one\")\n\t}\n\tfmt.Println(\"after\")"},
+		{"nested switch", "x := 1\n\ty := 2\n\tswitch x {\n\tcase 1:\n\t\tswitch y {\n\t\tcase 2:\n\t\t\tfmt.Println(\"inner\")\n\t\t}\n\t}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")

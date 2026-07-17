@@ -201,12 +201,8 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		if err := emitBlock(b, s.Then, depth+1); err != nil {
 			return err
 		}
-		if len(s.Else) > 0 {
-			writeIndent(b, depth)
-			b.WriteString("else:\n")
-			if err := emitBlock(b, s.Else, depth+1); err != nil {
-				return err
-			}
+		if err := emitElse(b, s.Else, depth); err != nil {
+			return err
 		}
 	case *ir.ForStmt:
 		cond := "True"
@@ -230,6 +226,33 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		return fmt.Errorf("emit: unsupported statement type %T", s)
 	}
 	return nil
+}
+
+// emitElse writes an if statement's else part. An else block that is exactly one
+// nested if becomes an elif, which is the same semantics as else followed by if
+// but reads far better for an else-if chain or a switch's case ladder; any other
+// else block is a plain else suite.
+func emitElse(b *strings.Builder, els []ir.Stmt, depth int) error {
+	if len(els) == 0 {
+		return nil
+	}
+	if len(els) == 1 {
+		if nested, ok := els[0].(*ir.IfStmt); ok {
+			cond, err := emitExpr(nested.Cond)
+			if err != nil {
+				return err
+			}
+			writeIndent(b, depth)
+			fmt.Fprintf(b, "elif %s:\n", cond)
+			if err := emitBlock(b, nested.Then, depth+1); err != nil {
+				return err
+			}
+			return emitElse(b, nested.Else, depth)
+		}
+	}
+	writeIndent(b, depth)
+	b.WriteString("else:\n")
+	return emitBlock(b, els, depth+1)
 }
 
 // emitRangeString writes the while form a range over a string lowers to: a byte
