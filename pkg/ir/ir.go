@@ -13,8 +13,48 @@ package ir
 type Module struct {
 	// Package is the Go package clause name, such as main.
 	Package string
+	// Structs are the package's struct types in source order, each emitted as a
+	// Python class before the functions that use it.
+	Structs []*StructDef
 	// Funcs are the package's functions in source order.
 	Funcs []*Func
+}
+
+// StructDef is a Go struct type lowered to a Python class with __slots__, a
+// zero-value constructor, and a type-directed copy method. The class is
+// generated directly rather than with a dataclass so hebi controls exactly which
+// methods it emits.
+type StructDef struct {
+	// Name is the struct type name, which becomes the class name.
+	Name string
+	// Fields are the struct's fields in declaration order.
+	Fields []StructField
+}
+
+// FieldKind tells the emitter how a field takes part in construction and
+// copying. A scalar field is an immutable value shared by assignment; a value
+// struct field is itself a value, so it defaults to a freshly zeroed instance
+// and copies by recursing into its own copy method.
+type FieldKind int
+
+const (
+	// FieldScalar is a numeric, boolean, or string field: its zero value is a
+	// literal and copy shares it directly.
+	FieldScalar FieldKind = iota
+	// FieldStruct is a value-struct field: its zero value is a fresh instance of
+	// the field's struct type and copy recurses into that type's copy method.
+	FieldStruct
+)
+
+// StructField is one field of a struct. Zero is the constructor default for a
+// scalar field, the Go zero value of its type. Struct is the field's struct type
+// name for a value-struct field, used to build its zero instance and to recurse
+// in copy.
+type StructField struct {
+	Name   string
+	Kind   FieldKind
+	Zero   Expr
+	Struct string
 }
 
 // Func is a function definition. At M0 functions take no parameters and return
@@ -111,6 +151,14 @@ type RangeString struct {
 	ContinueStep []Stmt
 }
 
+// SetField assigns to a struct field, obj.Name = Value, matching a Go field
+// assignment. Object is the struct instance expression.
+type SetField struct {
+	Object Expr
+	Name   string
+	Value  Expr
+}
+
 // LabeledBreak marks a Go break that names an outer loop. It is a transient node
 // the lowering emits at the break site and the labeled-break pass rewrites away
 // into a flag set and a plain break before the module is verified, so it never
@@ -126,6 +174,7 @@ type LabeledContinue struct{ Label string }
 
 func (*ExprStmt) isStmt()        {}
 func (*AssignStmt) isStmt()      {}
+func (*SetField) isStmt()        {}
 func (*IfStmt) isStmt()          {}
 func (*ForStmt) isStmt()         {}
 func (*ForRange) isStmt()        {}
@@ -205,6 +254,37 @@ type CallExpr struct {
 	Args []Expr
 }
 
+// FieldAccess reads a field of a struct value, obj.Name. The read alone does not
+// copy; the copy at a value read is a separate Clone the lowering wraps around
+// this node where Go's value semantics demand an independent value.
+type FieldAccess struct {
+	X    Expr
+	Name string
+}
+
+// StructLit constructs a struct instance through its generated constructor. When
+// Keyed is true the fields carry names and emit as keyword arguments Name=Value,
+// matching a keyed Go literal, so an omitted field takes the constructor's zero
+// default; otherwise the fields are positional, matching a positional literal. An
+// empty Fields list builds the zero value.
+type StructLit struct {
+	Type   string
+	Keyed  bool
+	Fields []StructArg
+}
+
+// StructArg is one argument of a struct constructor call. Name is set only for a
+// keyed literal, where it is the field name.
+type StructArg struct {
+	Name  string
+	Value Expr
+}
+
+// Clone copies a struct value by calling its generated copy method, emitted at a
+// site where Go performs a value copy of a struct: an assignment, or a read of a
+// struct-typed field that yields a value.
+type Clone struct{ X Expr }
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -213,15 +293,18 @@ type Intrinsic struct {
 	Args []Expr
 }
 
-func (*IntLit) isExpr()     {}
-func (*FloatLit) isExpr()   {}
-func (*StringLit) isExpr()  {}
-func (*BoolLit) isExpr()    {}
-func (*Ident) isExpr()      {}
-func (*BinaryExpr) isExpr() {}
-func (*UnaryExpr) isExpr()  {}
-func (*Mask) isExpr()       {}
-func (*Convert) isExpr()    {}
-func (*IndexExpr) isExpr()  {}
-func (*CallExpr) isExpr()   {}
-func (*Intrinsic) isExpr()  {}
+func (*IntLit) isExpr()      {}
+func (*FloatLit) isExpr()    {}
+func (*StringLit) isExpr()   {}
+func (*BoolLit) isExpr()     {}
+func (*Ident) isExpr()       {}
+func (*BinaryExpr) isExpr()  {}
+func (*UnaryExpr) isExpr()   {}
+func (*Mask) isExpr()        {}
+func (*Convert) isExpr()     {}
+func (*IndexExpr) isExpr()   {}
+func (*CallExpr) isExpr()    {}
+func (*Intrinsic) isExpr()   {}
+func (*FieldAccess) isExpr() {}
+func (*StructLit) isExpr()   {}
+func (*Clone) isExpr()       {}
