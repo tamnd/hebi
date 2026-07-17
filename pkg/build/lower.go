@@ -43,6 +43,9 @@ type lowerer struct {
 	// nested or repeated range gets distinct cursor and width names. It counts
 	// across the whole module in source order, which keeps the emit deterministic.
 	rangeSeq int
+	// switchSeq numbers the tag temporary an expression switch spills to, so a
+	// nested switch does not reuse an outer switch's tag name.
+	switchSeq int
 }
 
 // seqName builds an internal name from a base and a sequence number, leaving the
@@ -120,6 +123,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerFor(s)
 	case *ast.RangeStmt:
 		return l.lowerRange(s)
+	case *ast.SwitchStmt:
+		return l.lowerSwitch(s)
 	case *ast.ExprStmt:
 		x, err := l.lowerExpr(s.X)
 		if err != nil {
@@ -239,6 +244,134 @@ func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
 		return nil, l.errf(s.Else.Pos(), "else branch %T is not supported yet", s.Else)
 	}
 	return []ir.Stmt{out}, nil
+}
+
+// lowerSwitch lowers a switch to an if/elif chain, which is faithful because Go
+// cases do not fall through by default and each is an implicit break, so the
+// first matching branch runs and the chain ends. An expression switch spills its
+// tag to a temporary so the tag runs once, and a case's value list becomes an or
+// chain of equality tests against the tag. A tagless switch tests each case's
+// boolean directly with no tag. The default clause, wherever it appears, becomes
+// the final else, since Go takes it only when nothing else matches.
+func (l *lowerer) lowerSwitch(s *ast.SwitchStmt) ([]ir.Stmt, error) {
+	if s.Init != nil {
+		return nil, l.errf(s.Pos(), "switch with an init statement is not supported yet")
+	}
+	var pre []ir.Stmt
+	var tag ir.Expr
+	if s.Tag != nil {
+		t, err := l.lowerExpr(s.Tag)
+		if err != nil {
+			return nil, err
+		}
+		name := seqName("_tag", l.switchSeq)
+		l.switchSeq++
+		pre = append(pre, &ir.AssignStmt{Name: name, Value: t, Define: true})
+		tag = &ir.Ident{Name: name}
+	}
+
+	type clause struct {
+		conds []ir.Expr // nil marks the default clause
+		body  []ir.Stmt
+		fall  bool
+	}
+	var clauses []clause
+	for _, item := range s.Body.List {
+		cc, ok := item.(*ast.CaseClause)
+		if !ok {
+			return nil, l.errf(item.Pos(), "switch body item %T is not supported yet", item)
+		}
+		var conds []ir.Expr
+		for _, e := range cc.List {
+			ce, err := l.lowerExpr(e)
+			if err != nil {
+				return nil, err
+			}
+			conds = append(conds, ce)
+		}
+		body, fall, err := l.lowerCaseBody(cc.Body)
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, clause{conds: conds, body: body, fall: fall})
+	}
+
+	// resolve inlines a falling case's successor body, so a fallthrough runs the
+	// next case unconditionally while that next case still runs on its own match.
+	var resolve func(i int) []ir.Stmt
+	resolve = func(i int) []ir.Stmt {
+		out := append([]ir.Stmt(nil), clauses[i].body...)
+		if clauses[i].fall && i+1 < len(clauses) {
+			out = append(out, resolve(i+1)...)
+		}
+		return out
+	}
+
+	var branches []*ir.IfStmt
+	var defaultBody []ir.Stmt
+	hasDefault := false
+	for i, c := range clauses {
+		if c.conds == nil {
+			defaultBody = resolve(i)
+			hasDefault = true
+			continue
+		}
+		branches = append(branches, &ir.IfStmt{Cond: caseCond(tag, c.conds), Then: resolve(i)})
+	}
+
+	if len(branches) == 0 {
+		// Only a default, or an empty switch: no chain, just the default body.
+		return append(pre, defaultBody...), nil
+	}
+	var elseBlock []ir.Stmt
+	if hasDefault {
+		elseBlock = defaultBody
+	}
+	for i := len(branches) - 1; i >= 0; i-- {
+		branches[i].Else = elseBlock
+		elseBlock = []ir.Stmt{branches[i]}
+	}
+	return append(pre, elseBlock...), nil
+}
+
+// lowerCaseBody lowers a case clause's statements, reporting whether the clause
+// ends in a fallthrough. go/types guarantees a fallthrough is the last statement
+// of a non-final case, so it is only ever the trailing statement here.
+func (l *lowerer) lowerCaseBody(list []ast.Stmt) ([]ir.Stmt, bool, error) {
+	fall := false
+	if n := len(list); n > 0 {
+		if br, ok := list[n-1].(*ast.BranchStmt); ok && br.Tok == token.FALLTHROUGH {
+			fall = true
+			list = list[:n-1]
+		}
+	}
+	var out []ir.Stmt
+	for _, s := range list {
+		lowered, err := l.lowerStmt(s)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, lowered...)
+	}
+	return out, fall, nil
+}
+
+// caseCond builds a case's condition. With a tag it is an or chain of equality
+// tests against the tag, one per case value; without a tag the case values are
+// themselves booleans, so it is an or chain of them directly.
+func caseCond(tag ir.Expr, conds []ir.Expr) ir.Expr {
+	parts := conds
+	if tag != nil {
+		parts = make([]ir.Expr, len(conds))
+		for i, c := range conds {
+			parts[i] = &ir.BinaryExpr{Op: "==", X: tag, Y: c}
+		}
+	}
+	expr := parts[0]
+	for _, p := range parts[1:] {
+		expr = &ir.BinaryExpr{Op: "||", X: expr, Y: p}
+	}
+	return expr
 }
 
 func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {

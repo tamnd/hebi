@@ -219,6 +219,61 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleSwitchChain pins the shape a switch lowers to: the tag spilled to a
+// temporary, an elif ladder rather than nested else blocks, and a multi-value
+// case rendered as an or chain of equality tests.
+func TestModuleSwitchChain(t *testing.T) {
+	t.Parallel()
+	tag := &ir.Ident{Name: "_tag"}
+	eq := func(text string) ir.Expr {
+		return &ir.BinaryExpr{Op: "==", X: tag, Y: &ir.IntLit{Text: text}}
+	}
+	say := func(word string) ir.Stmt {
+		return &ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{&ir.StringLit{Value: word}}}}
+	}
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "_tag", Define: true, Value: &ir.Ident{Name: "x"}},
+				&ir.IfStmt{
+					Cond: eq("1"),
+					Then: []ir.Stmt{say("one")},
+					Else: []ir.Stmt{&ir.IfStmt{
+						Cond: &ir.BinaryExpr{Op: "||", X: eq("2"), Y: eq("3")},
+						Then: []ir.Stmt{say("small")},
+						Else: []ir.Stmt{say("big")},
+					}},
+				},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    _tag = x
+    if (_tag == 1):
+        _hebirt.println(b"one")
+    elif ((_tag == 2) or (_tag == 3)):
+        _hebirt.println(b"small")
+    else:
+        _hebirt.println(b"big")
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestMaskHelper(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
