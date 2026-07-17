@@ -66,6 +66,9 @@ func verifyStmt(where string, s Stmt) error {
 				return err
 			}
 		}
+		if err := verifyBlock(where+": continue step", s.ContinueStep); err != nil {
+			return err
+		}
 		return verifyBlock(where+": body", s.Body)
 	case *ForRange:
 		if s.Stop == nil {
@@ -92,11 +95,18 @@ func verifyStmt(where string, s Stmt) error {
 		// The labeled-break pass rewrites every LabeledBreak into a flag and a
 		// plain break, so one reaching the verifier is a lowering bug.
 		return fmt.Errorf("ir: %s is an unresolved labeled break to %q", where, s.Label)
+	case *LabeledContinue:
+		// The labeled-jump pass rewrites every LabeledContinue into a flag and a
+		// continue, so one reaching the verifier is a lowering bug.
+		return fmt.Errorf("ir: %s is an unresolved labeled continue to %q", where, s.Label)
 	case *RangeString:
 		if s.Cursor == "" || s.Width == "" {
 			return fmt.Errorf("ir: %s ranges a string without a cursor or width name", where)
 		}
 		if err := verifyExpr(where+": range source", s.Source); err != nil {
+			return err
+		}
+		if err := verifyBlock(where+": continue step", s.ContinueStep); err != nil {
 			return err
 		}
 		return verifyBlock(where+": body", s.Body)

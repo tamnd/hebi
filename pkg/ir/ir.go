@@ -50,11 +50,16 @@ type IfStmt struct {
 // ForStmt is a for loop lowered to the while form. A nil Cond is an unconditional
 // loop, matching Go's bare for. Label carries the Go loop label when the source
 // labeled this loop, which the labeled-break pass reads to place its flag checks
-// and which the emitter ignores, since Python has no loop labels.
+// and which the emitter ignores, since Python has no loop labels. ContinueStep is
+// the step a continue owes this loop, the post of a three-clause for, which the
+// labeled-continue pass runs before a continue it injects into this loop; it is
+// nil for a bare while and is already present at the bottom of Body for the
+// emitter, so the emitter ignores it.
 type ForStmt struct {
-	Cond  Expr
-	Body  []Stmt
-	Label string
+	Cond         Expr
+	Body         []Stmt
+	Label        string
+	ContinueStep []Stmt
 }
 
 // ForRange is a Python for-in-range loop, the readable form a simple counted Go
@@ -99,6 +104,11 @@ type RangeString struct {
 	Source Expr
 	Body   []Stmt
 	Label  string
+	// ContinueStep is the cursor advance a continue owes this loop, which the
+	// labeled-continue pass runs before a continue it injects here. The emitter
+	// writes its own copy at the bottom of the loop for a normal iteration, so it
+	// ignores this field.
+	ContinueStep []Stmt
 }
 
 // LabeledBreak marks a Go break that names an outer loop. It is a transient node
@@ -107,15 +117,23 @@ type RangeString struct {
 // reaches the emitter; both the verifier and the emitter reject one that leaks.
 type LabeledBreak struct{ Label string }
 
-func (*ExprStmt) isStmt()     {}
-func (*AssignStmt) isStmt()   {}
-func (*IfStmt) isStmt()       {}
-func (*ForStmt) isStmt()      {}
-func (*ForRange) isStmt()     {}
-func (*Break) isStmt()        {}
-func (*Continue) isStmt()     {}
-func (*RangeString) isStmt()  {}
-func (*LabeledBreak) isStmt() {}
+// LabeledContinue marks a Go continue that names an outer loop. Like LabeledBreak
+// it is transient: the labeled-jump pass rewrites it into a flag that breaks the
+// inner loops and continues the named loop, running that loop's step first, all
+// before the module is verified, so it never reaches the emitter and both the
+// verifier and the emitter reject one that leaks.
+type LabeledContinue struct{ Label string }
+
+func (*ExprStmt) isStmt()        {}
+func (*AssignStmt) isStmt()      {}
+func (*IfStmt) isStmt()          {}
+func (*ForStmt) isStmt()         {}
+func (*ForRange) isStmt()        {}
+func (*Break) isStmt()           {}
+func (*Continue) isStmt()        {}
+func (*RangeString) isStmt()     {}
+func (*LabeledBreak) isStmt()    {}
+func (*LabeledContinue) isStmt() {}
 
 // Expr is an expression node.
 type Expr interface{ isExpr() }

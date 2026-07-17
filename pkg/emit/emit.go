@@ -238,6 +238,8 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		}
 	case *ir.LabeledBreak:
 		return fmt.Errorf("emit: labeled break to %q reached the emitter unresolved", s.Label)
+	case *ir.LabeledContinue:
+		return fmt.Errorf("emit: labeled continue to %q reached the emitter unresolved", s.Label)
 	default:
 		return fmt.Errorf("emit: unsupported statement type %T", s)
 	}

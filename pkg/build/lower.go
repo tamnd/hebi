@@ -146,7 +146,7 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if err != nil {
 		return nil, err
 	}
-	body = resolveLabeledBreaks(body)
+	body = resolveLabeledJumps(body)
 	return &ir.Func{Name: fd.Name.Name, Body: body}, nil
 }
 
@@ -350,8 +350,9 @@ func (l *lowerer) lowerLabeled(s *ast.LabeledStmt) ([]ir.Stmt, error) {
 // switch is one hebi cannot yet place faithfully. A labeled break that names an
 // enclosing loop becomes a LabeledBreak marker the later pass turns into flags. An
 // unlabeled continue advances the innermost loop; the step a while-form loop owes
-// it is threaded in by the loop lowering, not here. Labeled continue and goto wait
-// on their own slice.
+// it is threaded in by the loop lowering, not here. A labeled continue that names
+// an enclosing loop becomes a LabeledContinue marker the later pass turns into
+// flags, the same way a labeled break does. A goto still waits on its own slice.
 func (l *lowerer) lowerBranch(s *ast.BranchStmt) ([]ir.Stmt, error) {
 	switch s.Tok {
 	case token.BREAK:
@@ -367,7 +368,10 @@ func (l *lowerer) lowerBranch(s *ast.BranchStmt) ([]ir.Stmt, error) {
 		return []ir.Stmt{&ir.Break{}}, nil
 	case token.CONTINUE:
 		if s.Label != nil {
-			return nil, l.errf(s.Pos(), "labeled continue is not supported yet")
+			if !l.labelIsLoop(s.Label.Name) {
+				return nil, l.errf(s.Pos(), "labeled continue to %s is not supported yet", s.Label.Name)
+			}
+			return []ir.Stmt{&ir.LabeledContinue{Label: s.Label.Name}}, nil
 		}
 		return []ir.Stmt{&ir.Continue{}}, nil
 	case token.GOTO:
@@ -377,52 +381,97 @@ func (l *lowerer) lowerBranch(s *ast.BranchStmt) ([]ir.Stmt, error) {
 	}
 }
 
-// resolveLabeledBreaks rewrites the LabeledBreak markers in a block into the flag
-// machinery that reproduces a labeled break in Python, which has no loop labels. A
-// break naming the innermost loop is just a plain break. A break naming an outer
-// loop sets a per-label flag and breaks the innermost loop; then after each nested
-// loop the flag is checked and the enclosing loop breaks too, so the break unwinds
-// one loop at a time until it reaches the named loop. The flag is declared just
-// before the named loop. innerLabel is the label of the nearest enclosing loop,
-// and used records which flags were set so the declaration is emitted only where a
-// flag is really needed. The returned set is the labels that still escape this
-// block, for the caller to keep unwinding.
-func resolveLabeledBreaks(stmts []ir.Stmt) []ir.Stmt {
-	out, _ := rewriteBreaks(stmts, "", map[string]bool{})
+// jumpKind tells a labeled break from a labeled continue in the resolve pass. The
+// two share every step of the unwinding except the action taken at the loop they
+// name: a break leaves that loop, a continue advances it.
+type jumpKind int
+
+const (
+	jumpBreak jumpKind = iota
+	jumpContinue
+)
+
+// jump is a labeled break or continue to a named loop. It is the key the resolve
+// pass tracks, so a break flag and a continue flag to the same loop stay distinct
+// and never collide.
+type jump struct {
+	label string
+	kind  jumpKind
+}
+
+// jumpFlag names the boolean a jump sets, distinct per label and per kind so a
+// break and a continue to the same loop do not share a flag.
+func jumpFlag(j jump) string {
+	if j.kind == jumpContinue {
+		return "_cnt_" + j.label
+	}
+	return "_brk_" + j.label
+}
+
+// resolveLabeledJumps rewrites the LabeledBreak and LabeledContinue markers in a
+// block into the flag machinery that reproduces a labeled jump in Python, which
+// has no loop labels. A jump naming the loop it sits directly in is a plain break
+// or a plain continue. A jump naming an outer loop sets a per-jump flag and breaks
+// the innermost loop; then after each nested loop the flag is checked and the
+// enclosing loop breaks too, so control unwinds one loop at a time until it
+// reaches the named loop, where a break leaves it and a continue advances it. The
+// flag is declared just before the named loop. innerLabel and innerStep are the
+// label and continue step of the nearest enclosing loop, and used records which
+// flags were set so a declaration is emitted only where a flag is really needed.
+// The returned set is the jumps that still escape this block, for the caller to
+// keep unwinding.
+func resolveLabeledJumps(stmts []ir.Stmt) []ir.Stmt {
+	out, _ := rewriteJumps(stmts, "", nil, map[jump]bool{})
 	return out
 }
 
-func rewriteBreaks(stmts []ir.Stmt, innerLabel string, used map[string]bool) ([]ir.Stmt, map[string]bool) {
-	escapes := map[string]bool{}
+func rewriteJumps(stmts []ir.Stmt, innerLabel string, innerStep []ir.Stmt, used map[jump]bool) ([]ir.Stmt, map[jump]bool) {
+	escapes := map[jump]bool{}
 	var out []ir.Stmt
 	for _, s := range stmts {
 		switch s := s.(type) {
 		case *ir.LabeledBreak:
+			j := jump{label: s.Label, kind: jumpBreak}
 			if s.Label == innerLabel {
 				// The break names the loop it sits directly in, so a plain break
 				// leaves it, exactly as an unlabeled break would.
 				out = append(out, &ir.Break{})
 			} else {
-				used[s.Label] = true
-				out = append(out, &ir.AssignStmt{Name: breakFlag(s.Label), Value: &ir.BoolLit{Value: true}})
+				used[j] = true
+				out = append(out, &ir.AssignStmt{Name: jumpFlag(j), Value: &ir.BoolLit{Value: true}})
 				out = append(out, &ir.Break{})
-				escapes[s.Label] = true
+				escapes[j] = true
+			}
+		case *ir.LabeledContinue:
+			j := jump{label: s.Label, kind: jumpContinue}
+			if s.Label == innerLabel {
+				// The continue names the loop it sits directly in, so it runs that
+				// loop's step and continues it, exactly as an unlabeled continue
+				// would; a bare Python continue would skip the step.
+				out = append(out, innerStep...)
+				out = append(out, &ir.Continue{})
+			} else {
+				used[j] = true
+				out = append(out, &ir.AssignStmt{Name: jumpFlag(j), Value: &ir.BoolLit{Value: true}})
+				out = append(out, &ir.Break{})
+				escapes[j] = true
 			}
 		case *ir.IfStmt:
-			// An if is transparent to break, so its branches unwind to the same
+			// An if is transparent to a jump, so its branches unwind to the same
 			// enclosing loop and it never carries a post-loop check of its own.
-			then, eThen := rewriteBreaks(s.Then, innerLabel, used)
-			els, eElse := rewriteBreaks(s.Else, innerLabel, used)
+			then, eThen := rewriteJumps(s.Then, innerLabel, innerStep, used)
+			els, eElse := rewriteJumps(s.Else, innerLabel, innerStep, used)
 			s.Then, s.Else = then, els
-			mergeLabels(escapes, eThen)
-			mergeLabels(escapes, eElse)
+			mergeJumps(escapes, eThen)
+			mergeJumps(escapes, eElse)
 			out = append(out, s)
 		case *ir.ForStmt:
-			out = unwindLoop(out, s, &s.Body, s.Label, innerLabel, escapes, used)
+			out = unwindLoop(out, s, &s.Body, s.Label, s.ContinueStep, innerLabel, innerStep, escapes, used)
 		case *ir.ForRange:
-			out = unwindLoop(out, s, &s.Body, s.Label, innerLabel, escapes, used)
+			// A for-in-range advances on its own, so a continue to it owes no step.
+			out = unwindLoop(out, s, &s.Body, s.Label, nil, innerLabel, innerStep, escapes, used)
 		case *ir.RangeString:
-			out = unwindLoop(out, s, &s.Body, s.Label, innerLabel, escapes, used)
+			out = unwindLoop(out, s, &s.Body, s.Label, s.ContinueStep, innerLabel, innerStep, escapes, used)
 		default:
 			out = append(out, s)
 		}
@@ -431,46 +480,73 @@ func rewriteBreaks(stmts []ir.Stmt, innerLabel string, used map[string]bool) ([]
 }
 
 // unwindLoop rewrites one nested loop's body, then places the loop into the
-// surrounding block with the flag declaration it needs and the post-loop checks
-// that keep a labeled break unwinding. ownLabel is the loop's own label and
-// innerLabel is the enclosing loop's; each label the body still escapes to gets a
-// check that breaks the enclosing loop, and a check for the enclosing loop's own
-// label ends the unwinding there.
-func unwindLoop(out []ir.Stmt, loop ir.Stmt, body *[]ir.Stmt, ownLabel, innerLabel string, escapes, used map[string]bool) []ir.Stmt {
-	newBody, childEsc := rewriteBreaks(*body, ownLabel, used)
+// surrounding block with the flag declarations it needs and the post-loop checks
+// that keep a labeled jump unwinding. ownLabel and ownStep are the loop's own
+// label and continue step, innerLabel and innerStep the enclosing loop's. Each
+// jump the body still escapes to gets a check after the loop: a jump that has not
+// reached its target breaks the enclosing loop and keeps escaping, while a jump
+// that names the enclosing loop ends its unwinding there, a break leaving that
+// loop and a continue running its step and advancing it.
+func unwindLoop(out []ir.Stmt, loop ir.Stmt, body *[]ir.Stmt, ownLabel string, ownStep []ir.Stmt, innerLabel string, innerStep []ir.Stmt, escapes, used map[jump]bool) []ir.Stmt {
+	newBody, childEsc := rewriteJumps(*body, ownLabel, ownStep, used)
 	*body = newBody
-	if ownLabel != "" && used[ownLabel] {
-		// A break inside this loop names it, so the flag it sets must exist before
-		// the loop runs.
-		out = append(out, &ir.AssignStmt{Name: breakFlag(ownLabel), Value: &ir.BoolLit{Value: false}})
+	if ownLabel != "" {
+		// A jump inside this loop names it, so the flag it sets must exist before
+		// the loop runs, both for the first iteration and for a break's check after
+		// the loop.
+		for _, kind := range []jumpKind{jumpBreak, jumpContinue} {
+			j := jump{label: ownLabel, kind: kind}
+			if used[j] {
+				out = append(out, &ir.AssignStmt{Name: jumpFlag(j), Value: &ir.BoolLit{Value: false}})
+			}
+		}
 	}
 	out = append(out, loop)
-	for _, label := range sortedLabels(childEsc) {
-		out = append(out, &ir.IfStmt{Cond: &ir.Ident{Name: breakFlag(label)}, Then: []ir.Stmt{&ir.Break{}}})
-		if label != innerLabel {
-			escapes[label] = true
+	for _, j := range sortedJumps(childEsc) {
+		if j.label == innerLabel {
+			out = append(out, terminalCheck(j, innerStep))
+		} else {
+			out = append(out, &ir.IfStmt{Cond: &ir.Ident{Name: jumpFlag(j)}, Then: []ir.Stmt{&ir.Break{}}})
+			escapes[j] = true
 		}
 	}
 	return out
 }
 
-func breakFlag(label string) string { return "_brk_" + label }
+// terminalCheck builds the check that ends a jump's unwinding at the loop it
+// names. A break simply leaves the loop. A continue clears its flag so the next
+// iteration starts fresh, runs the loop's step, then continues, which reproduces
+// Go's continue that advances the named loop while abandoning the inner ones.
+func terminalCheck(j jump, step []ir.Stmt) *ir.IfStmt {
+	if j.kind == jumpContinue {
+		then := []ir.Stmt{&ir.AssignStmt{Name: jumpFlag(j), Value: &ir.BoolLit{Value: false}}}
+		then = append(then, step...)
+		then = append(then, &ir.Continue{})
+		return &ir.IfStmt{Cond: &ir.Ident{Name: jumpFlag(j)}, Then: then}
+	}
+	return &ir.IfStmt{Cond: &ir.Ident{Name: jumpFlag(j)}, Then: []ir.Stmt{&ir.Break{}}}
+}
 
-func mergeLabels(dst, src map[string]bool) {
+func mergeJumps(dst, src map[jump]bool) {
 	for k := range src {
 		dst[k] = true
 	}
 }
 
-// sortedLabels returns the labels in a set in a stable order, so the emitted
-// checks do not depend on Go's map iteration order.
-func sortedLabels(set map[string]bool) []string {
-	labels := make([]string, 0, len(set))
-	for k := range set {
-		labels = append(labels, k)
+// sortedJumps returns the jumps in a set in a stable order, by label then kind, so
+// the emitted checks do not depend on Go's map iteration order.
+func sortedJumps(set map[jump]bool) []jump {
+	jumps := make([]jump, 0, len(set))
+	for j := range set {
+		jumps = append(jumps, j)
 	}
-	sort.Strings(labels)
-	return labels
+	sort.Slice(jumps, func(a, b int) bool {
+		if jumps[a].label != jumps[b].label {
+			return jumps[a].label < jumps[b].label
+		}
+		return jumps[a].kind < jumps[b].kind
+	})
+	return jumps
 }
 
 // runBeforeContinue rewrites a loop body so a continue first runs the given step,
@@ -711,18 +787,21 @@ func (l *lowerer) lowerFor(s *ast.ForStmt, label string) ([]ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
+	var contStep []ir.Stmt
 	if s.Post != nil {
 		// The post runs at the bottom of the loop body on a normal iteration, and
 		// a continue must run it too, or the loop would skip the step and spin, so
-		// the step is threaded in before each continue as well.
+		// the step is threaded in before each continue as well. The same step is
+		// kept on the node so a labeled continue the pass injects here runs it too.
 		post, err := l.lowerStmt(s.Post)
 		if err != nil {
 			return nil, err
 		}
+		contStep = post
 		body = runBeforeContinue(body, post)
 		body = append(body, post...)
 	}
-	return append(pre, &ir.ForStmt{Cond: cond, Body: body, Label: label}), nil
+	return append(pre, &ir.ForStmt{Cond: cond, Body: body, Label: label, ContinueStep: contStep}), nil
 }
 
 // lowerWhile lowers a condition-only or infinite for loop to a while. A nil
@@ -953,13 +1032,14 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt, label string) ([]ir.Stmt, error) 
 	advance := []ir.Stmt{&ir.AssignStmt{Name: cursor, Value: &ir.BinaryExpr{Op: "+", X: &ir.Ident{Name: cursor}, Y: &ir.Ident{Name: width}}}}
 	body = runBeforeContinue(body, advance)
 	rs := &ir.RangeString{
-		Key:    rangeIdent(s.Key),
-		Value:  rangeIdent(s.Value),
-		Cursor: cursor,
-		Width:  width,
-		Source: source,
-		Body:   body,
-		Label:  label,
+		Key:          rangeIdent(s.Key),
+		Value:        rangeIdent(s.Value),
+		Cursor:       cursor,
+		Width:        width,
+		Source:       source,
+		Body:         body,
+		Label:        label,
+		ContinueStep: advance,
 	}
 	return append(pre, rs), nil
 }

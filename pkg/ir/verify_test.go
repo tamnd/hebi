@@ -55,6 +55,9 @@ func TestVerifyRejects(t *testing.T) {
 		{"leaked labeled break", func(m *Module) {
 			m.Funcs[0].Body = append(m.Funcs[0].Body, &LabeledBreak{Label: "Outer"})
 		}, "unresolved labeled break to \"Outer\""},
+		{"leaked labeled continue", func(m *Module) {
+			m.Funcs[0].Body = append(m.Funcs[0].Body, &LabeledContinue{Label: "Outer"})
+		}, "unresolved labeled continue to \"Outer\""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -364,6 +364,73 @@ if __name__ == "__main__":
 	}
 }
 
+// TestLabeledContinue checks a continue that names an outer loop against go run.
+// The unwinding mirrors labeled break, but the named loop advances instead of
+// ending, so the cases cross one level and several, continue an outer while form
+// whose post must still run, continue an outer counted loop and an outer range
+// over a string, continue from inside an if and from inside a switch nested in the
+// loops, name the immediately enclosing loop where the continue is really plain,
+// and mix a labeled break and a labeled continue to the same loop so their flags
+// must not collide.
+func TestLabeledContinue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"one level", "Outer:\n\tfor i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t\tfmt.Println(\"after inner\", i)\n\t}"},
+		{"two levels", "Outer:\n\tfor i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tfor k := range 3 {\n\t\t\t\tif k == 1 {\n\t\t\t\t\tcontinue Outer\n\t\t\t\t}\n\t\t\t\tfmt.Println(i, j, k)\n\t\t\t}\n\t\t\tfmt.Println(\"mid\", i, j)\n\t\t}\n\t}"},
+		{"while form post runs", "sum := 0\nOuter:\n\tfor i := 0; i < 4; i = i + 1 {\n\t\tfor j := range 4 {\n\t\t\tif j == 2 {\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t\tsum += i * j\n\t\t}\n\t\tsum += 100\n\t}\n\tfmt.Println(sum)"},
+		{"while form step two", "total := 0\nOuter:\n\tfor i := 0; i < 10; i += 2 {\n\t\tfor j := range 3 {\n\t\t\tif i+j > 6 {\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t\ttotal += i\n\t\t}\n\t}\n\tfmt.Println(total)"},
+		{"range string target", "Outer:\n\tfor i, c := range \"abcd\" {\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t\tfmt.Println(i, c, j)\n\t\t}\n\t\tfmt.Println(\"tail\", i)\n\t}"},
+		{"continue from switch", "Outer:\n\tfor i := range 4 {\n\t\tfor j := range 4 {\n\t\t\tswitch {\n\t\t\tcase j == 2:\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t\tfmt.Println(\"row\", i)\n\t}"},
+		{"names inner loop", "for i := range 3 {\n\tInner:\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tcontinue Inner\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"break and continue same loop", "Outer:\n\tfor i := range 4 {\n\t\tfor j := range 4 {\n\t\t\tif j == 2 {\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t\tif i == 3 {\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t\tfmt.Println(\"done row\", i)\n\t}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
+// TestLabeledContinueEmit pins the readable flag shape a two-level labeled
+// continue lowers to. The named loop is written with a plain-assignment post so it
+// stays a while form rather than a counted range, which is where the step
+// threading shows: the flag is declared before the loop, set and broken at the
+// site, and after the inner loop it is cleared, the loop's post is run, and the
+// loop continues, so the named loop advances while the inner one is abandoned.
+func TestLabeledContinueEmit(t *testing.T) {
+	t.Parallel()
+	body := "Outer:\n\tfor i := 0; i < 3; i = i + 1 {\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tcontinue Outer\n\t\t\t}\n\t\t}\n\t}"
+	want := `import _hebirt
+
+
+def main():
+    i = 0
+    _cnt_Outer = False
+    while (i < 3):
+        for j in range(3):
+            if (j == 1):
+                _cnt_Outer = True
+                break
+        if _cnt_Outer:
+            _cnt_Outer = False
+            i = _hebirt._i64((i + 1))
+            continue
+        i = _hebirt._i64((i + 1))
+
+
+if __name__ == "__main__":
+    main()
+`
+	got := emitOf(t, "package main\n\nfunc main() {\n\t"+body+"\n}\n")
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")
@@ -504,7 +571,6 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"parameter", "package main\n\nfunc f(x int) {}\n\nfunc main() {}\n"},
 		{"result", "package main\n\nfunc f() int { return 0 }\n\nfunc main() {}\n"},
 		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},
-		{"labeled continue", "package main\n\nfunc main() {\nOuter:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tcontinue Outer\n\t\t}\n\t\t_ = i\n\t}\n}\n"},
 		{"labeled switch", "package main\n\nfunc main() {\n\tx := 1\nSw:\n\tswitch x {\n\tcase 1:\n\t\tbreak Sw\n\t}\n}\n"},
 		{"goto", "package main\n\nfunc main() {\n\ti := 0\nLoop:\n\tif i < 3 {\n\t\ti++\n\t\tgoto Loop\n\t}\n}\n"},
 		{"non-tail break in switch", "package main\n\nfunc main() {\n\tx := 1\n\tswitch x {\n\tcase 1:\n\t\tbreak\n\t\tprintln(\"after\")\n\t}\n}\n"},
