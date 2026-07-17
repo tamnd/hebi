@@ -568,15 +568,16 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		source string
 	}{
 		{"method", "package main\n\ntype T struct{}\n\nfunc (T) m() {}\n\nfunc main() {}\n"},
-		{"parameter", "package main\n\nfunc f(x int) {}\n\nfunc main() {}\n"},
-		{"result", "package main\n\nfunc f() int { return 0 }\n\nfunc main() {}\n"},
+		{"multiple results", "package main\n\nfunc f() (int, int) { return 0, 0 }\n\nfunc main() { _, _ = f() }\n"},
+		{"named result", "package main\n\nfunc f() (n int) { return }\n\nfunc main() { _ = f() }\n"},
+		{"variadic parameter", "package main\n\nfunc f(xs ...int) {}\n\nfunc main() { f() }\n"},
+		{"embedded pointer field", "package main\n\ntype Inner struct{ N int }\n\ntype Outer struct {\n\t*Inner\n\tM int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"},
 		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},
 		{"labeled switch", "package main\n\nfunc main() {\n\tx := 1\nSw:\n\tswitch x {\n\tcase 1:\n\t\tbreak Sw\n\t}\n}\n"},
 		{"goto", "package main\n\nfunc main() {\n\ti := 0\nLoop:\n\tif i < 3 {\n\t\ti++\n\t\tgoto Loop\n\t}\n}\n"},
 		{"non-tail break in switch", "package main\n\nfunc main() {\n\tx := 1\n\tswitch x {\n\tcase 1:\n\t\tbreak\n\t\tprintln(\"after\")\n\t}\n}\n"},
 		{"statement label", "package main\n\nfunc main() {\nDone:\n\tprintln(\"hi\")\n\t_ = 0\n\tgoto Done\n}\n"},
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
-		{"embedded field", "package main\n\ntype Inner struct{ N int }\n\ntype Outer struct {\n\tInner\n\tM int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"},
 		{"pointer field", "package main\n\ntype Node struct {\n\tV int\n\tNext *Node\n}\n\nfunc main() {\n\tvar n Node\n\t_ = n\n}\n"},
 		{"slice field", "package main\n\ntype Bag struct{ Items []int }\n\nfunc main() {\n\tvar b Bag\n\t_ = b\n}\n"},
 	}
@@ -661,9 +662,9 @@ func TestStructs(t *testing.T) {
 }
 
 // TestStructsEmit pins the exact Python a struct lowers to: a class with a
-// __slots__ tuple, a zero-value constructor, and a copy method, plus the
-// constructor call, the copy at the value assignment, and the field reads in
-// main.
+// __slots__ tuple, a zero-value constructor, a copy method, and the field-wise
+// __eq__ and matching __hash__ a comparable struct earns, plus the constructor
+// call, the copy at the value assignment, and the field reads in main.
 func TestStructsEmit(t *testing.T) {
 	t.Parallel()
 	source := "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\ta := Point{1, 2}\n\tb := a\n\tb.X = 99\n\tfmt.Println(a.X, b.X)\n}\n"
@@ -679,6 +680,14 @@ class Point:
 
     def copy(self):
         return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
 
 
 def main():
@@ -711,6 +720,14 @@ func TestStructValueFieldEmit(t *testing.T) {
     def copy(self):
         return Inner(self.N)
 
+    def __eq__(self, other):
+        if other.__class__ is not Inner:
+            return NotImplemented
+        return self.N == other.N
+
+    def __hash__(self):
+        return hash((self.N,))
+
 
 class Outer:
     __slots__ = ("V", "K")
@@ -722,10 +739,178 @@ class Outer:
     def copy(self):
         return Outer(self.V.copy(), self.K)
 
+    def __eq__(self, other):
+        if other.__class__ is not Outer:
+            return NotImplemented
+        return self.V == other.V and self.K == other.K
+
+    def __hash__(self):
+        return hash((self.V, self.K))
+
 
 def main():
     o = Outer()
     _ = o
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestStructValueSemantics checks the copy-on-call and copy-on-return sites and
+// struct comparison by value against go run. A struct passed by value is an
+// independent copy, so a mutation inside the callee does not touch the caller's;
+// a struct returned by value is independent of the callee's frame; and == and !=
+// compare field by field, recursing into a value-struct field, so two structs
+// with equal fields are equal and one differing field makes them unequal.
+func TestStructValueSemantics(t *testing.T) {
+	t.Parallel()
+	const point = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\n"
+	const boxed = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\ntype Box struct {\n\tP Point\n}\n\n"
+	const mixed = "package main\n\nimport \"fmt\"\n\ntype Inner struct {\n\tN int\n}\n\ntype Outer struct {\n\tV Inner\n\tK int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"copy on call is independent", point + "func bump(p Point) {\n\tp.X = 99\n}\n\nfunc main() {\n\ta := Point{1, 2}\n\tbump(a)\n\tfmt.Println(a.X)\n}\n"},
+		{"copy on return of a field", boxed + "func get(b Box) Point {\n\treturn b.P\n}\n\nfunc main() {\n\tb := Box{P: Point{1, 2}}\n\tp := get(b)\n\tp.X = 99\n\tfmt.Println(b.P.X, p.X)\n}\n"},
+		{"return of a param copies", point + "func idp(p Point) Point {\n\treturn p\n}\n\nfunc main() {\n\ta := Point{1, 2}\n\tc := idp(a)\n\tc.X = 7\n\tfmt.Println(a.X, c.X)\n}\n"},
+		{"fresh literal arg not double copied", point + "func first(p Point) int {\n\treturn p.X\n}\n\nfunc main() {\n\tfmt.Println(first(Point{5, 6}))\n}\n"},
+		{"scalar param and return", "package main\n\nimport \"fmt\"\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n\nfunc main() {\n\tfmt.Println(add(2, 3))\n}\n"},
+		{"comparison by value", point + "func main() {\n\ta := Point{1, 2}\n\tb := Point{1, 2}\n\tc := Point{1, 3}\n\tfmt.Println(a == b, a == c, a != c)\n}\n"},
+		{"nested comparison recurses", mixed + "func main() {\n\ta := Outer{V: Inner{1}, K: 2}\n\tb := Outer{V: Inner{1}, K: 2}\n\tc := Outer{V: Inner{9}, K: 2}\n\tfmt.Println(a == b, a == c)\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestEmbeddedPromotion checks embedded-field promotion against go run: a
+// promoted field reads and writes through the embedded slot, the embedded field
+// is reachable by its type name too, a value copy of the outer struct copies the
+// embedded value deeply, and comparison recurses through the embedded field.
+func TestEmbeddedPromotion(t *testing.T) {
+	t.Parallel()
+	const base = "package main\n\nimport \"fmt\"\n\ntype Base struct {\n\tID int\n}\n\ntype User struct {\n\tBase\n\tName int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"promoted read and write", base + "func main() {\n\tvar u User\n\tu.ID = 7\n\tu.Name = 3\n\tfmt.Println(u.ID, u.Name, u.Base.ID)\n}\n"},
+		{"keyed literal with embedded field", base + "func main() {\n\tu := User{Base: Base{ID: 1}, Name: 2}\n\tfmt.Println(u.ID, u.Name)\n}\n"},
+		{"copy is deep through embed", base + "func main() {\n\ta := User{Base: Base{ID: 1}, Name: 2}\n\tb := a\n\tb.ID = 99\n\tfmt.Println(a.ID, b.ID)\n}\n"},
+		{"comparison recurses through embed", base + "func main() {\n\ta := User{Base: Base{1}, Name: 2}\n\tb := User{Base: Base{1}, Name: 2}\n\tc := User{Base: Base{5}, Name: 2}\n\tfmt.Println(a == b, a == c)\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestEmbeddedPromotionEmit pins the Python an embedded struct lowers to: the
+// embedded field is a value-struct slot named for its type, its constructor
+// parameter is suffixed so the Base() call that builds a zero still resolves, and
+// a promoted field access reads through the embedded slot with no runtime
+// delegation, resolved at the selector the way go/types resolved it.
+func TestEmbeddedPromotionEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nimport \"fmt\"\n\ntype Base struct {\n\tID int\n}\n\ntype User struct {\n\tBase\n\tName int\n}\n\nfunc main() {\n\tvar u User\n\tu.ID = 7\n\tfmt.Println(u.ID)\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Base:
+    __slots__ = ("ID",)
+
+    def __init__(self, ID=0):
+        self.ID = ID
+
+    def copy(self):
+        return Base(self.ID)
+
+    def __eq__(self, other):
+        if other.__class__ is not Base:
+            return NotImplemented
+        return self.ID == other.ID
+
+    def __hash__(self):
+        return hash((self.ID,))
+
+
+class User:
+    __slots__ = ("Base", "Name")
+
+    def __init__(self, Base_=None, Name=0):
+        self.Base = Base_ if Base_ is not None else Base()
+        self.Name = Name
+
+    def copy(self):
+        return User(self.Base.copy(), self.Name)
+
+    def __eq__(self, other):
+        if other.__class__ is not User:
+            return NotImplemented
+        return self.Base == other.Base and self.Name == other.Name
+
+    def __hash__(self):
+        return hash((self.Base, self.Name))
+
+
+def main():
+    u = User()
+    u.Base.ID = 7
+    ` + shim.Name + `.println(u.Base.ID)
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestFuncParamsEmit pins the plain-function surface: parameters become the
+// Python signature and a single return becomes a return statement, with a struct
+// argument cloned at the call and a returned struct value cloned at the return,
+// the copy-on-call and copy-on-return sites.
+func TestFuncParamsEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc idp(p Point) Point {\n\treturn p\n}\n\nfunc main() {\n\ta := Point{1, 2}\n\t_ = idp(a)\n}\n"
+	want := `class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
+
+
+def idp(p):
+    return p.copy()
+
+
+def main():
+    a = Point(1, 2)
+    _ = idp(a.copy())
 
 
 if __name__ == "__main__":

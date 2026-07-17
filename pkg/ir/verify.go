@@ -56,6 +56,11 @@ func Verify(m *Module) error {
 			return fmt.Errorf("ir: func %s is defined more than once", fn.Name)
 		}
 		seen[fn.Name] = true
+		for j, p := range fn.Params {
+			if p == "" {
+				return fmt.Errorf("ir: func %s: parameter %d has no name", fn.Name, j)
+			}
+		}
 		if err := verifyBlock(fn.Name, fn.Body); err != nil {
 			return err
 		}
@@ -78,6 +83,12 @@ func verifyStmt(where string, s Stmt) error {
 		return fmt.Errorf("ir: %s is nil", where)
 	case *ExprStmt:
 		return verifyExpr(where, s.X)
+	case *ReturnStmt:
+		if s.Value == nil {
+			// A bare return carries no value, so there is nothing to check.
+			return nil
+		}
+		return verifyExpr(where+": value", s.Value)
 	case *AssignStmt:
 		if s.Name == "" {
 			return fmt.Errorf("ir: %s assigns to an empty name", where)

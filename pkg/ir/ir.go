@@ -29,6 +29,27 @@ type StructDef struct {
 	Name string
 	// Fields are the struct's fields in declaration order.
 	Fields []StructField
+	// Comparable is true when every field is comparable, so the struct earns a
+	// field-wise __eq__ and a matching __hash__; Go rejects == on a struct that is
+	// not comparable, so the emitter leaves such a struct with Python's identity
+	// equality instead.
+	Comparable bool
+}
+
+// CtorParamName returns the constructor parameter name for a field of this
+// struct. It matches the field's attribute name except when that name would
+// shadow a sibling value-struct's class inside the constructor body, where a
+// zero value is built by calling that class: then the parameter is suffixed with
+// an underscore so the class name still resolves. This arises for an embedded
+// value struct, whose field name is its type name, so a field named Base would
+// otherwise shadow the Base() call that builds another field's zero.
+func (sd *StructDef) CtorParamName(field string) string {
+	for _, g := range sd.Fields {
+		if g.Kind == FieldStruct && g.Struct == field {
+			return field + "_"
+		}
+	}
+	return field
 }
 
 // FieldKind tells the emitter how a field takes part in construction and
@@ -57,11 +78,16 @@ type StructField struct {
 	Struct string
 }
 
-// Func is a function definition. At M0 functions take no parameters and return
-// nothing; parameters and returns arrive in M3.
+// Func is a function definition. Params are the parameter names in order, bound
+// positionally at the call site; a blank or unnamed Go parameter is given a
+// synthetic name so the Python signature stays well formed. A function returns at
+// most one value in this milestone, through ReturnStmt; multiple and named
+// returns arrive in M3.
 type Func struct {
 	// Name is the function name.
 	Name string
+	// Params are the parameter names in declaration order.
+	Params []string
 	// Body is the ordered list of statements.
 	Body []Stmt
 }
@@ -79,6 +105,11 @@ type AssignStmt struct {
 	Value  Expr
 	Define bool
 }
+
+// ReturnStmt returns from a function. Value is the returned expression, or nil
+// for a bare return with no value. A struct value returned by value is cloned at
+// the return by the lowering, since the caller receives an independent value.
+type ReturnStmt struct{ Value Expr }
 
 // IfStmt is a conditional. Else may be empty.
 type IfStmt struct {
@@ -173,6 +204,7 @@ type LabeledBreak struct{ Label string }
 type LabeledContinue struct{ Label string }
 
 func (*ExprStmt) isStmt()        {}
+func (*ReturnStmt) isStmt()      {}
 func (*AssignStmt) isStmt()      {}
 func (*SetField) isStmt()        {}
 func (*IfStmt) isStmt()          {}

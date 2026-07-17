@@ -154,6 +154,57 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleComparableAndFunc pins the emitter's comparable-struct and
+// plain-function surface directly: a struct marked comparable earns __eq__ and
+// __hash__, a function carries its parameter names in the signature, and a return
+// statement carries its value.
+func TestModuleComparableAndFunc(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Structs: []*ir.StructDef{
+			{Name: "Point", Comparable: true, Fields: []ir.StructField{
+				{Name: "X", Kind: ir.FieldScalar, Zero: &ir.IntLit{Text: "0"}},
+				{Name: "Y", Kind: ir.FieldScalar, Zero: &ir.IntLit{Text: "0"}},
+			}},
+		},
+		Funcs: []*ir.Func{{
+			Name:   "idp",
+			Params: []string{"p"},
+			Body:   []ir.Stmt{&ir.ReturnStmt{Value: &ir.Clone{X: &ir.Ident{Name: "p"}}}},
+		}},
+	}
+	want := `class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
+
+
+def idp(p):
+    return p.copy()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestModuleMaskAndUnary(t *testing.T) {
 	t.Parallel()
 	// func main() { fmt.Println(_u8(-(a))) } exercises both new nodes and the
