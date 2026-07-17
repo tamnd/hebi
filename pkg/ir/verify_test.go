@@ -29,6 +29,28 @@ func TestVerifyAcceptsWellFormed(t *testing.T) {
 	}
 }
 
+// TestVerifyAcceptsFuncSurface checks a function with parameters and a value
+// return, plus a bare return, passes structural verification.
+func TestVerifyAcceptsFuncSurface(t *testing.T) {
+	t.Parallel()
+	m := &Module{
+		Package: "main",
+		Funcs: []*Func{{
+			Name:   "add",
+			Params: []string{"a", "b"},
+			Body: []Stmt{
+				&ReturnStmt{Value: &BinaryExpr{Op: "+", X: &Ident{Name: "a"}, Y: &Ident{Name: "b"}}},
+			},
+		}, {
+			Name: "noop",
+			Body: []Stmt{&ReturnStmt{}},
+		}},
+	}
+	if err := Verify(m); err != nil {
+		t.Fatalf("Verify rejected a well-formed function surface: %v", err)
+	}
+}
+
 func TestVerifyRejects(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -58,6 +80,10 @@ func TestVerifyRejects(t *testing.T) {
 		{"leaked labeled continue", func(m *Module) {
 			m.Funcs[0].Body = append(m.Funcs[0].Body, &LabeledContinue{Label: "Outer"})
 		}, "unresolved labeled continue to \"Outer\""},
+		{"empty param name", func(m *Module) { m.Funcs[0].Params = []string{""} }, "parameter 0 has no name"},
+		{"bad return value", func(m *Module) {
+			m.Funcs[0].Body = append(m.Funcs[0].Body, &ReturnStmt{Value: &BinaryExpr{Op: "", X: &IntLit{Text: "1"}, Y: &IntLit{Text: "2"}}})
+		}, "no operator"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

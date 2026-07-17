@@ -127,6 +127,10 @@ func blockUsesShim(body []ir.Stmt) bool {
 			if exprUsesShim(s.X) {
 				return true
 			}
+		case *ir.ReturnStmt:
+			if exprUsesShim(s.Value) {
+				return true
+			}
 		case *ir.AssignStmt:
 			if exprUsesShim(s.Value) {
 				return true
@@ -188,7 +192,7 @@ func argsUseShim(args []ir.Expr) bool {
 }
 
 func emitFunc(b *strings.Builder, fn *ir.Func) error {
-	fmt.Fprintf(b, "def %s():\n", fn.Name)
+	fmt.Fprintf(b, "def %s(%s):\n", fn.Name, strings.Join(fn.Params, ", "))
 	return emitBlock(b, fn.Body, 1)
 }
 
@@ -224,7 +228,7 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) {
 			// error; a struct field defaults to None and is built in the body.
 			def, _ = emitExpr(f.Zero)
 		}
-		fmt.Fprintf(b, ", %s=%s", f.Name, def)
+		fmt.Fprintf(b, ", %s=%s", sd.CtorParamName(f.Name), def)
 	}
 	b.WriteString("):\n")
 	if len(sd.Fields) == 0 {
@@ -232,11 +236,12 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) {
 		b.WriteString("pass\n")
 	}
 	for _, f := range sd.Fields {
+		param := sd.CtorParamName(f.Name)
 		writeIndent(b, 2)
 		if f.Kind == ir.FieldStruct {
-			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s()\n", f.Name, f.Name, f.Name, f.Struct)
+			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s()\n", f.Name, param, param, f.Struct)
 		} else {
-			fmt.Fprintf(b, "self.%s = %s\n", f.Name, f.Name)
+			fmt.Fprintf(b, "self.%s = %s\n", f.Name, param)
 		}
 	}
 
@@ -256,6 +261,52 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) {
 		}
 	}
 	b.WriteString(")\n")
+
+	if sd.Comparable {
+		emitStructEq(b, sd)
+	}
+}
+
+// emitStructEq writes the field-wise __eq__ and matching __hash__ a comparable Go
+// struct earns, so == compares by value and the struct can serve as a map key.
+// __eq__ guards on the exact class and returns NotImplemented on a mismatch, which
+// is defensive since Go only ever compares two values of the same type, then
+// compares field by field, recursing into a value-struct field through its own
+// __eq__. __hash__ hashes the tuple of the same fields in the same order, so the
+// two agree.
+func emitStructEq(b *strings.Builder, sd *ir.StructDef) {
+	b.WriteString("\n")
+	writeIndent(b, 1)
+	b.WriteString("def __eq__(self, other):\n")
+	writeIndent(b, 2)
+	fmt.Fprintf(b, "if other.__class__ is not %s:\n", sd.Name)
+	writeIndent(b, 3)
+	b.WriteString("return NotImplemented\n")
+	writeIndent(b, 2)
+	if len(sd.Fields) == 0 {
+		b.WriteString("return True\n")
+	} else {
+		parts := make([]string, len(sd.Fields))
+		for i, f := range sd.Fields {
+			parts[i] = fmt.Sprintf("self.%s == other.%s", f.Name, f.Name)
+		}
+		fmt.Fprintf(b, "return %s\n", strings.Join(parts, " and "))
+	}
+
+	b.WriteString("\n")
+	writeIndent(b, 1)
+	b.WriteString("def __hash__(self):\n")
+	writeIndent(b, 2)
+	parts := make([]string, len(sd.Fields))
+	for i, f := range sd.Fields {
+		parts[i] = fmt.Sprintf("self.%s", f.Name)
+	}
+	inner := strings.Join(parts, ", ")
+	if len(sd.Fields) == 1 {
+		// A one-element tuple needs a trailing comma to be a tuple, not a grouping.
+		inner += ","
+	}
+	fmt.Fprintf(b, "return hash((%s))\n", inner)
 }
 
 // emitBlock writes a suite at the given indentation depth, one tab stop being
@@ -284,6 +335,17 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		writeIndent(b, depth)
 		b.WriteString(expr)
 		b.WriteString("\n")
+	case *ir.ReturnStmt:
+		writeIndent(b, depth)
+		if s.Value == nil {
+			b.WriteString("return\n")
+			return nil
+		}
+		value, err := emitExpr(s.Value)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(b, "return %s\n", value)
 	case *ir.AssignStmt:
 		// Python draws no distinction between := and =, so both lower to a
 		// plain binding; the difference only matters to the Go type checker.

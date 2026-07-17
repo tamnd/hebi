@@ -18,7 +18,7 @@ import (
 // error for any surface it does not yet handle, so an unsupported construct
 // fails loudly rather than emitting something wrong.
 func lower(pkg *frontend.Package) (*ir.Module, error) {
-	l := &lowerer{pkg: pkg}
+	l := &lowerer{pkg: pkg, structs: map[string]*ir.StructDef{}}
 	m := &ir.Module{Package: pkg.Name}
 	// Collect struct type declarations first so the emitter has every class
 	// before the functions that construct or read one, and so a value-struct
@@ -36,6 +36,7 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 				}
 				if sd != nil {
 					m.Structs = append(m.Structs, sd)
+					l.structs[sd.Name] = sd
 				}
 			}
 		}
@@ -72,12 +73,13 @@ func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, error) {
 	if !ok {
 		return nil, nil
 	}
-	sd := &ir.StructDef{Name: ts.Name.Name}
+	sd := &ir.StructDef{Name: ts.Name.Name, Comparable: types.Comparable(obj.Type())}
 	for i := range st.NumFields() {
 		fv := st.Field(i)
-		if fv.Anonymous() {
-			return nil, l.errf(ts.Pos(), "embedded field %s is not supported yet", fv.Name())
-		}
+		// An embedded field is a field whose name is its type's name, so it lowers
+		// to a slot named for the embedded type; its members are promoted at the
+		// selector by go/types, resolved into an explicit access path there. A
+		// value-struct embed is a value field like any other, deep-copied in copy.
 		field, err := l.structField(fv.Name(), fv.Type(), ts.Pos())
 		if err != nil {
 			return nil, err
@@ -109,6 +111,10 @@ func (l *lowerer) structField(name string, t types.Type, pos token.Pos) (ir.Stru
 
 type lowerer struct {
 	pkg *frontend.Package
+	// structs indexes the lowered struct definitions by name, so a keyed composite
+	// literal can look up the target struct to translate a field key into the
+	// constructor parameter name, which differs for an embedded value struct.
+	structs map[string]*ir.StructDef
 	// rangeSeq numbers the internal names a range over a string allocates, so a
 	// nested or repeated range gets distinct cursor and width names. It counts
 	// across the whole module in source order, which keeps the emit deterministic.
@@ -202,11 +208,12 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0 {
 		return nil, l.errf(fd.Pos(), "type parameters are not supported yet")
 	}
-	if fd.Type.Params != nil && len(fd.Type.Params.List) > 0 {
-		return nil, l.errf(fd.Pos(), "function parameters are not supported yet")
+	params, err := l.lowerParams(fd.Type.Params)
+	if err != nil {
+		return nil, err
 	}
-	if fd.Type.Results != nil && len(fd.Type.Results.List) > 0 {
-		return nil, l.errf(fd.Pos(), "function results are not supported yet")
+	if err := l.checkResults(fd.Type.Results); err != nil {
+		return nil, err
 	}
 	if fd.Body == nil {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
@@ -216,7 +223,75 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 		return nil, err
 	}
 	body = resolveLabeledJumps(body)
-	return &ir.Func{Name: fd.Name.Name, Body: body}, nil
+	return &ir.Func{Name: fd.Name.Name, Params: params, Body: body}, nil
+}
+
+// lowerParams flattens a function's parameter list to the ordered names the
+// Python signature binds. A field of several names, func(a, b int), expands to one
+// name each, and a blank or unnamed parameter is given a synthetic _pN so the
+// signature stays well formed and no two blanks collide; the body never refers to
+// such a name, matching Go. A variadic parameter waits on its own slice.
+func (l *lowerer) lowerParams(fields *ast.FieldList) ([]string, error) {
+	if fields == nil {
+		return nil, nil
+	}
+	var params []string
+	for _, field := range fields.List {
+		if _, ok := field.Type.(*ast.Ellipsis); ok {
+			return nil, l.errf(field.Pos(), "variadic parameters are not supported yet")
+		}
+		if len(field.Names) == 0 {
+			params = append(params, fmt.Sprintf("_p%d", len(params)))
+			continue
+		}
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				params = append(params, fmt.Sprintf("_p%d", len(params)))
+				continue
+			}
+			params = append(params, name.Name)
+		}
+	}
+	return params, nil
+}
+
+// checkResults rejects the return shapes this milestone does not carry. A single
+// unnamed result is fine and flows through ReturnStmt; multiple results and named
+// results are the readable-tuple and defer-visible-binding work of M3, so they
+// fail loudly here rather than lowering to something wrong.
+func (l *lowerer) checkResults(fields *ast.FieldList) error {
+	if fields == nil {
+		return nil
+	}
+	if len(fields.List) > 1 {
+		return l.errf(fields.Pos(), "multiple return values are not supported yet")
+	}
+	for _, field := range fields.List {
+		if len(field.Names) > 0 {
+			return l.errf(field.Pos(), "named return values are not supported yet")
+		}
+	}
+	return nil
+}
+
+// lowerReturn lowers a return statement. A bare return carries no value. A single
+// returned value that reads a struct value out of a copyable location is cloned,
+// since the caller receives an independent value, which is the copy-on-return site
+// of the value-semantics rule. Multiple returns wait on M3 and are rejected at the
+// function signature before a body reaches here.
+func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
+	if len(s.Results) == 0 {
+		return []ir.Stmt{&ir.ReturnStmt{}}, nil
+	}
+	if len(s.Results) > 1 {
+		return nil, l.errf(s.Pos(), "multiple return values are not supported yet")
+	}
+	value, err := l.lowerExpr(s.Results[0])
+	if err != nil {
+		return nil, err
+	}
+	value = l.copyIfValueRead(s.Results[0], value)
+	return []ir.Stmt{&ir.ReturnStmt{Value: value}}, nil
 }
 
 func (l *lowerer) lowerBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
@@ -260,6 +335,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 			return nil, err
 		}
 		return []ir.Stmt{&ir.ExprStmt{X: x}}, nil
+	case *ast.ReturnStmt:
+		return l.lowerReturn(s)
 	default:
 		return nil, l.errf(s.Pos(), "statement %T is not supported yet", s)
 	}
@@ -396,10 +473,16 @@ func (l *lowerer) lowerFieldTarget(sel *ast.SelectorExpr) (ir.Expr, error) {
 	if !ok || selection.Kind() != types.FieldVal {
 		return nil, l.errf(sel.Pos(), "assignment target %s is not supported yet", sel.Sel.Name)
 	}
-	if len(selection.Index()) != 1 {
-		return nil, l.errf(sel.Pos(), "assignment to a promoted field is not supported yet")
+	base, err := l.lowerExpr(sel.X)
+	if err != nil {
+		return nil, err
 	}
-	return l.lowerExpr(sel.X)
+	// The object of the assignment is the access path down to but not including the
+	// final field, which the caller names from the selector. For a direct field the
+	// path is empty and the object is the base; for a promoted field it steps
+	// through the embedded slots go/types resolved, so u.ID = 5 writes u.Base.ID.
+	index := selection.Index()
+	return l.fieldChain(base, l.pkg.Info.TypeOf(sel.X), index[:len(index)-1]), nil
 }
 
 // lowerCompoundAssign lowers x op= y to x = x op y, reusing the width mask of the
@@ -1227,14 +1310,48 @@ func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 	if selection.Kind() != types.FieldVal {
 		return nil, l.errf(e.Pos(), "method value %s is not supported yet", e.Sel.Name)
 	}
-	if len(selection.Index()) != 1 {
-		return nil, l.errf(e.Pos(), "promoted field %s is not supported yet", e.Sel.Name)
-	}
 	x, err := l.lowerExpr(e.X)
 	if err != nil {
 		return nil, err
 	}
-	return &ir.FieldAccess{X: x, Name: e.Sel.Name}, nil
+	// A direct field is a single-step path; a promoted field steps through the
+	// embedded slots go/types resolved, so u.ID reads u.Base.ID at emit time with
+	// no runtime delegation, matching the type checker's selection.
+	return l.fieldChain(x, l.pkg.Info.TypeOf(e.X), selection.Index()), nil
+}
+
+// fieldChain builds the nested field access a selection resolves to, following
+// the embedded-field path go/types computed. Each index names a field of the
+// current struct, and because an embedded field's slot is named for its type, the
+// path reads the same names the type checker walked. A direct selection has a
+// single index and yields one access; a promoted selection has several and yields
+// the chain that reaches the promoted member.
+func (l *lowerer) fieldChain(base ir.Expr, baseType types.Type, index []int) ir.Expr {
+	expr := base
+	t := structOf(baseType)
+	for k, i := range index {
+		f := t.Field(i)
+		expr = &ir.FieldAccess{X: expr, Name: f.Name()}
+		if k < len(index)-1 {
+			t = structOf(f.Type())
+		}
+	}
+	return expr
+}
+
+// structOf returns the struct type underlying a type, seeing through a pointer to
+// a struct, or nil when the type is not a struct. The lowering only calls it while
+// walking a field path go/types already validated, so the intermediate steps are
+// always structs.
+func structOf(t types.Type) *types.Struct {
+	if t == nil {
+		return nil
+	}
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	st, _ := t.Underlying().(*types.Struct)
+	return st
 }
 
 // lowerCompositeLit lowers a struct composite literal to a constructor call.
@@ -1272,7 +1389,10 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 				return nil, err
 			}
 			value = l.copyIfValueRead(kv.Value, value)
-			lit.Fields = append(lit.Fields, ir.StructArg{Name: key.Name, Value: value})
+			// The keyword argument must be the constructor parameter name, which is
+			// the field name except where an embedded value struct's field shadows a
+			// class the constructor calls, so the two stay in step.
+			lit.Fields = append(lit.Fields, ir.StructArg{Name: l.ctorKeyword(named.Obj().Name(), key.Name), Value: value})
 			continue
 		}
 		value, err := l.lowerExpr(elt)
@@ -1283,6 +1403,17 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 		lit.Fields = append(lit.Fields, ir.StructArg{Value: value})
 	}
 	return lit, nil
+}
+
+// ctorKeyword returns the constructor keyword for a keyed field of a struct,
+// applying the same shadow-avoiding rule the emitter uses so a keyed literal's
+// keyword matches the parameter name. When the struct is not in the table, which
+// does not happen for a lowered keyed literal, the field name is used as is.
+func (l *lowerer) ctorKeyword(structName, fieldName string) string {
+	if sd, ok := l.structs[structName]; ok {
+		return sd.CtorParamName(fieldName)
+	}
+	return fieldName
 }
 
 // copyIfValueRead wraps a lowered expression in a Clone when the source reads a
@@ -1459,7 +1590,7 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		}
 		return nil, l.errf(e.Pos(), "call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
 	case *ast.Ident:
-		args, err := l.lowerArgs(e.Args)
+		args, err := l.lowerCallArgs(e.Args)
 		if err != nil {
 			return nil, err
 		}
@@ -1556,14 +1687,19 @@ func (l *lowerer) isFmtPrintln(sel *ast.SelectorExpr) bool {
 	return pkgName.Imported().Path() == "fmt"
 }
 
-func (l *lowerer) lowerArgs(exprs []ast.Expr) ([]ir.Expr, error) {
+// lowerCallArgs lowers the arguments of a call to a named function, cloning a
+// struct value passed by value, which is the copy-on-call site of the
+// value-semantics rule: the callee receives an independent value, so a mutation
+// inside it must not touch the caller's. A non-struct argument and a fresh value
+// such as a literal or another call are left alone by copyIfValueRead.
+func (l *lowerer) lowerCallArgs(exprs []ast.Expr) ([]ir.Expr, error) {
 	out := make([]ir.Expr, len(exprs))
 	for i, a := range exprs {
 		lowered, err := l.lowerExpr(a)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = lowered
+		out[i] = l.copyIfValueRead(a, lowered)
 	}
 	return out, nil
 }
