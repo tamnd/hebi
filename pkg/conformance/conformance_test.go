@@ -1,0 +1,68 @@
+package conformance
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+// TestFixtures is the M0 differential band: every fixture under testdata must
+// produce the same stdout and exit code through go run and through the compiled
+// Python tier. It skips where the go tool or python3 is not on the path.
+func TestFixtures(t *testing.T) {
+	t.Parallel()
+	requireTools(t)
+	fixtures, err := filepath.Glob("testdata/fixtures/*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixtures) == 0 {
+		t.Fatal("no fixtures found")
+	}
+	for _, path := range fixtures {
+		name := filepath.Base(path)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			source, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Differential(t.Context(), string(source)); err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestObservationsCompose checks each runner in isolation: RunGo and
+// RunCompiled must both observe the same simple program the same way, so a
+// disagreement in TestFixtures points at the emitter rather than the harness.
+func TestObservationsCompose(t *testing.T) {
+	t.Parallel()
+	requireTools(t)
+	got, err := RunGo(t.Context(), "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(7)\n}\n")
+	if err != nil {
+		t.Fatalf("RunGo: %v", err)
+	}
+	if got.Stdout != "7\n" || got.Exit != 0 {
+		t.Errorf("go observation = %+v, want {Stdout:\"7\\n\" Exit:0}", got)
+	}
+	compiled, err := RunCompiled(t.Context(), "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(7)\n}\n")
+	if err != nil {
+		t.Fatalf("RunCompiled: %v", err)
+	}
+	if compiled != got {
+		t.Errorf("compiled observation %+v disagreed with go %+v", compiled, got)
+	}
+}
+
+func requireTools(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go tool not on PATH")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+}
