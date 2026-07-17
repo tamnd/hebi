@@ -7,9 +7,11 @@ import (
 	"testing"
 )
 
-// TestFixtures is the M0 differential band: every fixture under testdata must
+// TestFixtures is the differential band: every fixture under testdata must
 // produce the same stdout and exit code through go run and through the compiled
-// Python tier. It skips where the go tool or python3 is not on the path.
+// Python tier. It covers the M0 band 0001-0050 and the M1 band 0051 onward,
+// scalars and control flow, and skips where the go tool or python3 is not on
+// the path.
 func TestFixtures(t *testing.T) {
 	t.Parallel()
 	requireTools(t)
