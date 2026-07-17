@@ -121,6 +121,10 @@ func blockUsesShim(body []ir.Stmt) bool {
 			if exprUsesShim(s.Cond) || blockUsesShim(s.Body) {
 				return true
 			}
+		case *ir.ForRange:
+			if exprUsesShim(s.Start) || exprUsesShim(s.Stop) || exprUsesShim(s.Step) || blockUsesShim(s.Body) {
+				return true
+			}
 		case *ir.RangeString:
 			// A range over a string always calls the rune decoder in the shim.
 			return true
@@ -218,6 +222,10 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		if err := emitBlock(b, s.Body, depth+1); err != nil {
 			return err
 		}
+	case *ir.ForRange:
+		if err := emitForRange(b, s, depth); err != nil {
+			return err
+		}
 	case *ir.RangeString:
 		if err := emitRangeString(b, s, depth); err != nil {
 			return err
@@ -253,6 +261,46 @@ func emitElse(b *strings.Builder, els []ir.Stmt, depth int) error {
 	writeIndent(b, depth)
 	b.WriteString("else:\n")
 	return emitBlock(b, els, depth+1)
+}
+
+// emitForRange writes the for-in-range loop a counted Go loop and a range over
+// an integer lower to. A missing start is left off so the call reads range(stop),
+// a present start prints as range(start, stop), and a step adds a third argument,
+// which needs an explicit start of zero when the source had none. A loop that
+// discards its variable spends the throwaway name so the count still runs.
+func emitForRange(b *strings.Builder, s *ir.ForRange, depth int) error {
+	stop, err := emitExpr(s.Stop)
+	if err != nil {
+		return err
+	}
+	var args string
+	switch {
+	case s.Start == nil && s.Step == nil:
+		args = stop
+	default:
+		start := "0"
+		if s.Start != nil {
+			start, err = emitExpr(s.Start)
+			if err != nil {
+				return err
+			}
+		}
+		args = start + ", " + stop
+		if s.Step != nil {
+			step, err := emitExpr(s.Step)
+			if err != nil {
+				return err
+			}
+			args += ", " + step
+		}
+	}
+	name := s.Var
+	if name == "" {
+		name = "_"
+	}
+	writeIndent(b, depth)
+	fmt.Fprintf(b, "for %s in range(%s):\n", name, args)
+	return emitBlock(b, s.Body, depth+1)
 }
 
 // emitRangeString writes the while form a range over a string lowers to: a byte

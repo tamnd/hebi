@@ -54,6 +54,22 @@ type ForStmt struct {
 	Body []Stmt
 }
 
+// ForRange is a Python for-in-range loop, the readable form a simple counted Go
+// loop and a range over an integer both lower to. Var is the loop variable, left
+// empty when the Go program ranged for the count alone, in which case the emitter
+// spends the throwaway name. Start is the first value, nil when it is an implicit
+// zero so the emitter writes range(Stop) rather than range(0, Stop). Step is the
+// stride, nil for the default of one. The lowering only builds this node when it
+// has proven the loop is a plain forward or backward count, so the Python range
+// walks exactly the values Go's loop variable would take.
+type ForRange struct {
+	Var   string
+	Start Expr
+	Stop  Expr
+	Step  Expr
+	Body  []Stmt
+}
+
 // RangeString is a range over a string, which iterates runes and yields the
 // byte index of each rune's start and the decoded rune, matching Go's for range
 // over a string. Key is the byte-index variable and Value is the rune variable,
@@ -74,6 +90,7 @@ func (*ExprStmt) isStmt()    {}
 func (*AssignStmt) isStmt()  {}
 func (*IfStmt) isStmt()      {}
 func (*ForStmt) isStmt()     {}
+func (*ForRange) isStmt()    {}
 func (*RangeString) isStmt() {}
 
 // Expr is an expression node.

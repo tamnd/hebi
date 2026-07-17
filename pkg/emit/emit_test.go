@@ -465,6 +465,68 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleForRange pins the three argument shapes a for-in-range loop takes: a
+// bare stop, a start and stop, and a start, stop, and step, plus the throwaway
+// name a loop that discards its variable spends.
+func TestModuleForRange(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.ForRange{
+					Var:  "i",
+					Stop: &ir.Ident{Name: "n"},
+					Body: []ir.Stmt{&ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{&ir.Ident{Name: "i"}}}}},
+				},
+				&ir.ForRange{
+					Var:   "j",
+					Start: &ir.IntLit{Text: "2"},
+					Stop:  &ir.IntLit{Text: "8"},
+					Body:  nil,
+				},
+				&ir.ForRange{
+					Var:   "k",
+					Start: &ir.IntLit{Text: "10"},
+					Stop:  &ir.IntLit{Text: "0"},
+					Step:  &ir.IntLit{Text: "-2"},
+					Body:  nil,
+				},
+				&ir.ForRange{
+					Var:  "",
+					Stop: &ir.IntLit{Text: "3"},
+					Body: nil,
+				},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    for i in range(n):
+        _hebirt.println(i)
+    for j in range(2, 8):
+        pass
+    for k in range(10, 0, -2):
+        pass
+    for _ in range(3):
+        pass
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 // TestEmittedRuns is the small end-to-end check: emit hello, drop it beside the
 // shim, run it under CPython, and confirm it prints the Go answer. It skips
 // where python3 is not on the path.

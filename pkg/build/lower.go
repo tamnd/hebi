@@ -117,6 +117,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerDecl(s)
 	case *ast.AssignStmt:
 		return l.lowerAssign(s)
+	case *ast.IncDecStmt:
+		return l.lowerIncDec(s)
 	case *ast.IfStmt:
 		return l.lowerIf(s)
 	case *ast.ForStmt:
@@ -192,9 +194,24 @@ func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
 	return nil, l.errf(name.Pos(), "zero value of %s is not supported yet", l.pkg.Info.TypeOf(name))
 }
 
+// compoundOps maps a Go compound-assignment token to the plain binary operator
+// and the token narrow reads to decide masking. Only the operators whose binary
+// form hebi already lowers are here; division, remainder, and the bitwise family
+// wait on their own slices, so an unlisted compound assignment fails loudly.
+var compoundOps = map[token.Token]struct {
+	op  string
+	tok token.Token
+}{
+	token.ADD_ASSIGN: {"+", token.ADD},
+	token.SUB_ASSIGN: {"-", token.SUB},
+	token.MUL_ASSIGN: {"*", token.MUL},
+	token.SHL_ASSIGN: {"<<", token.SHL},
+	token.SHR_ASSIGN: {">>", token.SHR},
+}
+
 func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN {
-		return nil, l.errf(s.Pos(), "compound assignment %s is not supported yet", s.Tok)
+		return l.lowerCompoundAssign(s)
 	}
 	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
@@ -208,6 +225,48 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		return nil, err
 	}
 	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value, Define: s.Tok == token.DEFINE}}, nil
+}
+
+// lowerCompoundAssign lowers x op= y to x = x op y, reusing the width mask of the
+// plain binary operator so a growing compound assignment on a sized integer wraps
+// two's-complement the way Go does. The target must be a plain name for now; the
+// pointer, field, and index forms arrive with those types.
+func (l *lowerer) lowerCompoundAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
+	spec, ok := compoundOps[s.Tok]
+	if !ok {
+		return nil, l.errf(s.Pos(), "compound assignment %s is not supported yet", s.Tok)
+	}
+	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
+		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
+	}
+	name, ok := s.Lhs[0].(*ast.Ident)
+	if !ok {
+		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
+	}
+	y, err := l.lowerExpr(s.Rhs[0])
+	if err != nil {
+		return nil, err
+	}
+	inner := &ir.BinaryExpr{Op: spec.op, X: &ir.Ident{Name: name.Name}, Y: y}
+	value := l.narrow(s.Lhs[0], spec.tok, inner)
+	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value}}, nil
+}
+
+// lowerIncDec lowers x++ and x-- to x = x + 1 and x = x - 1, masking the result
+// to the target's width because an increment can overflow a sized integer and
+// wrap the way Go does. The operand must be a plain name for now.
+func (l *lowerer) lowerIncDec(s *ast.IncDecStmt) ([]ir.Stmt, error) {
+	name, ok := s.X.(*ast.Ident)
+	if !ok {
+		return nil, l.errf(s.X.Pos(), "increment of %T is not supported yet", s.X)
+	}
+	op, tok := "+", token.ADD
+	if s.Tok == token.DEC {
+		op, tok = "-", token.SUB
+	}
+	inner := &ir.BinaryExpr{Op: op, X: &ir.Ident{Name: name.Name}, Y: &ir.IntLit{Text: "1"}}
+	value := l.narrow(s.X, tok, inner)
+	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value}}, nil
 }
 
 func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
@@ -374,10 +433,56 @@ func caseCond(tag ir.Expr, conds []ir.Expr) ir.Expr {
 	return expr
 }
 
+// lowerFor lowers a for statement without a range clause. A bare condition or an
+// infinite loop is a while, unchanged from the earlier slice. A three-clause loop
+// becomes a readable for-in-range when it is a plain forward or backward count,
+// and otherwise a faithful while: the init runs before the loop, the condition
+// gates it, and the post runs at the bottom of the body.
 func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
-	if s.Init != nil || s.Post != nil {
-		return nil, l.errf(s.Pos(), "for with an init or post statement is not supported yet")
+	if s.Init == nil && s.Post == nil {
+		return l.lowerWhile(s)
 	}
+	if sugar, err := l.countSugar(s); err != nil {
+		return nil, err
+	} else if sugar != nil {
+		return []ir.Stmt{sugar}, nil
+	}
+	var pre []ir.Stmt
+	if s.Init != nil {
+		init, err := l.lowerStmt(s.Init)
+		if err != nil {
+			return nil, err
+		}
+		pre = init
+	}
+	var cond ir.Expr
+	if s.Cond != nil {
+		c, err := l.lowerExpr(s.Cond)
+		if err != nil {
+			return nil, err
+		}
+		cond = c
+	}
+	body, err := l.lowerBlock(s.Body)
+	if err != nil {
+		return nil, err
+	}
+	if s.Post != nil {
+		// The post runs at the bottom of the loop body. A continue in the body
+		// would skip it, which the labeled-continue machinery of a later slice
+		// will guard; no continue exists yet, so the placement is faithful today.
+		post, err := l.lowerStmt(s.Post)
+		if err != nil {
+			return nil, err
+		}
+		body = append(body, post...)
+	}
+	return append(pre, &ir.ForStmt{Cond: cond, Body: body}), nil
+}
+
+// lowerWhile lowers a condition-only or infinite for loop to a while. A nil
+// condition is Go's bare for and emits while True.
+func (l *lowerer) lowerWhile(s *ast.ForStmt) ([]ir.Stmt, error) {
 	var cond ir.Expr
 	if s.Cond != nil {
 		c, err := l.lowerExpr(s.Cond)
@@ -393,6 +498,167 @@ func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
 	return []ir.Stmt{&ir.ForStmt{Cond: cond, Body: body}}, nil
 }
 
+// countSugar recognizes a three-clause for that is a plain integer count and
+// builds the for-in-range form for it, returning nil when the loop is not a
+// simple count so the caller falls back to the while form. The pattern is a
+// short-variable init of an integer, a condition that compares that same
+// variable against a bound, a post that steps the variable by a constant in the
+// matching direction, and a body that never reassigns the variable. Everything
+// outside that shape is left to the always-correct while form.
+func (l *lowerer) countSugar(s *ast.ForStmt) (*ir.ForRange, error) {
+	init, ok := s.Init.(*ast.AssignStmt)
+	if !ok || init.Tok != token.DEFINE || len(init.Lhs) != 1 || len(init.Rhs) != 1 {
+		return nil, nil
+	}
+	v, ok := init.Lhs[0].(*ast.Ident)
+	if !ok || v.Name == "_" {
+		return nil, nil
+	}
+	if _, _, isInt := intWidth(l.pkg.Info.TypeOf(v)); !isInt {
+		return nil, nil
+	}
+	cond, ok := s.Cond.(*ast.BinaryExpr)
+	if !ok {
+		return nil, nil
+	}
+	if cv, ok := cond.X.(*ast.Ident); !ok || cv.Name != v.Name {
+		return nil, nil
+	}
+	up, byK, ok := postStep(s.Post, v.Name)
+	if !ok {
+		return nil, nil
+	}
+	if assignsInBody(s.Body, v.Name) {
+		return nil, nil
+	}
+	// Match the comparison to the step direction, and reject the inclusive bound
+	// paired with a non-unit step, where turning the bound into a range stop
+	// would risk an off-by-one.
+	inclusive := false
+	switch cond.Op {
+	case token.LSS:
+		if !up {
+			return nil, nil
+		}
+	case token.LEQ:
+		if !up || byK != "" {
+			return nil, nil
+		}
+		inclusive = true
+	case token.GTR:
+		if up {
+			return nil, nil
+		}
+	case token.GEQ:
+		if up || byK != "" {
+			return nil, nil
+		}
+		inclusive = true
+	default:
+		return nil, nil
+	}
+
+	start, err := l.lowerExpr(init.Rhs[0])
+	if err != nil {
+		return nil, err
+	}
+	if zeroLit(init.Rhs[0]) {
+		start = nil
+	}
+	limit, err := l.lowerExpr(cond.Y)
+	if err != nil {
+		return nil, err
+	}
+	stop := limit
+	if inclusive {
+		// An inclusive bound with a unit step counts one further, so the range
+		// stops one past the bound going up and one before it going down.
+		adjust := "+"
+		if !up {
+			adjust = "-"
+		}
+		stop = &ir.BinaryExpr{Op: adjust, X: limit, Y: &ir.IntLit{Text: "1"}}
+	}
+	var step ir.Expr
+	switch {
+	case up && byK != "":
+		step = &ir.IntLit{Text: byK}
+	case !up && byK != "":
+		step = &ir.IntLit{Text: "-" + byK}
+	case !up:
+		step = &ir.IntLit{Text: "-1"}
+	}
+	body, err := l.lowerBlock(s.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.ForRange{Var: v.Name, Start: start, Stop: stop, Step: step, Body: body}, nil
+}
+
+// postStep reads a for loop's post statement, reporting whether it steps the loop
+// variable up or down and by how much. A ++ or -- steps by one, reported with an
+// empty magnitude; a += or -= steps by a positive integer literal, reported as
+// its text. Anything else, including a data-dependent step, is not a countable
+// stride and returns ok false so the caller uses the while form.
+func postStep(post ast.Stmt, name string) (up bool, byK string, ok bool) {
+	switch p := post.(type) {
+	case *ast.IncDecStmt:
+		id, isIdent := p.X.(*ast.Ident)
+		if !isIdent || id.Name != name {
+			return false, "", false
+		}
+		return p.Tok == token.INC, "", true
+	case *ast.AssignStmt:
+		if len(p.Lhs) != 1 || len(p.Rhs) != 1 {
+			return false, "", false
+		}
+		id, isIdent := p.Lhs[0].(*ast.Ident)
+		if !isIdent || id.Name != name {
+			return false, "", false
+		}
+		if p.Tok != token.ADD_ASSIGN && p.Tok != token.SUB_ASSIGN {
+			return false, "", false
+		}
+		lit, isLit := p.Rhs[0].(*ast.BasicLit)
+		if !isLit || lit.Kind != token.INT || lit.Value == "0" {
+			return false, "", false
+		}
+		return p.Tok == token.ADD_ASSIGN, lit.Value, true
+	default:
+		return false, "", false
+	}
+}
+
+// zeroLit reports whether an expression is the integer literal 0, which the
+// count sugar drops so a loop starting at zero reads as range(stop).
+func zeroLit(e ast.Expr) bool {
+	lit, ok := e.(*ast.BasicLit)
+	return ok && lit.Kind == token.INT && lit.Value == "0"
+}
+
+// assignsInBody reports whether a loop body reassigns the given name anywhere,
+// including a shadowing short declaration, which disqualifies the count sugar
+// because a Python range would not reflect the change.
+func assignsInBody(body *ast.BlockStmt, name string) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range n.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok && id.Name == name {
+					found = true
+				}
+			}
+		case *ast.IncDecStmt:
+			if id, ok := n.X.(*ast.Ident); ok && id.Name == name {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
 // lowerRange lowers a for range statement. Only range over a string is supported
 // in this slice, which iterates runes and yields the byte index of each rune and
 // the decoded rune; range over the other kinds arrives in a later slice. The
@@ -404,7 +670,13 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 	}
 	srcType := l.pkg.Info.TypeOf(s.X)
 	basic, ok := srcType.Underlying().(*types.Basic)
-	if !ok || basic.Info()&types.IsString == 0 {
+	if !ok {
+		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
+	}
+	if basic.Info()&types.IsInteger != 0 {
+		return l.lowerRangeInt(s)
+	}
+	if basic.Info()&types.IsString == 0 {
 		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
 	}
 	src, err := l.lowerExpr(s.X)
@@ -435,6 +707,26 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 		Body:   body,
 	}
 	return append(pre, rs), nil
+}
+
+// lowerRangeInt lowers a range over an integer, the Go 1.22 form for i := range n
+// that iterates i from zero to n minus one. It is the readable for-in-range: n is
+// the stop bound, the start is an implicit zero, and the step is one, so a
+// non-positive n runs the body no times, matching Go. Only the index is bound,
+// since Go's range over an integer has a single value.
+func (l *lowerer) lowerRangeInt(s *ast.RangeStmt) ([]ir.Stmt, error) {
+	if s.Value != nil {
+		return nil, l.errf(s.Pos(), "range over an integer binds a single value")
+	}
+	stop, err := l.lowerExpr(s.X)
+	if err != nil {
+		return nil, err
+	}
+	body, err := l.lowerBlock(s.Body)
+	if err != nil {
+		return nil, err
+	}
+	return []ir.Stmt{&ir.ForRange{Var: rangeIdent(s.Key), Stop: stop, Body: body}}, nil
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
