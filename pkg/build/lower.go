@@ -286,9 +286,17 @@ func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
 // operator can grow the value past the type's range. Constant expressions are
 // exact and already in range, so they are never masked, which keeps ordinary
 // constant arithmetic readable.
+//
+// Left shift is a growing op and masks like the others: Python computes the
+// full-precision result and the mask truncates it, which also gives Go's
+// count-at-least-width-yields-zero rule for free. Right shift is not here on
+// purpose. A signed right shift is arithmetic in both languages once the value
+// holds its true signed form, which the mask-then-sign-extend discipline
+// guarantees, and an unsigned right shift is logical because the value is a
+// non-negative Python int, so neither needs a helper.
 func (l *lowerer) wrapGrowing(e ast.Expr, op token.Token, inner ir.Expr) ir.Expr {
 	switch op {
-	case token.ADD, token.SUB, token.MUL:
+	case token.ADD, token.SUB, token.MUL, token.SHL:
 	default:
 		return inner
 	}

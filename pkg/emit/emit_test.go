@@ -114,6 +114,41 @@ if __name__ == "__main__":
 	}
 }
 
+func TestModuleShifts(t *testing.T) {
+	t.Parallel()
+	// A masked left shift and a bare right shift, the two spellings the
+	// lowering produces: the left shift grows and carries a mask, the right
+	// shift needs none.
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "a", Value: &ir.Mask{Bits: 8, Signed: false, X: &ir.BinaryExpr{Op: "<<", X: &ir.Ident{Name: "x"}, Y: &ir.IntLit{Text: "1"}}}},
+				&ir.AssignStmt{Name: "b", Value: &ir.BinaryExpr{Op: ">>", X: &ir.Ident{Name: "y"}, Y: &ir.IntLit{Text: "1"}}},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    a = _hebirt._u8((x << 1))
+    b = (y >> 1)
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestMaskHelper(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
