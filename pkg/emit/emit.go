@@ -34,6 +34,8 @@ var binOps = map[string]string{
 	"!=": "!=",
 	"&&": "and",
 	"||": "or",
+	"<<": "<<",
+	">>": ">>",
 }
 
 // unaryOps maps the Go unary operator text to its Python spelling. Negation and

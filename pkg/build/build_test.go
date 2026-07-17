@@ -109,6 +109,53 @@ func TestIntegerWidths(t *testing.T) {
 	}
 }
 
+// TestShifts checks shift semantics end to end against go run. It covers a
+// masked left shift, oversized shift counts on both directions, arithmetic and
+// logical right shifts, and two untyped-constant cases: a shift computed at
+// full precision and an expression whose Go grouping differs from Python's,
+// which the paren-everything emitter must preserve.
+func TestShifts(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go tool not on PATH")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"uint32 left shift masks", "var x uint32 = 0x80000000\n\tfmt.Println(x << 1)", "0\n"},
+		{"uint8 left shift oversized", "var x uint8 = 1\n\tfmt.Println(x << 9)", "0\n"},
+		{"signed left shift", "var x int8 = -1\n\tfmt.Println(x << 2)", "-4\n"},
+		{"signed right shift arithmetic", "var x int8 = -8\n\tfmt.Println(x >> 1)", "-4\n"},
+		{"signed right shift oversized", "var x int8 = -1\n\tfmt.Println(x >> 100)", "-1\n"},
+		{"unsigned right shift logical", "var x uint8 = 200\n\tfmt.Println(x >> 1)", "100\n"},
+		{"unsigned right shift oversized", "var x uint32 = 0xFFFFFFFF\n\tfmt.Println(x >> 40)", "0\n"},
+		{"untyped constant full precision", "fmt.Println(1 << 40)", "1099511627776\n"},
+		{"precedence preserved", "fmt.Println(1 << 2 * 3)", "12\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			src := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t" + tt.body + "\n}\n"
+			var out, errb bytes.Buffer
+			code, err := Run(context.Background(), writeModule(t, src), &out, &errb)
+			if err != nil {
+				t.Fatalf("Run: %v (stderr: %s)", err, errb.String())
+			}
+			if code != 0 {
+				t.Fatalf("exit code = %d (stderr: %s)", code, errb.String())
+			}
+			if got := out.String(); got != tt.want {
+				t.Errorf("output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildRejectsUnsupported(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
