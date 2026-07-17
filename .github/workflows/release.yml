@@ -1,0 +1,44 @@
+name: release
+
+# Cut a release from a version tag. This builds the hebi CLI for each target
+# and attaches the binaries to the GitHub release. The Python wheels and PyPI
+# trusted publishing land in M10; this is the tool's own release path.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version pins
+        run: grep -E "^[A-Za-z_][A-Za-z0-9_]*=" versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO }}
+          cache: true
+      - name: build
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          name="hebi-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}${{ matrix.target.ext }}"
+          go build -o "$name" ./cmd/hebi
+          echo "ARTIFACT=$name" >> "$GITHUB_ENV"
+      - name: attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARTIFACT }}
