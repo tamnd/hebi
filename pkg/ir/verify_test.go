@@ -177,6 +177,42 @@ func TestVerifyStringSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyForRange accepts a well-formed for-in-range loop with each of its
+// optional bounds present or absent, and rejects one without a stop bound and
+// one whose bounds are nil expressions.
+func TestVerifyForRange(t *testing.T) {
+	t.Parallel()
+	good := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+		&ForRange{Var: "i", Stop: &Ident{Name: "n"}, Body: nil},
+		&ForRange{Var: "j", Start: &IntLit{Text: "1"}, Stop: &IntLit{Text: "9"}, Step: &IntLit{Text: "2"}, Body: nil},
+	}}}}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed for-in-range: %v", err)
+	}
+	tests := []struct {
+		name    string
+		stmt    Stmt
+		wantSub string
+	}{
+		{"no stop", &ForRange{Var: "i", Stop: nil}, "without a stop bound"},
+		{"nil start", &ForRange{Var: "i", Start: nil, Stop: &IntLit{Text: "1"}, Step: &Ident{Name: ""}}, "no name"},
+		{"nil stop expression", &ForRange{Var: "i", Stop: &BinaryExpr{Op: "+", X: nil, Y: &IntLit{Text: "1"}}}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{tt.stmt}}}}
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {

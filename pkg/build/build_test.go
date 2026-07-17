@@ -192,6 +192,71 @@ func TestSwitch(t *testing.T) {
 	}
 }
 
+// TestForLoops checks every for shape against go run: the counted loop that
+// becomes range, a non-zero start, a stride, the inclusive bounds, the two
+// descending forms, the condition-only and infinite-with-break forms lowered to
+// while, a range over an integer with and without a variable and over an
+// expression, the fallbacks where the body mutates the counter or the condition
+// is compound, and nested counted loops.
+func TestForLoops(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"counted", "for i := 0; i < 5; i++ {\n\t\tfmt.Println(i)\n\t}"},
+		{"nonzero start", "for i := 2; i < 6; i++ {\n\t\tfmt.Println(i)\n\t}"},
+		{"stride", "for i := 0; i < 10; i += 3 {\n\t\tfmt.Println(i)\n\t}"},
+		{"inclusive up", "for i := 0; i <= 5; i++ {\n\t\tfmt.Println(i)\n\t}"},
+		{"descending", "for i := 5; i > 0; i-- {\n\t\tfmt.Println(i)\n\t}"},
+		{"descending inclusive", "for i := 5; i >= 0; i-- {\n\t\tfmt.Println(i)\n\t}"},
+		{"descending stride", "for i := 10; i > 0; i -= 3 {\n\t\tfmt.Println(i)\n\t}"},
+		{"condition only", "sum := 0\n\tfor sum < 20 {\n\t\tsum += 7\n\t}\n\tfmt.Println(sum)"},
+		{"while form post", "sum := 0\n\tfor i := 0; sum < 15; i++ {\n\t\tsum += i\n\t}\n\tfmt.Println(sum)"},
+		{"range int", "for i := range 4 {\n\t\tfmt.Println(i)\n\t}"},
+		{"range int blank", "count := 0\n\tfor range 3 {\n\t\tcount++\n\t}\n\tfmt.Println(count)"},
+		{"range int expr", "n := 5\n\tfor i := range n {\n\t\tfmt.Println(i)\n\t}"},
+		{"range int zero", "for i := range 0 {\n\t\tfmt.Println(i)\n\t}\n\tfmt.Println(\"done\")"},
+		{"body mutates counter", "for i := 0; i < 10; i++ {\n\t\tfmt.Println(i)\n\t\ti++\n\t}"},
+		{"compound condition", "for i := 0; i < 10 && i < 4; i++ {\n\t\tfmt.Println(i)\n\t}"},
+		{"nested counted", "for i := 0; i < 3; i++ {\n\t\tfor j := 0; j < 2; j++ {\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"sized counter wraps", "for i := uint8(253); i < 255; i++ {\n\t\tfmt.Println(i)\n\t}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
+// TestCompoundAssign checks the compound assignments and the increment and
+// decrement statements against go run, including the width wrap a growing
+// compound assignment on a sized integer must reproduce.
+func TestCompoundAssign(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"add", "x := 10\n\tx += 5\n\tfmt.Println(x)"},
+		{"sub", "x := 10\n\tx -= 4\n\tfmt.Println(x)"},
+		{"mul", "x := 6\n\tx *= 7\n\tfmt.Println(x)"},
+		{"shl", "x := 1\n\tx <<= 4\n\tfmt.Println(x)"},
+		{"shr", "x := 256\n\tx >>= 3\n\tfmt.Println(x)"},
+		{"increment", "x := 41\n\tx++\n\tfmt.Println(x)"},
+		{"decrement", "x := 5\n\tx--\n\tfmt.Println(x)"},
+		{"sized wrap", "x := uint8(250)\n\tx += 10\n\tfmt.Println(x)"},
+		{"sized decrement wrap", "x := uint8(0)\n\tx--\n\tfmt.Println(x)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")
@@ -331,7 +396,7 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"method", "package main\n\ntype T struct{}\n\nfunc (T) m() {}\n\nfunc main() {}\n"},
 		{"parameter", "package main\n\nfunc f(x int) {}\n\nfunc main() {}\n"},
 		{"result", "package main\n\nfunc f() int { return 0 }\n\nfunc main() {}\n"},
-		{"compound assign", "package main\n\nfunc main() {\n\tx := 0\n\tx += 1\n\t_ = x\n}\n"},
+		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
 	}
 	for _, tt := range tests {

@@ -67,6 +67,24 @@ func verifyStmt(where string, s Stmt) error {
 			}
 		}
 		return verifyBlock(where+": body", s.Body)
+	case *ForRange:
+		if s.Stop == nil {
+			return fmt.Errorf("ir: %s ranges without a stop bound", where)
+		}
+		if err := verifyExpr(where+": range stop", s.Stop); err != nil {
+			return err
+		}
+		if s.Start != nil {
+			if err := verifyExpr(where+": range start", s.Start); err != nil {
+				return err
+			}
+		}
+		if s.Step != nil {
+			if err := verifyExpr(where+": range step", s.Step); err != nil {
+				return err
+			}
+		}
+		return verifyBlock(where+": body", s.Body)
 	case *RangeString:
 		if s.Cursor == "" || s.Width == "" {
 			return fmt.Errorf("ir: %s ranges a string without a cursor or width name", where)
