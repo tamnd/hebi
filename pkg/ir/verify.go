@@ -96,6 +96,18 @@ func verifyExpr(where string, e Expr) error {
 			return err
 		}
 		return verifyExpr(where+": right", e.Y)
+	case *UnaryExpr:
+		if e.Op == "" {
+			return fmt.Errorf("ir: %s is a unary expression with no operator", where)
+		}
+		return verifyExpr(where+": operand", e.X)
+	case *Mask:
+		switch e.Bits {
+		case 8, 16, 32, 64:
+		default:
+			return fmt.Errorf("ir: %s masks to an invalid width %d", where, e.Bits)
+		}
+		return verifyExpr(where+": masked", e.X)
 	case *CallExpr:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s calls an empty name", where)

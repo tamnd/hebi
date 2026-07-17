@@ -63,6 +63,52 @@ func TestRunMatchesGo(t *testing.T) {
 	}
 }
 
+// TestIntegerWidths checks masking end to end: each program exercises a width,
+// an overflow, a conversion, or a negation, and the emitted Python must print
+// exactly what go run prints. It is the strongest proof the mask helpers wrap
+// two's-complement the Go way.
+func TestIntegerWidths(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go tool not on PATH")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"uint8 overflow", "var a uint8 = 200\n\tvar b uint8 = 100\n\tfmt.Println(a + b)", "44\n"},
+		{"int8 overflow", "var x int8 = 100\n\tfmt.Println(x * 2)", "-56\n"},
+		{"uint32 wrap", "var u uint32 = 0xFFFFFFFF\n\tfmt.Println(u + 1)", "0\n"},
+		{"conversion truncates", "var big uint32 = 0x1234\n\tfmt.Println(uint8(big))", "52\n"},
+		{"signed to unsigned", "var n int8 = -1\n\tfmt.Println(uint8(n))", "255\n"},
+		{"unsigned to signed", "var n uint8 = 255\n\tfmt.Println(int8(n))", "-1\n"},
+		{"widen sign extends", "var n int8 = -1\n\tfmt.Println(int32(n))", "-1\n"},
+		{"negation wraps", "var x int8 = -128\n\tfmt.Println(-x)", "-128\n"},
+		{"int64 arithmetic", "var a int = 1000000\n\tfmt.Println(a * a)", "1000000000000\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			src := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t" + tt.body + "\n}\n"
+			var out, errb bytes.Buffer
+			code, err := Run(context.Background(), writeModule(t, src), &out, &errb)
+			if err != nil {
+				t.Fatalf("Run: %v (stderr: %s)", err, errb.String())
+			}
+			if code != 0 {
+				t.Fatalf("exit code = %d (stderr: %s)", code, errb.String())
+			}
+			if got := out.String(); got != tt.want {
+				t.Errorf("output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildRejectsUnsupported(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

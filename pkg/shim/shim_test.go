@@ -14,10 +14,36 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
+	}
+}
+
+// TestWidthHelpers runs the masking helpers under CPython and checks they wrap
+// two's-complement the Go way: unsigned masks, signed masks then sign-extends.
+func TestWidthHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"print(r._u8(300), r._i8(200), r._u32(-1), r._i16(-1), r._u64(-1), r._i64(0x8000000000000000))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run helpers: %v\n%s", err, out)
+	}
+	want := "44 -56 4294967295 -1 18446744073709551615 -9223372036854775808\n"
+	if got := string(out); got != want {
+		t.Errorf("helper output = %q, want %q", got, want)
 	}
 }
 

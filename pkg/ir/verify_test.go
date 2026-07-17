@@ -72,6 +72,41 @@ func TestVerifyRejects(t *testing.T) {
 	}
 }
 
+func TestVerifyUnaryAndMask(t *testing.T) {
+	t.Parallel()
+	good := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+		&AssignStmt{Name: "x", Define: true, Value: &Mask{Bits: 8, Signed: true, X: &UnaryExpr{Op: "-", X: &Ident{Name: "y"}}}},
+	}}}}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed unary and mask: %v", err)
+	}
+	tests := []struct {
+		name    string
+		value   Expr
+		wantSub string
+	}{
+		{"empty unary op", &UnaryExpr{Op: "", X: &Ident{Name: "y"}}, "unary expression with no operator"},
+		{"nil unary operand", &UnaryExpr{Op: "-", X: nil}, "nil expression"},
+		{"bad mask width", &Mask{Bits: 7, Signed: false, X: &Ident{Name: "y"}}, "invalid width 7"},
+		{"nil mask operand", &Mask{Bits: 8, Signed: false, X: nil}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "x", Define: true, Value: tt.value},
+			}}}}
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {
