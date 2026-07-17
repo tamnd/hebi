@@ -26,6 +26,77 @@ func writeModule(t *testing.T, source string) string {
 	return src
 }
 
+// assertMatchesGo compiles a main body both ways, once with go run as the
+// oracle and once through hebi, and requires the stdout and exit status to
+// agree. It is the differential check without a hand-written expected value,
+// which is what float formatting needs since the exact digits are Go's to
+// decide.
+func assertMatchesGo(t *testing.T, body string) {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go tool not on PATH")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	src := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t" + body + "\n}\n"
+	file := writeModule(t, src)
+
+	goCmd := exec.CommandContext(t.Context(), "go", "run", file)
+	goOut, err := goCmd.Output()
+	if err != nil {
+		t.Fatalf("go run: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	code, err := Run(context.Background(), file, &out, &errb)
+	if err != nil {
+		t.Fatalf("Run: %v (stderr: %s)", err, errb.String())
+	}
+	if code != 0 {
+		t.Fatalf("hebi exit = %d (stderr: %s)", code, errb.String())
+	}
+	if got, want := out.String(), string(goOut); got != want {
+		t.Errorf("hebi output = %q, go run output = %q", got, want)
+	}
+}
+
+// TestFloats checks float64 and float32 lowering against go run: literals,
+// native float64 arithmetic, single-precision float32 narrowing, the number
+// conversions, and the formatting reconciliation where fmt's shortest float
+// differs from Python's str.
+func TestFloats(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"float64 literal", "fmt.Println(3.14)"},
+		{"integer valued float", "fmt.Println(3.0)"},
+		{"exponent notation", "fmt.Println(1000000.0)"},
+		{"small exponent", "fmt.Println(1e-5)"},
+		{"negative float", "fmt.Println(-2.5)"},
+		{"float64 arithmetic", "var a float64 = 0.1\n\tvar b float64 = 0.2\n\tfmt.Println(a + b)"},
+		{"float64 zero value", "var f float64\n\tfmt.Println(f)"},
+		{"mixed args", "fmt.Println(1.5, 2.5, 3)"},
+		{"float32 literal", "var a float32 = 0.1\n\tfmt.Println(a)"},
+		{"float32 narrows", "var a float32 = 0.1\n\tvar b float32 = 0.2\n\tfmt.Println(a + b)"},
+		{"float32 many digits", "var a float32 = 0.123456789\n\tfmt.Println(a)"},
+		{"float32 from float64", "var d float64 = 0.1\n\tfmt.Println(float32(d))"},
+		{"int from float truncates", "var f float64 = 3.9\n\tfmt.Println(int(f))"},
+		{"int from negative float", "var f float64 = -3.9\n\tfmt.Println(int(f))"},
+		{"float from int", "var n int = 7\n\tfmt.Println(float64(n))"},
+		{"float to sized int masks", "var f float64 = 300.0\n\tfmt.Println(uint8(f))"},
+		{"float32 from int", "var n int = 5\n\tfmt.Println(float32(n))"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")

@@ -149,6 +149,44 @@ if __name__ == "__main__":
 	}
 }
 
+func TestModuleFloatAndConvert(t *testing.T) {
+	t.Parallel()
+	// A float64 literal passes through, a float32 result renarrows through the
+	// helper, and an int conversion of a float truncates before the width mask.
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "a", Value: &ir.FloatLit{Text: "3.14"}},
+				&ir.AssignStmt{Name: "b", Value: &ir.Intrinsic{Name: "_f32", Args: []ir.Expr{&ir.FloatLit{Text: "0.1"}}}},
+				&ir.AssignStmt{Name: "c", Value: &ir.Mask{Bits: 8, Signed: false, X: &ir.Convert{To: "int", X: &ir.Ident{Name: "a"}}}},
+				&ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{&ir.Convert{To: "float", X: &ir.Ident{Name: "c"}}}}},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+def main():
+    a = 3.14
+    b = _hebirt._f32(0.1)
+    c = _hebirt._u8(int(a))
+    _hebirt.println(float(c))
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestMaskHelper(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

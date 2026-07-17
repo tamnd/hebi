@@ -125,6 +125,8 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.X) || exprUsesShim(e.Y)
 	case *ir.UnaryExpr:
 		return exprUsesShim(e.X)
+	case *ir.Convert:
+		return exprUsesShim(e.X)
 	case *ir.CallExpr:
 		return argsUseShim(e.Args)
 	}
@@ -216,6 +218,8 @@ func emitExpr(e ir.Expr) (string, error) {
 	switch e := e.(type) {
 	case *ir.IntLit:
 		return e.Text, nil
+	case *ir.FloatLit:
+		return e.Text, nil
 	case *ir.StringLit:
 		return pyString(e.Value), nil
 	case *ir.BoolLit:
@@ -255,6 +259,12 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.%s(%s)", shim.Name, maskHelper(e.Bits, e.Signed), x), nil
+	case *ir.Convert:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s(%s)", e.To, x), nil
 	case *ir.CallExpr:
 		args, err := emitArgs(e.Args)
 		if err != nil {

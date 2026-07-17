@@ -107,6 +107,40 @@ func TestVerifyUnaryAndMask(t *testing.T) {
 	}
 }
 
+func TestVerifyFloatAndConvert(t *testing.T) {
+	t.Parallel()
+	good := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+		&AssignStmt{Name: "x", Define: true, Value: &Convert{To: "int", X: &FloatLit{Text: "3.9"}}},
+	}}}}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed float and convert: %v", err)
+	}
+	tests := []struct {
+		name    string
+		value   Expr
+		wantSub string
+	}{
+		{"empty float text", &FloatLit{Text: ""}, "float literal with no text"},
+		{"unknown convert builtin", &Convert{To: "str", X: &Ident{Name: "y"}}, "unknown builtin"},
+		{"nil convert operand", &Convert{To: "int", X: nil}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "x", Define: true, Value: tt.value},
+			}}}}
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {
