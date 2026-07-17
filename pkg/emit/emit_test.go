@@ -187,6 +187,38 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleNot pins the logical not spelling: the keyword operator takes a
+// space before its operand where the symbol operators do not, and the operand
+// keeps its own parentheses.
+func TestModuleNot(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "a", Value: &ir.UnaryExpr{Op: "!", X: &ir.Ident{Name: "ok"}}},
+				&ir.AssignStmt{Name: "b", Value: &ir.UnaryExpr{Op: "!", X: &ir.BinaryExpr{Op: "<", X: &ir.Ident{Name: "x"}, Y: &ir.Ident{Name: "y"}}}},
+			},
+		}},
+	}
+	want := `def main():
+    a = (not ok)
+    b = (not (x < y))
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestMaskHelper(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

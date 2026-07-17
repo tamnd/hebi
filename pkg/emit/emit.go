@@ -44,6 +44,15 @@ var binOps = map[string]string{
 var unaryOps = map[string]string{
 	"-": "-",
 	"+": "+",
+	"!": "not",
+}
+
+// isWordOperator reports whether a Python operator is spelled as a keyword, such
+// as not, and so needs a space before its operand where a symbol operator does
+// not.
+func isWordOperator(op string) bool {
+	last := op[len(op)-1]
+	return last >= 'a' && last <= 'z'
 }
 
 // maskHelper names the runtime helper for a width and signedness, matching the
@@ -296,7 +305,11 @@ func emitExpr(e ir.Expr) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("(%s%s)", op, x), nil
+		sep := ""
+		if isWordOperator(op) {
+			sep = " "
+		}
+		return fmt.Sprintf("(%s%s%s)", op, sep, x), nil
 	case *ir.Mask:
 		x, err := emitExpr(e.X)
 		if err != nil {
