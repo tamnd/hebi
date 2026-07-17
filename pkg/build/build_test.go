@@ -257,6 +257,40 @@ func TestCompoundAssign(t *testing.T) {
 	}
 }
 
+// TestBreakContinue checks unlabeled break and continue against go run across
+// the loop shapes where continue is a bare keyword and the ones where it must
+// still run a step first: an infinite loop, a condition loop, a for-in-range, a
+// while-form loop with a post, a range over a string whose cursor must advance,
+// nested loops where an inner break stays inner, and a redundant trailing break
+// inside a switch that leaves the switch and lets the loop go on.
+func TestBreakContinue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"break infinite", "i := 0\n\tfor {\n\t\tif i >= 3 {\n\t\t\tbreak\n\t\t}\n\t\tfmt.Println(i)\n\t\ti++\n\t}"},
+		{"continue condition", "i := 0\n\tfor i < 6 {\n\t\ti++\n\t\tif i == 3 {\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Println(i)\n\t}"},
+		{"break range int", "for i := range 10 {\n\t\tif i == 4 {\n\t\t\tbreak\n\t\t}\n\t\tfmt.Println(i)\n\t}"},
+		{"continue range int", "for i := range 5 {\n\t\tif i == 2 {\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Println(i)\n\t}"},
+		{"continue while form post", "sum := 0\n\tfor i := 0; sum < 12; i++ {\n\t\tif i == 2 {\n\t\t\tcontinue\n\t\t}\n\t\tsum += i\n\t}\n\tfmt.Println(sum)"},
+		{"break while form post", "last := 0\n\tfor i := 0; i < 100; i++ {\n\t\tif i == 5 {\n\t\t\tbreak\n\t\t}\n\t\tlast = i\n\t}\n\tfmt.Println(last)"},
+		{"continue range string", "for i, c := range \"abcde\" {\n\t\tif i == 2 {\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Println(i, c)\n\t}"},
+		{"break range string", "for i, c := range \"hello\" {\n\t\tif i == 3 {\n\t\t\tbreak\n\t\t}\n\t\tfmt.Println(i, c)\n\t}"},
+		{"nested inner break", "for i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"nested inner continue", "for i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"continue in switch in loop", "for i := range 4 {\n\t\tswitch i {\n\t\tcase 1:\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Println(i)\n\t}"},
+		{"trailing break in switch", "for i := range 3 {\n\t\tswitch i {\n\t\tcase 1:\n\t\t\tfmt.Println(\"one\")\n\t\t\tbreak\n\t\tdefault:\n\t\t\tfmt.Println(\"other\")\n\t\t}\n\t}"},
+		{"trailing break in switch no loop", "x := 2\n\tswitch x {\n\tcase 2:\n\t\tfmt.Println(\"two\")\n\t\tbreak\n\tdefault:\n\t\tfmt.Println(\"other\")\n\t}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")
@@ -397,6 +431,11 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"parameter", "package main\n\nfunc f(x int) {}\n\nfunc main() {}\n"},
 		{"result", "package main\n\nfunc f() int { return 0 }\n\nfunc main() {}\n"},
 		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},
+		{"labeled break", "package main\n\nfunc main() {\nOuter:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tbreak Outer\n\t\t}\n\t\t_ = i\n\t}\n}\n"},
+		{"labeled continue", "package main\n\nfunc main() {\nOuter:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tcontinue Outer\n\t\t}\n\t\t_ = i\n\t}\n}\n"},
+		{"goto", "package main\n\nfunc main() {\n\ti := 0\nLoop:\n\tif i < 3 {\n\t\ti++\n\t\tgoto Loop\n\t}\n}\n"},
+		{"non-tail break in switch", "package main\n\nfunc main() {\n\tx := 1\n\tswitch x {\n\tcase 1:\n\t\tbreak\n\t\tprintln(\"after\")\n\t}\n}\n"},
+		{"statement label", "package main\n\nfunc main() {\nDone:\n\tprintln(\"hi\")\n\t_ = 0\n\tgoto Done\n}\n"},
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
 	}
 	for _, tt := range tests {

@@ -46,6 +46,40 @@ type lowerer struct {
 	// switchSeq numbers the tag temporary an expression switch spills to, so a
 	// nested switch does not reuse an outer switch's tag name.
 	switchSeq int
+	// scopes is the stack of enclosing loops and switches, innermost last, which
+	// tells a break whether it leaves a loop or a switch and lets the lowering
+	// reject a break it cannot yet express faithfully.
+	scopes []scopeKind
+}
+
+// scopeKind marks an enclosing breakable construct as a loop or a switch, since
+// Go's unlabeled break leaves whichever is innermost while its continue always
+// targets the innermost loop.
+type scopeKind int
+
+const (
+	scopeLoop scopeKind = iota
+	scopeSwitch
+)
+
+func (l *lowerer) pushScope(k scopeKind) { l.scopes = append(l.scopes, k) }
+func (l *lowerer) popScope()             { l.scopes = l.scopes[:len(l.scopes)-1] }
+
+// innermostIsSwitch reports whether the closest enclosing breakable construct is
+// a switch, in which case an unlabeled break leaves the switch rather than a
+// loop.
+func (l *lowerer) innermostIsSwitch() bool {
+	n := len(l.scopes)
+	return n > 0 && l.scopes[n-1] == scopeSwitch
+}
+
+// lowerLoopBlock lowers a loop body with a loop scope on the stack, so a break or
+// continue inside it resolves to this loop.
+func (l *lowerer) lowerLoopBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
+	l.pushScope(scopeLoop)
+	body, err := l.lowerBlock(block)
+	l.popScope()
+	return body, err
 }
 
 // seqName builds an internal name from a base and a sequence number, leaving the
@@ -127,6 +161,10 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerRange(s)
 	case *ast.SwitchStmt:
 		return l.lowerSwitch(s)
+	case *ast.BranchStmt:
+		return l.lowerBranch(s)
+	case *ast.LabeledStmt:
+		return nil, l.errf(s.Pos(), "a statement label is not supported yet")
 	case *ast.ExprStmt:
 		x, err := l.lowerExpr(s.X)
 		if err != nil {
@@ -269,6 +307,59 @@ func (l *lowerer) lowerIncDec(s *ast.IncDecStmt) ([]ir.Stmt, error) {
 	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value}}, nil
 }
 
+// lowerBranch lowers a break or continue. An unlabeled break leaves the innermost
+// loop and becomes a Python break; when the innermost breakable construct is a
+// switch instead, the break leaves the switch, which the case lowering handles as
+// a dropped trailing statement, so any break that reaches here from inside a
+// switch is one hebi cannot yet place faithfully. An unlabeled continue advances
+// the innermost loop; the step a while-form loop owes it is threaded in by the
+// loop lowering, not here. Labeled jumps and goto wait on their own slice.
+func (l *lowerer) lowerBranch(s *ast.BranchStmt) ([]ir.Stmt, error) {
+	switch s.Tok {
+	case token.BREAK:
+		if s.Label != nil {
+			return nil, l.errf(s.Pos(), "labeled break is not supported yet")
+		}
+		if l.innermostIsSwitch() {
+			return nil, l.errf(s.Pos(), "break inside a switch is only supported as the last statement of a case for now")
+		}
+		return []ir.Stmt{&ir.Break{}}, nil
+	case token.CONTINUE:
+		if s.Label != nil {
+			return nil, l.errf(s.Pos(), "labeled continue is not supported yet")
+		}
+		return []ir.Stmt{&ir.Continue{}}, nil
+	case token.GOTO:
+		return nil, l.errf(s.Pos(), "goto is not supported yet")
+	default:
+		return nil, l.errf(s.Pos(), "fallthrough is only supported at the end of a switch case")
+	}
+}
+
+// runBeforeContinue rewrites a loop body so a continue first runs the given step,
+// which is how a while-form loop keeps its post statement or a range over a string
+// keeps its cursor advance faithful: Python's bare continue would skip the step
+// and spin forever. It descends into if branches, which is where a continue
+// usually hides and where a switch's lowered chain lives, but it stops at a nested
+// loop, whose own continue belongs to that loop and gets its own step.
+func runBeforeContinue(body []ir.Stmt, step []ir.Stmt) []ir.Stmt {
+	out := make([]ir.Stmt, 0, len(body))
+	for _, s := range body {
+		switch s := s.(type) {
+		case *ir.Continue:
+			out = append(out, step...)
+			out = append(out, s)
+		case *ir.IfStmt:
+			s.Then = runBeforeContinue(s.Then, step)
+			s.Else = runBeforeContinue(s.Else, step)
+			out = append(out, s)
+		default:
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
 	if s.Init != nil {
 		return nil, l.errf(s.Pos(), "if with an init statement is not supported yet")
@@ -334,26 +425,33 @@ func (l *lowerer) lowerSwitch(s *ast.SwitchStmt) ([]ir.Stmt, error) {
 		body  []ir.Stmt
 		fall  bool
 	}
+	// A switch is a breakable scope, so an unlabeled break inside a case leaves
+	// the switch rather than an enclosing loop.
+	l.pushScope(scopeSwitch)
 	var clauses []clause
 	for _, item := range s.Body.List {
 		cc, ok := item.(*ast.CaseClause)
 		if !ok {
+			l.popScope()
 			return nil, l.errf(item.Pos(), "switch body item %T is not supported yet", item)
 		}
 		var conds []ir.Expr
 		for _, e := range cc.List {
 			ce, err := l.lowerExpr(e)
 			if err != nil {
+				l.popScope()
 				return nil, err
 			}
 			conds = append(conds, ce)
 		}
 		body, fall, err := l.lowerCaseBody(cc.Body)
 		if err != nil {
+			l.popScope()
 			return nil, err
 		}
 		clauses = append(clauses, clause{conds: conds, body: body, fall: fall})
 	}
+	l.popScope()
 
 	// resolve inlines a falling case's successor body, so a fallthrough runs the
 	// next case unconditionally while that next case still runs on its own match.
@@ -395,12 +493,21 @@ func (l *lowerer) lowerSwitch(s *ast.SwitchStmt) ([]ir.Stmt, error) {
 
 // lowerCaseBody lowers a case clause's statements, reporting whether the clause
 // ends in a fallthrough. go/types guarantees a fallthrough is the last statement
-// of a non-final case, so it is only ever the trailing statement here.
+// of a non-final case, so it is only ever the trailing statement here. A trailing
+// unlabeled break is the redundant switch-exit Go programmers sometimes write for
+// clarity, and since a case already ends without falling through, it is dropped;
+// a break elsewhere in the case reaches the branch lowering, which reports that
+// hebi cannot yet place it.
 func (l *lowerer) lowerCaseBody(list []ast.Stmt) ([]ir.Stmt, bool, error) {
 	fall := false
 	if n := len(list); n > 0 {
 		if br, ok := list[n-1].(*ast.BranchStmt); ok && br.Tok == token.FALLTHROUGH {
 			fall = true
+			list = list[:n-1]
+		}
+	}
+	if n := len(list); n > 0 {
+		if br, ok := list[n-1].(*ast.BranchStmt); ok && br.Tok == token.BREAK && br.Label == nil {
 			list = list[:n-1]
 		}
 	}
@@ -463,18 +570,19 @@ func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
 		}
 		cond = c
 	}
-	body, err := l.lowerBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body)
 	if err != nil {
 		return nil, err
 	}
 	if s.Post != nil {
-		// The post runs at the bottom of the loop body. A continue in the body
-		// would skip it, which the labeled-continue machinery of a later slice
-		// will guard; no continue exists yet, so the placement is faithful today.
+		// The post runs at the bottom of the loop body on a normal iteration, and
+		// a continue must run it too, or the loop would skip the step and spin, so
+		// the step is threaded in before each continue as well.
 		post, err := l.lowerStmt(s.Post)
 		if err != nil {
 			return nil, err
 		}
+		body = runBeforeContinue(body, post)
 		body = append(body, post...)
 	}
 	return append(pre, &ir.ForStmt{Cond: cond, Body: body}), nil
@@ -491,7 +599,7 @@ func (l *lowerer) lowerWhile(s *ast.ForStmt) ([]ir.Stmt, error) {
 		}
 		cond = c
 	}
-	body, err := l.lowerBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +696,9 @@ func (l *lowerer) countSugar(s *ast.ForStmt) (*ir.ForRange, error) {
 	case !up:
 		step = &ir.IntLit{Text: "-1"}
 	}
-	body, err := l.lowerBlock(s.Body)
+	// A continue in a for-in-range needs no threaded step, since Python's for
+	// advances the range on its own, exactly as Go's post would.
+	body, err := l.lowerLoopBlock(s.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -694,15 +804,22 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 	}
 	n := l.rangeSeq
 	l.rangeSeq++
-	body, err := l.lowerBlock(s.Body)
+	cursor := seqName("_i", n)
+	width := seqName("_w", n)
+	body, err := l.lowerLoopBlock(s.Body)
 	if err != nil {
 		return nil, err
 	}
+	// The emitter advances the cursor at the bottom of the loop for a normal
+	// iteration; a continue must advance it too, or the decode would repeat the
+	// same rune forever, so the advance is threaded in before each continue.
+	advance := []ir.Stmt{&ir.AssignStmt{Name: cursor, Value: &ir.BinaryExpr{Op: "+", X: &ir.Ident{Name: cursor}, Y: &ir.Ident{Name: width}}}}
+	body = runBeforeContinue(body, advance)
 	rs := &ir.RangeString{
 		Key:    rangeIdent(s.Key),
 		Value:  rangeIdent(s.Value),
-		Cursor: seqName("_i", n),
-		Width:  seqName("_w", n),
+		Cursor: cursor,
+		Width:  width,
 		Source: source,
 		Body:   body,
 	}
@@ -722,7 +839,7 @@ func (l *lowerer) lowerRangeInt(s *ast.RangeStmt) ([]ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, err := l.lowerBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body)
 	if err != nil {
 		return nil, err
 	}

@@ -527,6 +527,43 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleBreakContinue pins the break and continue keywords inside a loop.
+func TestModuleBreakContinue(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{&ir.ForRange{
+				Var:  "i",
+				Stop: &ir.IntLit{Text: "10"},
+				Body: []ir.Stmt{
+					&ir.IfStmt{Cond: &ir.BinaryExpr{Op: "==", X: &ir.Ident{Name: "i"}, Y: &ir.IntLit{Text: "5"}}, Then: []ir.Stmt{&ir.Break{}}},
+					&ir.IfStmt{Cond: &ir.BinaryExpr{Op: "==", X: &ir.Ident{Name: "i"}, Y: &ir.IntLit{Text: "2"}}, Then: []ir.Stmt{&ir.Continue{}}},
+				},
+			}},
+		}},
+	}
+	want := `def main():
+    for i in range(10):
+        if (i == 5):
+            break
+        if (i == 2):
+            continue
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 // TestEmittedRuns is the small end-to-end check: emit hello, drop it beside the
 // shim, run it under CPython, and confirm it prints the Go answer. It skips
 // where python3 is not on the path.

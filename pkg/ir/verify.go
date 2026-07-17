@@ -85,6 +85,9 @@ func verifyStmt(where string, s Stmt) error {
 			}
 		}
 		return verifyBlock(where+": body", s.Body)
+	case *Break, *Continue:
+		// A break or continue carries no operand, so there is nothing to check.
+		return nil
 	case *RangeString:
 		if s.Cursor == "" || s.Width == "" {
 			return fmt.Errorf("ir: %s ranges a string without a cursor or width name", where)
