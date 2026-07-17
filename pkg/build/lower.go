@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -47,14 +48,21 @@ type lowerer struct {
 	// nested switch does not reuse an outer switch's tag name.
 	switchSeq int
 	// scopes is the stack of enclosing loops and switches, innermost last, which
-	// tells a break whether it leaves a loop or a switch and lets the lowering
-	// reject a break it cannot yet express faithfully.
-	scopes []scopeKind
+	// tells a break whether it leaves a loop or a switch and lets a labeled break
+	// find the loop it names.
+	scopes []scope
 }
 
-// scopeKind marks an enclosing breakable construct as a loop or a switch, since
-// Go's unlabeled break leaves whichever is innermost while its continue always
-// targets the innermost loop.
+// scope is one enclosing breakable construct: a loop or a switch, carrying the Go
+// label the source attached to it, if any. Go's unlabeled break leaves whichever
+// is innermost, while a labeled break names an outer loop that the lowering finds
+// by its label.
+type scope struct {
+	kind  scopeKind
+	label string
+}
+
+// scopeKind marks an enclosing breakable construct as a loop or a switch.
 type scopeKind int
 
 const (
@@ -62,21 +70,32 @@ const (
 	scopeSwitch
 )
 
-func (l *lowerer) pushScope(k scopeKind) { l.scopes = append(l.scopes, k) }
-func (l *lowerer) popScope()             { l.scopes = l.scopes[:len(l.scopes)-1] }
+func (l *lowerer) pushScope(s scope) { l.scopes = append(l.scopes, s) }
+func (l *lowerer) popScope()         { l.scopes = l.scopes[:len(l.scopes)-1] }
 
 // innermostIsSwitch reports whether the closest enclosing breakable construct is
 // a switch, in which case an unlabeled break leaves the switch rather than a
 // loop.
 func (l *lowerer) innermostIsSwitch() bool {
 	n := len(l.scopes)
-	return n > 0 && l.scopes[n-1] == scopeSwitch
+	return n > 0 && l.scopes[n-1].kind == scopeSwitch
 }
 
-// lowerLoopBlock lowers a loop body with a loop scope on the stack, so a break or
-// continue inside it resolves to this loop.
-func (l *lowerer) lowerLoopBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
-	l.pushScope(scopeLoop)
+// labelIsLoop reports whether the given label names an enclosing loop, so a
+// labeled break to it can be expressed with the flag machinery.
+func (l *lowerer) labelIsLoop(label string) bool {
+	for _, s := range l.scopes {
+		if s.label == label {
+			return s.kind == scopeLoop
+		}
+	}
+	return false
+}
+
+// lowerLoopBlock lowers a loop body with a loop scope on the stack, carrying the
+// loop's label so a labeled break inside it can resolve to this loop.
+func (l *lowerer) lowerLoopBlock(block *ast.BlockStmt, label string) ([]ir.Stmt, error) {
+	l.pushScope(scope{kind: scopeLoop, label: label})
 	body, err := l.lowerBlock(block)
 	l.popScope()
 	return body, err
@@ -127,6 +146,7 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if err != nil {
 		return nil, err
 	}
+	body = resolveLabeledBreaks(body)
 	return &ir.Func{Name: fd.Name.Name, Body: body}, nil
 }
 
@@ -156,15 +176,15 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 	case *ast.IfStmt:
 		return l.lowerIf(s)
 	case *ast.ForStmt:
-		return l.lowerFor(s)
+		return l.lowerFor(s, "")
 	case *ast.RangeStmt:
-		return l.lowerRange(s)
+		return l.lowerRange(s, "")
 	case *ast.SwitchStmt:
 		return l.lowerSwitch(s)
 	case *ast.BranchStmt:
 		return l.lowerBranch(s)
 	case *ast.LabeledStmt:
-		return nil, l.errf(s.Pos(), "a statement label is not supported yet")
+		return l.lowerLabeled(s)
 	case *ast.ExprStmt:
 		x, err := l.lowerExpr(s.X)
 		if err != nil {
@@ -307,18 +327,39 @@ func (l *lowerer) lowerIncDec(s *ast.IncDecStmt) ([]ir.Stmt, error) {
 	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value}}, nil
 }
 
+// lowerLabeled lowers a statement that carries a Go label. Only a label on a loop
+// is supported, where the label lets an inner break name this loop; the label
+// flows into the loop lowering and out to the labeled-break pass. A label on a
+// switch, a select, or a bare statement waits on a later slice, since those need
+// their own jump machinery.
+func (l *lowerer) lowerLabeled(s *ast.LabeledStmt) ([]ir.Stmt, error) {
+	switch inner := s.Stmt.(type) {
+	case *ast.ForStmt:
+		return l.lowerFor(inner, s.Label.Name)
+	case *ast.RangeStmt:
+		return l.lowerRange(inner, s.Label.Name)
+	default:
+		return nil, l.errf(s.Pos(), "a label on %T is not supported yet", inner)
+	}
+}
+
 // lowerBranch lowers a break or continue. An unlabeled break leaves the innermost
 // loop and becomes a Python break; when the innermost breakable construct is a
 // switch instead, the break leaves the switch, which the case lowering handles as
 // a dropped trailing statement, so any break that reaches here from inside a
-// switch is one hebi cannot yet place faithfully. An unlabeled continue advances
-// the innermost loop; the step a while-form loop owes it is threaded in by the
-// loop lowering, not here. Labeled jumps and goto wait on their own slice.
+// switch is one hebi cannot yet place faithfully. A labeled break that names an
+// enclosing loop becomes a LabeledBreak marker the later pass turns into flags. An
+// unlabeled continue advances the innermost loop; the step a while-form loop owes
+// it is threaded in by the loop lowering, not here. Labeled continue and goto wait
+// on their own slice.
 func (l *lowerer) lowerBranch(s *ast.BranchStmt) ([]ir.Stmt, error) {
 	switch s.Tok {
 	case token.BREAK:
 		if s.Label != nil {
-			return nil, l.errf(s.Pos(), "labeled break is not supported yet")
+			if !l.labelIsLoop(s.Label.Name) {
+				return nil, l.errf(s.Pos(), "labeled break to %s is not supported yet", s.Label.Name)
+			}
+			return []ir.Stmt{&ir.LabeledBreak{Label: s.Label.Name}}, nil
 		}
 		if l.innermostIsSwitch() {
 			return nil, l.errf(s.Pos(), "break inside a switch is only supported as the last statement of a case for now")
@@ -334,6 +375,102 @@ func (l *lowerer) lowerBranch(s *ast.BranchStmt) ([]ir.Stmt, error) {
 	default:
 		return nil, l.errf(s.Pos(), "fallthrough is only supported at the end of a switch case")
 	}
+}
+
+// resolveLabeledBreaks rewrites the LabeledBreak markers in a block into the flag
+// machinery that reproduces a labeled break in Python, which has no loop labels. A
+// break naming the innermost loop is just a plain break. A break naming an outer
+// loop sets a per-label flag and breaks the innermost loop; then after each nested
+// loop the flag is checked and the enclosing loop breaks too, so the break unwinds
+// one loop at a time until it reaches the named loop. The flag is declared just
+// before the named loop. innerLabel is the label of the nearest enclosing loop,
+// and used records which flags were set so the declaration is emitted only where a
+// flag is really needed. The returned set is the labels that still escape this
+// block, for the caller to keep unwinding.
+func resolveLabeledBreaks(stmts []ir.Stmt) []ir.Stmt {
+	out, _ := rewriteBreaks(stmts, "", map[string]bool{})
+	return out
+}
+
+func rewriteBreaks(stmts []ir.Stmt, innerLabel string, used map[string]bool) ([]ir.Stmt, map[string]bool) {
+	escapes := map[string]bool{}
+	var out []ir.Stmt
+	for _, s := range stmts {
+		switch s := s.(type) {
+		case *ir.LabeledBreak:
+			if s.Label == innerLabel {
+				// The break names the loop it sits directly in, so a plain break
+				// leaves it, exactly as an unlabeled break would.
+				out = append(out, &ir.Break{})
+			} else {
+				used[s.Label] = true
+				out = append(out, &ir.AssignStmt{Name: breakFlag(s.Label), Value: &ir.BoolLit{Value: true}})
+				out = append(out, &ir.Break{})
+				escapes[s.Label] = true
+			}
+		case *ir.IfStmt:
+			// An if is transparent to break, so its branches unwind to the same
+			// enclosing loop and it never carries a post-loop check of its own.
+			then, eThen := rewriteBreaks(s.Then, innerLabel, used)
+			els, eElse := rewriteBreaks(s.Else, innerLabel, used)
+			s.Then, s.Else = then, els
+			mergeLabels(escapes, eThen)
+			mergeLabels(escapes, eElse)
+			out = append(out, s)
+		case *ir.ForStmt:
+			out = unwindLoop(out, s, &s.Body, s.Label, innerLabel, escapes, used)
+		case *ir.ForRange:
+			out = unwindLoop(out, s, &s.Body, s.Label, innerLabel, escapes, used)
+		case *ir.RangeString:
+			out = unwindLoop(out, s, &s.Body, s.Label, innerLabel, escapes, used)
+		default:
+			out = append(out, s)
+		}
+	}
+	return out, escapes
+}
+
+// unwindLoop rewrites one nested loop's body, then places the loop into the
+// surrounding block with the flag declaration it needs and the post-loop checks
+// that keep a labeled break unwinding. ownLabel is the loop's own label and
+// innerLabel is the enclosing loop's; each label the body still escapes to gets a
+// check that breaks the enclosing loop, and a check for the enclosing loop's own
+// label ends the unwinding there.
+func unwindLoop(out []ir.Stmt, loop ir.Stmt, body *[]ir.Stmt, ownLabel, innerLabel string, escapes, used map[string]bool) []ir.Stmt {
+	newBody, childEsc := rewriteBreaks(*body, ownLabel, used)
+	*body = newBody
+	if ownLabel != "" && used[ownLabel] {
+		// A break inside this loop names it, so the flag it sets must exist before
+		// the loop runs.
+		out = append(out, &ir.AssignStmt{Name: breakFlag(ownLabel), Value: &ir.BoolLit{Value: false}})
+	}
+	out = append(out, loop)
+	for _, label := range sortedLabels(childEsc) {
+		out = append(out, &ir.IfStmt{Cond: &ir.Ident{Name: breakFlag(label)}, Then: []ir.Stmt{&ir.Break{}}})
+		if label != innerLabel {
+			escapes[label] = true
+		}
+	}
+	return out
+}
+
+func breakFlag(label string) string { return "_brk_" + label }
+
+func mergeLabels(dst, src map[string]bool) {
+	for k := range src {
+		dst[k] = true
+	}
+}
+
+// sortedLabels returns the labels in a set in a stable order, so the emitted
+// checks do not depend on Go's map iteration order.
+func sortedLabels(set map[string]bool) []string {
+	labels := make([]string, 0, len(set))
+	for k := range set {
+		labels = append(labels, k)
+	}
+	sort.Strings(labels)
+	return labels
 }
 
 // runBeforeContinue rewrites a loop body so a continue first runs the given step,
@@ -427,7 +564,7 @@ func (l *lowerer) lowerSwitch(s *ast.SwitchStmt) ([]ir.Stmt, error) {
 	}
 	// A switch is a breakable scope, so an unlabeled break inside a case leaves
 	// the switch rather than an enclosing loop.
-	l.pushScope(scopeSwitch)
+	l.pushScope(scope{kind: scopeSwitch})
 	var clauses []clause
 	for _, item := range s.Body.List {
 		cc, ok := item.(*ast.CaseClause)
@@ -545,11 +682,11 @@ func caseCond(tag ir.Expr, conds []ir.Expr) ir.Expr {
 // becomes a readable for-in-range when it is a plain forward or backward count,
 // and otherwise a faithful while: the init runs before the loop, the condition
 // gates it, and the post runs at the bottom of the body.
-func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
+func (l *lowerer) lowerFor(s *ast.ForStmt, label string) ([]ir.Stmt, error) {
 	if s.Init == nil && s.Post == nil {
-		return l.lowerWhile(s)
+		return l.lowerWhile(s, label)
 	}
-	if sugar, err := l.countSugar(s); err != nil {
+	if sugar, err := l.countSugar(s, label); err != nil {
 		return nil, err
 	} else if sugar != nil {
 		return []ir.Stmt{sugar}, nil
@@ -570,7 +707,7 @@ func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
 		}
 		cond = c
 	}
-	body, err := l.lowerLoopBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body, label)
 	if err != nil {
 		return nil, err
 	}
@@ -585,12 +722,12 @@ func (l *lowerer) lowerFor(s *ast.ForStmt) ([]ir.Stmt, error) {
 		body = runBeforeContinue(body, post)
 		body = append(body, post...)
 	}
-	return append(pre, &ir.ForStmt{Cond: cond, Body: body}), nil
+	return append(pre, &ir.ForStmt{Cond: cond, Body: body, Label: label}), nil
 }
 
 // lowerWhile lowers a condition-only or infinite for loop to a while. A nil
 // condition is Go's bare for and emits while True.
-func (l *lowerer) lowerWhile(s *ast.ForStmt) ([]ir.Stmt, error) {
+func (l *lowerer) lowerWhile(s *ast.ForStmt, label string) ([]ir.Stmt, error) {
 	var cond ir.Expr
 	if s.Cond != nil {
 		c, err := l.lowerExpr(s.Cond)
@@ -599,11 +736,11 @@ func (l *lowerer) lowerWhile(s *ast.ForStmt) ([]ir.Stmt, error) {
 		}
 		cond = c
 	}
-	body, err := l.lowerLoopBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body, label)
 	if err != nil {
 		return nil, err
 	}
-	return []ir.Stmt{&ir.ForStmt{Cond: cond, Body: body}}, nil
+	return []ir.Stmt{&ir.ForStmt{Cond: cond, Body: body, Label: label}}, nil
 }
 
 // countSugar recognizes a three-clause for that is a plain integer count and
@@ -613,7 +750,7 @@ func (l *lowerer) lowerWhile(s *ast.ForStmt) ([]ir.Stmt, error) {
 // variable against a bound, a post that steps the variable by a constant in the
 // matching direction, and a body that never reassigns the variable. Everything
 // outside that shape is left to the always-correct while form.
-func (l *lowerer) countSugar(s *ast.ForStmt) (*ir.ForRange, error) {
+func (l *lowerer) countSugar(s *ast.ForStmt, label string) (*ir.ForRange, error) {
 	init, ok := s.Init.(*ast.AssignStmt)
 	if !ok || init.Tok != token.DEFINE || len(init.Lhs) != 1 || len(init.Rhs) != 1 {
 		return nil, nil
@@ -698,11 +835,11 @@ func (l *lowerer) countSugar(s *ast.ForStmt) (*ir.ForRange, error) {
 	}
 	// A continue in a for-in-range needs no threaded step, since Python's for
 	// advances the range on its own, exactly as Go's post would.
-	body, err := l.lowerLoopBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body, label)
 	if err != nil {
 		return nil, err
 	}
-	return &ir.ForRange{Var: v.Name, Start: start, Stop: stop, Step: step, Body: body}, nil
+	return &ir.ForRange{Var: v.Name, Start: start, Stop: stop, Step: step, Body: body, Label: label}, nil
 }
 
 // postStep reads a for loop's post statement, reporting whether it steps the loop
@@ -774,7 +911,7 @@ func assignsInBody(body *ast.BlockStmt, name string) bool {
 // the decoded rune; range over the other kinds arrives in a later slice. The
 // source is bound to a fresh name first so it is evaluated once, then a cursor
 // walks it rune by rune through the shim decoder.
-func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
+func (l *lowerer) lowerRange(s *ast.RangeStmt, label string) ([]ir.Stmt, error) {
 	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN && s.Tok != token.ILLEGAL {
 		return nil, l.errf(s.Pos(), "range with %s is not supported yet", s.Tok)
 	}
@@ -784,7 +921,7 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
 	}
 	if basic.Info()&types.IsInteger != 0 {
-		return l.lowerRangeInt(s)
+		return l.lowerRangeInt(s, label)
 	}
 	if basic.Info()&types.IsString == 0 {
 		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
@@ -806,7 +943,7 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 	l.rangeSeq++
 	cursor := seqName("_i", n)
 	width := seqName("_w", n)
-	body, err := l.lowerLoopBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body, label)
 	if err != nil {
 		return nil, err
 	}
@@ -822,6 +959,7 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 		Width:  width,
 		Source: source,
 		Body:   body,
+		Label:  label,
 	}
 	return append(pre, rs), nil
 }
@@ -831,7 +969,7 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt) ([]ir.Stmt, error) {
 // the stop bound, the start is an implicit zero, and the step is one, so a
 // non-positive n runs the body no times, matching Go. Only the index is bound,
 // since Go's range over an integer has a single value.
-func (l *lowerer) lowerRangeInt(s *ast.RangeStmt) ([]ir.Stmt, error) {
+func (l *lowerer) lowerRangeInt(s *ast.RangeStmt, label string) ([]ir.Stmt, error) {
 	if s.Value != nil {
 		return nil, l.errf(s.Pos(), "range over an integer binds a single value")
 	}
@@ -839,11 +977,11 @@ func (l *lowerer) lowerRangeInt(s *ast.RangeStmt) ([]ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, err := l.lowerLoopBlock(s.Body)
+	body, err := l.lowerLoopBlock(s.Body, label)
 	if err != nil {
 		return nil, err
 	}
-	return []ir.Stmt{&ir.ForRange{Var: rangeIdent(s.Key), Stop: stop, Body: body}}, nil
+	return []ir.Stmt{&ir.ForRange{Var: rangeIdent(s.Key), Stop: stop, Body: body, Label: label}}, nil
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {

@@ -236,6 +236,8 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		if err := emitRangeString(b, s, depth); err != nil {
 			return err
 		}
+	case *ir.LabeledBreak:
+		return fmt.Errorf("emit: labeled break to %q reached the emitter unresolved", s.Label)
 	default:
 		return fmt.Errorf("emit: unsupported statement type %T", s)
 	}

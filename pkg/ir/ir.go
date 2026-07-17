@@ -48,10 +48,13 @@ type IfStmt struct {
 }
 
 // ForStmt is a for loop lowered to the while form. A nil Cond is an unconditional
-// loop, matching Go's bare for.
+// loop, matching Go's bare for. Label carries the Go loop label when the source
+// labeled this loop, which the labeled-break pass reads to place its flag checks
+// and which the emitter ignores, since Python has no loop labels.
 type ForStmt struct {
-	Cond Expr
-	Body []Stmt
+	Cond  Expr
+	Body  []Stmt
+	Label string
 }
 
 // ForRange is a Python for-in-range loop, the readable form a simple counted Go
@@ -68,6 +71,7 @@ type ForRange struct {
 	Stop  Expr
 	Step  Expr
 	Body  []Stmt
+	Label string
 }
 
 // Break leaves the innermost enclosing loop, matching Go's unlabeled break; it
@@ -94,16 +98,24 @@ type RangeString struct {
 	Width  string
 	Source Expr
 	Body   []Stmt
+	Label  string
 }
 
-func (*ExprStmt) isStmt()    {}
-func (*AssignStmt) isStmt()  {}
-func (*IfStmt) isStmt()      {}
-func (*ForStmt) isStmt()     {}
-func (*ForRange) isStmt()    {}
-func (*Break) isStmt()       {}
-func (*Continue) isStmt()    {}
-func (*RangeString) isStmt() {}
+// LabeledBreak marks a Go break that names an outer loop. It is a transient node
+// the lowering emits at the break site and the labeled-break pass rewrites away
+// into a flag set and a plain break before the module is verified, so it never
+// reaches the emitter; both the verifier and the emitter reject one that leaks.
+type LabeledBreak struct{ Label string }
+
+func (*ExprStmt) isStmt()     {}
+func (*AssignStmt) isStmt()   {}
+func (*IfStmt) isStmt()       {}
+func (*ForStmt) isStmt()      {}
+func (*ForRange) isStmt()     {}
+func (*Break) isStmt()        {}
+func (*Continue) isStmt()     {}
+func (*RangeString) isStmt()  {}
+func (*LabeledBreak) isStmt() {}
 
 // Expr is an expression node.
 type Expr interface{ isExpr() }

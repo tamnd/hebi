@@ -61,6 +61,24 @@ func assertMatchesGo(t *testing.T, body string) {
 	}
 }
 
+// emitOf builds a single-file program through the real frontend and lowering
+// and returns the emitted main.py, so a golden test can pin the exact Python a
+// construct lowers to without going near the CLI.
+func emitOf(t *testing.T, source string) string {
+	t.Helper()
+	src := writeModule(t, source)
+	out := t.TempDir()
+	res, err := Build(src, out)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(res.Dir, res.Module))
+	if err != nil {
+		t.Fatalf("read main.py: %v", err)
+	}
+	return string(data)
+}
+
 // TestFloats checks float64 and float32 lowering against go run: literals,
 // native float64 arithmetic, single-precision float32 narrowing, the number
 // conversions, and the formatting reconciliation where fmt's shortest float
@@ -291,6 +309,61 @@ func TestBreakContinue(t *testing.T) {
 	}
 }
 
+// TestLabeledBreak checks a break that names an outer loop against go run. The
+// flag machinery has to unwind one loop at a time, so the cases cross one level
+// and several, break from inside an if, break from inside a switch nested in the
+// loops, sit beside trailing code that the break must skip at each level, name
+// the immediately enclosing loop where the break is really just plain, and run
+// two independent labeled loops so their flags do not collide.
+func TestLabeledBreak(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"one level", "Outer:\n\tfor i := range 4 {\n\t\tfor j := range 4 {\n\t\t\tif i+j == 3 {\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"two levels", "Outer:\n\tfor i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tfor k := range 3 {\n\t\t\t\tif i+j+k == 2 {\n\t\t\t\t\tbreak Outer\n\t\t\t\t}\n\t\t\t\tfmt.Println(i, j, k)\n\t\t\t}\n\t\t}\n\t}"},
+		{"skips trailing code", "Outer:\n\tfor i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tif i == 1 && j == 1 {\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t\tfmt.Println(\"inner\", i, j)\n\t\t}\n\t\tfmt.Println(\"tail\", i)\n\t}"},
+		{"break from switch", "Outer:\n\tfor i := range 4 {\n\t\tfor j := range 4 {\n\t\t\tswitch {\n\t\t\tcase i*j == 6:\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"names inner loop", "for i := range 3 {\n\tInner:\n\t\tfor j := range 3 {\n\t\t\tif j == 1 {\n\t\t\t\tbreak Inner\n\t\t\t}\n\t\t\tfmt.Println(i, j)\n\t\t}\n\t}"},
+		{"while form target", "sum := 0\nOuter:\n\tfor i := 0; i < 10; i++ {\n\t\tfor j := range 10 {\n\t\t\tif i*j > 12 {\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t\tsum += j\n\t\t}\n\t}\n\tfmt.Println(sum)"},
+		{"range string target", "Outer:\n\tfor i, c := range \"abcdef\" {\n\t\tfor j := range 3 {\n\t\t\tif i+j == 4 {\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t\tfmt.Println(i, c, j)\n\t\t}\n\t}"},
+		{"two independent labels", "A:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tif i == 1 {\n\t\t\t\tbreak A\n\t\t\t}\n\t\t\tfmt.Println(\"a\", i)\n\t\t}\n\t}\nB:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tif i == 2 {\n\t\t\t\tbreak B\n\t\t\t}\n\t\t\tfmt.Println(\"b\", i)\n\t\t}\n\t}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertMatchesGo(t, tt.body)
+		})
+	}
+}
+
+// TestLabeledBreakEmit pins the readable flag shape a two-level labeled break
+// lowers to: the flag is declared before the named loop, set and broken at the
+// site, and checked after each nested loop so the break unwinds outward.
+func TestLabeledBreakEmit(t *testing.T) {
+	t.Parallel()
+	body := "Outer:\n\tfor i := range 3 {\n\t\tfor j := range 3 {\n\t\t\tif i == j {\n\t\t\t\tbreak Outer\n\t\t\t}\n\t\t}\n\t}"
+	want := `def main():
+    _brk_Outer = False
+    for i in range(3):
+        for j in range(3):
+            if (i == j):
+                _brk_Outer = True
+                break
+        if _brk_Outer:
+            break
+
+
+if __name__ == "__main__":
+    main()
+`
+	got := emitOf(t, "package main\n\nfunc main() {\n\t"+body+"\n}\n")
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestBuildWritesFiles(t *testing.T) {
 	t.Parallel()
 	src := writeModule(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(1 + 2)\n}\n")
@@ -431,8 +504,8 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"parameter", "package main\n\nfunc f(x int) {}\n\nfunc main() {}\n"},
 		{"result", "package main\n\nfunc f() int { return 0 }\n\nfunc main() {}\n"},
 		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},
-		{"labeled break", "package main\n\nfunc main() {\nOuter:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tbreak Outer\n\t\t}\n\t\t_ = i\n\t}\n}\n"},
 		{"labeled continue", "package main\n\nfunc main() {\nOuter:\n\tfor i := range 3 {\n\t\tfor range 3 {\n\t\t\tcontinue Outer\n\t\t}\n\t\t_ = i\n\t}\n}\n"},
+		{"labeled switch", "package main\n\nfunc main() {\n\tx := 1\nSw:\n\tswitch x {\n\tcase 1:\n\t\tbreak Sw\n\t}\n}\n"},
 		{"goto", "package main\n\nfunc main() {\n\ti := 0\nLoop:\n\tif i < 3 {\n\t\ti++\n\t\tgoto Loop\n\t}\n}\n"},
 		{"non-tail break in switch", "package main\n\nfunc main() {\n\tx := 1\n\tswitch x {\n\tcase 1:\n\t\tbreak\n\t\tprintln(\"after\")\n\t}\n}\n"},
 		{"statement label", "package main\n\nfunc main() {\nDone:\n\tprintln(\"hi\")\n\t_ = 0\n\tgoto Done\n}\n"},

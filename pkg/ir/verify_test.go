@@ -52,6 +52,9 @@ func TestVerifyRejects(t *testing.T) {
 		{"empty intrinsic name", func(m *Module) {
 			m.Funcs[0].Body[1].(*IfStmt).Then[0].(*ExprStmt).X.(*Intrinsic).Name = ""
 		}, "intrinsic with no name"},
+		{"leaked labeled break", func(m *Module) {
+			m.Funcs[0].Body = append(m.Funcs[0].Body, &LabeledBreak{Label: "Outer"})
+		}, "unresolved labeled break to \"Outer\""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -88,6 +88,10 @@ func verifyStmt(where string, s Stmt) error {
 	case *Break, *Continue:
 		// A break or continue carries no operand, so there is nothing to check.
 		return nil
+	case *LabeledBreak:
+		// The labeled-break pass rewrites every LabeledBreak into a flag and a
+		// plain break, so one reaching the verifier is a lowering bug.
+		return fmt.Errorf("ir: %s is an unresolved labeled break to %q", where, s.Label)
 	case *RangeString:
 		if s.Cursor == "" || s.Width == "" {
 			return fmt.Errorf("ir: %s ranges a string without a cursor or width name", where)
