@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: read version pins
-        run: cat versions.env >> "$GITHUB_ENV"
+        run: grep -E "^[A-Za-z_][A-Za-z0-9_]*=" versions.env >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO }}
@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: read version pins
-        run: cat versions.env >> "$GITHUB_ENV"
+        run: grep -E "^[A-Za-z_][A-Za-z0-9_]*=" versions.env >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO }}
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: read version pins
-        run: cat versions.env >> "$GITHUB_ENV"
+        run: grep -E "^[A-Za-z_][A-Za-z0-9_]*=" versions.env >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO }}
@@ -92,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: read version pins
-        run: cat versions.env >> "$GITHUB_ENV"
+        run: grep -E "^[A-Za-z_][A-Za-z0-9_]*=" versions.env >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO }}
@@ -118,7 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: read version pins
-        run: cat versions.env >> "$GITHUB_ENV"
+        run: grep -E "^[A-Za-z_][A-Za-z0-9_]*=" versions.env >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO }}
