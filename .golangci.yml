@@ -1,0 +1,15 @@
+version: "2"
+
+# The default linter set (errcheck, govet, ineffassign, staticcheck, unused)
+# is the quality gate. Add to enable as the codebase grows a need.
+linters:
+  enable:
+    - misspell
+  settings:
+    errcheck:
+      # Writes to stdout and stderr through fmt do not carry a meaningful
+      # error to handle, so excluding them keeps CLI output code clean.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln

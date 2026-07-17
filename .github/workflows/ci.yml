@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel an in-flight run when a branch is pushed again.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build and test on Linux and macOS with the race detector on. gofmt and vet
+  # run here too so a formatting slip fails fast on both platforms. The Go
+  # version is pinned by go.mod and GOTOOLCHAIN is pinned from versions.env, so
+  # no runner silently upgrades the toolchain.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version pins
+        run: cat versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO }}
+          check-latest: false
+          cache: true
+      - name: pin the toolchain
+        run: echo "GOTOOLCHAIN=go${GO}" >> "$GITHUB_ENV"
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt -s -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test with the race detector
+        run: go test -race -shuffle=on -count=1 -coverprofile=coverage.out ./...
+      - name: coverage summary
+        if: matrix.os == 'ubuntu-latest'
+        run: go tool cover -func=coverage.out | tail -1
+
+  # golangci-lint bundles staticcheck, govet, ineffassign, errcheck, unused and
+  # more, so it is the main quality gate beyond vet.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version pins
+        run: cat versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.1
+
+  # Confirm go.mod and go.sum stay tidy: a PR that adds an import without
+  # running go mod tidy fails here instead of breaking a later release.
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version pins
+        run: cat versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO }}
+          cache: true
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  # Scan the module and its dependencies for known vulnerabilities.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version pins
+        run: cat versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO }}
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # Prove the CLI cross-compiles for the platforms a release will target. The
+  # compiled tier is pure Python and the tool itself is pure Go today, so this
+  # builds with CGO off. The native tier adds cgo later behind its own build.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version pins
+        run: cat versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO }}
+          cache: true
+      - name: build ${{ matrix.target.goos }}/${{ matrix.target.goarch }}
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -o /dev/null ./cmd/hebi
+
+  # Guard the house rules that a linter cannot see: no internal/ directories,
+  # and versions.env stays parseable.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no internal directories
+        run: ./scripts/no-internal.sh
