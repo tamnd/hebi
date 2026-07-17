@@ -1,0 +1,17 @@
+# The CLI surface that does not touch the toolchain: version and the usage and
+# error paths. These are deterministic and run everywhere.
+
+exec hebi version
+stdout '0\.0\.0-dev'
+
+! exec hebi
+stderr 'usage: hebi'
+
+! exec hebi nope
+stderr 'unknown command'
+
+! exec hebi build
+stderr 'usage: hebi build'
+
+! exec hebi run
+stderr 'usage: hebi run'

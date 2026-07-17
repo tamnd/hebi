@@ -1,0 +1,28 @@
+# The end-to-end path: build a hello program to Python beside the shim, then
+# run it under CPython and check the output matches what go run would print.
+# Skips where the go tool or python3 is not available.
+
+[!exec:go] skip 'needs the go tool to load the input'
+[!exec:python3] skip 'needs python3 to run the emitted module'
+
+exec hebi build hello.go
+stdout 'main\.py'
+stdout '_hebirt\.py'
+exists out/main.py
+exists out/_hebirt.py
+
+exec hebi run hello.go
+stdout '^3\n$'
+
+-- go.mod --
+module example.com/hello
+
+go 1.26
+-- hello.go --
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(1 + 2)
+}
