@@ -1,0 +1,87 @@
+package ir
+
+import (
+	"strings"
+	"testing"
+)
+
+// hello is a well-formed module: func main() { x := 1 + 2; if x < 3 { println(x) } }
+func hello() *Module {
+	return &Module{
+		Package: "main",
+		Funcs: []*Func{{
+			Name: "main",
+			Body: []Stmt{
+				&AssignStmt{Name: "x", Define: true, Value: &BinaryExpr{Op: "+", X: &IntLit{Text: "1"}, Y: &IntLit{Text: "2"}}},
+				&IfStmt{
+					Cond: &BinaryExpr{Op: "<", X: &Ident{Name: "x"}, Y: &IntLit{Text: "3"}},
+					Then: []Stmt{&ExprStmt{X: &Intrinsic{Name: "println", Args: []Expr{&Ident{Name: "x"}}}}},
+				},
+			},
+		}},
+	}
+}
+
+func TestVerifyAcceptsWellFormed(t *testing.T) {
+	t.Parallel()
+	if err := Verify(hello()); err != nil {
+		t.Fatalf("Verify rejected a well-formed module: %v", err)
+	}
+}
+
+func TestVerifyRejects(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"nil module", nil, "module is nil"},
+		{"no package", func(m *Module) { m.Package = "" }, "no package name"},
+		{"nil func", func(m *Module) { m.Funcs[0] = nil }, "func 0 is nil"},
+		{"empty func name", func(m *Module) { m.Funcs[0].Name = "" }, "has no name"},
+		{"duplicate func", func(m *Module) { m.Funcs = append(m.Funcs, &Func{Name: "main"}) }, "defined more than once"},
+		{"nil statement", func(m *Module) { m.Funcs[0].Body[0] = nil }, "statement 0 is nil"},
+		{"empty assign name", func(m *Module) { m.Funcs[0].Body[0].(*AssignStmt).Name = "" }, "empty name"},
+		{"nil assign value", func(m *Module) { m.Funcs[0].Body[0].(*AssignStmt).Value = nil }, "nil expression"},
+		{"nil if cond", func(m *Module) { m.Funcs[0].Body[1].(*IfStmt).Cond = nil }, "if condition is a nil expression"},
+		{"empty binary op", func(m *Module) { m.Funcs[0].Body[0].(*AssignStmt).Value.(*BinaryExpr).Op = "" }, "no operator"},
+		{"empty int text", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*BinaryExpr).X.(*IntLit).Text = ""
+		}, "no text"},
+		{"empty intrinsic name", func(m *Module) {
+			m.Funcs[0].Body[1].(*IfStmt).Then[0].(*ExprStmt).X.(*Intrinsic).Name = ""
+		}, "intrinsic with no name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m *Module
+			if tt.mutate != nil {
+				m = hello()
+				tt.mutate(m)
+			}
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestVerifyDeterministic checks the reported error does not depend on run
+// order: the same malformed tree gives the same message every time.
+func TestVerifyDeterministic(t *testing.T) {
+	t.Parallel()
+	m := hello()
+	m.Funcs[0].Body[1].(*IfStmt).Cond = nil
+	first := Verify(m).Error()
+	for range 20 {
+		if got := Verify(m).Error(); got != first {
+			t.Fatalf("Verify message drifted: %q vs %q", got, first)
+		}
+	}
+}
