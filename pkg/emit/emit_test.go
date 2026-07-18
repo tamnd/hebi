@@ -205,6 +205,75 @@ def idp(p):
 	}
 }
 
+// TestModuleArray pins the emitter's array surface directly: a partial literal
+// is a padded list, a value copy goes through the array clone helper, an index
+// write is a subscript assignment, an immutable-element zero is a multiplied
+// list while a mutable-element zero is a per-slot comprehension, and an
+// array-typed struct field defaults to its fresh zero, clones on copy, and
+// projects to a hashable tuple in the hash.
+func TestModuleArray(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Structs: []*ir.StructDef{
+			{Name: "Grid", Comparable: true, Fields: []ir.StructField{
+				{Name: "Cells", Kind: ir.FieldArray, Zero: &ir.ArrayZero{Len: 3, Elem: &ir.IntLit{Text: "0"}}},
+			}},
+		},
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "a", Define: true, Value: &ir.ArrayLit{Elems: []ir.Expr{
+					&ir.IntLit{Text: "1"}, &ir.IntLit{Text: "2"}, &ir.IntLit{Text: "0"},
+				}}},
+				&ir.AssignStmt{Name: "b", Define: true, Value: &ir.ArrayClone{X: &ir.Ident{Name: "a"}}},
+				&ir.SetIndex{Object: &ir.Ident{Name: "b"}, Index: &ir.IntLit{Text: "0"}, Value: &ir.IntLit{Text: "9"}},
+				&ir.AssignStmt{Name: "pts", Define: true, Value: &ir.ArrayZero{Len: 2, Elem: &ir.CallExpr{Name: "Grid"}, ElemMutable: true}},
+				&ir.ExprStmt{X: &ir.Ident{Name: "pts"}},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+class Grid:
+    __slots__ = ("Cells",)
+
+    def __init__(self, Cells=None):
+        self.Cells = Cells if Cells is not None else [0] * 3
+
+    def copy(self):
+        return Grid(_hebirt._clone_array(self.Cells))
+
+    def __eq__(self, other):
+        if other.__class__ is not Grid:
+            return NotImplemented
+        return self.Cells == other.Cells
+
+    def __hash__(self):
+        return hash((_hebirt._arraykey(self.Cells),))
+
+
+def main():
+    a = [1, 2, 0]
+    b = _hebirt._clone_array(a)
+    b[0] = 9
+    pts = [Grid() for _ in range(2)]
+    pts
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestModuleMaskAndUnary(t *testing.T) {
 	t.Parallel()
 	// func main() { fmt.Println(_u8(-(a))) } exercises both new nodes and the

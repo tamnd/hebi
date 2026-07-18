@@ -107,7 +107,14 @@ func Module(m *ir.Module) (string, error) {
 func usesShim(m *ir.Module) bool {
 	for _, sd := range m.Structs {
 		for _, f := range sd.Fields {
-			if f.Kind == ir.FieldScalar && exprUsesShim(f.Zero) {
+			switch f.Kind {
+			case ir.FieldScalar:
+				if exprUsesShim(f.Zero) {
+					return true
+				}
+			case ir.FieldArray:
+				// An array field always emits the clone and array-key helpers in the
+				// generated copy and hash methods, so it needs the runtime import.
 				return true
 			}
 		}
@@ -137,6 +144,10 @@ func blockUsesShim(body []ir.Stmt) bool {
 			}
 		case *ir.SetField:
 			if exprUsesShim(s.Object) || exprUsesShim(s.Value) {
+				return true
+			}
+		case *ir.SetIndex:
+			if exprUsesShim(s.Object) || exprUsesShim(s.Index) || exprUsesShim(s.Value) {
 				return true
 			}
 		case *ir.IfStmt:
@@ -177,6 +188,13 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.X)
 	case *ir.Clone:
 		return exprUsesShim(e.X)
+	case *ir.ArrayClone:
+		// The array clone helper always comes from the runtime shim.
+		return true
+	case *ir.ArrayZero:
+		return exprUsesShim(e.Elem)
+	case *ir.ArrayLit:
+		return argsUseShim(e.Elems)
 	case *ir.StructLit:
 		for _, f := range e.Fields {
 			if exprUsesShim(f.Value) {
@@ -238,9 +256,16 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) {
 	for _, f := range sd.Fields {
 		param := sd.CtorParamName(f.Name)
 		writeIndent(b, 2)
-		if f.Kind == ir.FieldStruct {
+		switch f.Kind {
+		case ir.FieldStruct:
 			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s()\n", f.Name, param, param, f.Struct)
-		} else {
+		case ir.FieldArray:
+			// An array field is a value, so like a struct field it defaults to None
+			// and builds a fresh zero array in the body, since a mutable default
+			// argument would be shared across every instance of the class.
+			zero, _ := emitExpr(f.Zero)
+			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s\n", f.Name, param, param, zero)
+		default:
 			fmt.Fprintf(b, "self.%s = %s\n", f.Name, param)
 		}
 	}
@@ -254,9 +279,12 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		if f.Kind == ir.FieldStruct {
+		switch f.Kind {
+		case ir.FieldStruct:
 			fmt.Fprintf(b, "self.%s.copy()", f.Name)
-		} else {
+		case ir.FieldArray:
+			fmt.Fprintf(b, "%s._clone_array(self.%s)", shim.Name, f.Name)
+		default:
 			fmt.Fprintf(b, "self.%s", f.Name)
 		}
 	}
@@ -299,7 +327,14 @@ func emitStructEq(b *strings.Builder, sd *ir.StructDef) {
 	writeIndent(b, 2)
 	parts := make([]string, len(sd.Fields))
 	for i, f := range sd.Fields {
-		parts[i] = fmt.Sprintf("self.%s", f.Name)
+		if f.Kind == ir.FieldArray {
+			// A Python list is not hashable, so an array field is projected to a
+			// hashable tuple form for the hash, which a Go array field allows since
+			// a comparable array is a valid map key.
+			parts[i] = fmt.Sprintf("%s._arraykey(self.%s)", shim.Name, f.Name)
+		} else {
+			parts[i] = fmt.Sprintf("self.%s", f.Name)
+		}
 	}
 	inner := strings.Join(parts, ", ")
 	if len(sd.Fields) == 1 {
@@ -366,6 +401,21 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		}
 		writeIndent(b, depth)
 		fmt.Fprintf(b, "%s.%s = %s\n", obj, s.Name, value)
+	case *ir.SetIndex:
+		obj, err := emitExpr(s.Object)
+		if err != nil {
+			return err
+		}
+		index, err := emitExpr(s.Index)
+		if err != nil {
+			return err
+		}
+		value, err := emitExpr(s.Value)
+		if err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "%s[%s] = %s\n", obj, index, value)
 	case *ir.IfStmt:
 		cond, err := emitExpr(s.Cond)
 		if err != nil {
@@ -622,6 +672,35 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.copy()", x), nil
+	case *ir.ArrayZero:
+		elem, err := emitExpr(e.Elem)
+		if err != nil {
+			return "", err
+		}
+		if e.Len == 0 {
+			return "[]", nil
+		}
+		if e.ElemMutable {
+			// A struct or nested-array element must be built fresh at each position,
+			// so a comprehension re-evaluates the zero for every slot; a repeated
+			// list would alias one mutable element across the whole array.
+			return fmt.Sprintf("[%s for _ in range(%d)]", elem, e.Len), nil
+		}
+		// A scalar element is immutable, so repeating one value is both correct and
+		// the most readable form.
+		return fmt.Sprintf("[%s] * %d", elem, e.Len), nil
+	case *ir.ArrayLit:
+		elems, err := emitArgs(e.Elems)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("[%s]", elems), nil
+	case *ir.ArrayClone:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s._clone_array(%s)", shim.Name, x), nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}

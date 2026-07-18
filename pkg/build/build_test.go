@@ -580,6 +580,8 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
 		{"pointer field", "package main\n\ntype Node struct {\n\tV int\n\tNext *Node\n}\n\nfunc main() {\n\tvar n Node\n\t_ = n\n}\n"},
 		{"slice field", "package main\n\ntype Bag struct{ Items []int }\n\nfunc main() {\n\tvar b Bag\n\t_ = b\n}\n"},
+		{"keyed array element", "package main\n\nfunc main() {\n\ta := [3]int{0: 1, 2: 3}\n\t_ = a\n}\n"},
+		{"index assignment to slice", "package main\n\nfunc main() {\n\ts := make([]int, 3)\n\ts[0] = 1\n\t_ = s\n}\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -911,6 +913,148 @@ def idp(p):
 def main():
     a = Point(1, 2)
     _ = idp(a.copy())
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestArrayValueSemantics checks that a fixed-length array is a value against go
+// run: assignment copies so a later index write to one array leaves the other
+// alone, a partial literal pads the missing tail with zeros, a call and a return
+// each copy the array, a two-dimensional array copies at every level, an
+// array-typed struct field copies deeply with the enclosing struct, an
+// array-of-struct literal copies its struct elements, and array equality is
+// element-wise like Go's.
+func TestArrayValueSemantics(t *testing.T) {
+	t.Parallel()
+	const point = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\n"
+	const grid = "package main\n\nimport \"fmt\"\n\ntype Grid struct {\n\tCells [3]int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"copy on assignment is independent", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\tb := a\n\tb[0] = 9\n\tfmt.Println(a, b)\n}\n"},
+		{"partial literal pads with zeros", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [5]int{1, 2}\n\tfmt.Println(a)\n}\n"},
+		{"copy on call is independent", "package main\n\nimport \"fmt\"\n\nfunc mut(a [3]int) {\n\ta[0] = 99\n}\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\tmut(a)\n\tfmt.Println(a)\n}\n"},
+		{"copy on return is independent", "package main\n\nimport \"fmt\"\n\nfunc make3() [3]int {\n\tvar a [3]int\n\ta[1] = 5\n\treturn a\n}\n\nfunc main() {\n\ta := make3()\n\tb := make3()\n\ta[0] = 7\n\tfmt.Println(a, b)\n}\n"},
+		{"two dimensional array copies deeply", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [2][3]int{{7}}\n\tb := a\n\tb[0][0] = 8\n\tfmt.Println(a, b)\n}\n"},
+		{"array struct field copies deeply", grid + "func main() {\n\ta := Grid{}\n\ta.Cells[0] = 1\n\tb := a\n\tb.Cells[0] = 9\n\tfmt.Println(a.Cells, b.Cells)\n}\n"},
+		{"array of struct literal copies elements", point + "func main() {\n\tp := Point{1, 2}\n\ta := [2]Point{p}\n\tp.X = 99\n\tfmt.Println(a[0].X, p.X)\n}\n"},
+		{"array equality is element wise", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\tb := [3]int{1, 2, 3}\n\tc := [3]int{1, 2, 4}\n\tfmt.Println(a == b, a == c, a != c)\n}\n"},
+		{"index read copies a struct element", point + "func main() {\n\ta := [2]Point{{1, 2}, {3, 4}}\n\tq := a[0]\n\tq.X = 99\n\tfmt.Println(a[0].X, q.X)\n}\n"},
+		{"len of an array", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [4]int{}\n\tfmt.Println(len(a))\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestArrayEmit pins the Python an array lowers to: a partial literal is a list
+// padded to length, a value copy at an assignment goes through the array clone
+// helper, an index write is a subscript assignment, and len reads the list
+// length with no copy of its argument.
+func TestArrayEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [3]int{1, 2}\n\tb := a\n\tb[0] = 9\n\tfmt.Println(a, b, len(a))\n}\n"
+	want := "import " + shim.Name + `
+
+
+def main():
+    a = [1, 2, 0]
+    b = ` + shim.Name + `._clone_array(a)
+    b[0] = 9
+    ` + shim.Name + `.println(a, b, len(a))
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestArrayFieldEmit pins the array-typed struct field: the constructor defaults
+// it to a fresh zero list through the None sentinel, copy clones it through the
+// array helper so the copy never aliases, and the hash projects it to a hashable
+// tuple since a Python list is not hashable but a comparable array is a valid Go
+// map key.
+func TestArrayFieldEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Grid struct {\n\tCells [3]int\n}\n\nfunc main() {\n\tvar g Grid\n\t_ = g\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Grid:
+    __slots__ = ("Cells",)
+
+    def __init__(self, Cells=None):
+        self.Cells = Cells if Cells is not None else [0] * 3
+
+    def copy(self):
+        return Grid(` + shim.Name + `._clone_array(self.Cells))
+
+    def __eq__(self, other):
+        if other.__class__ is not Grid:
+            return NotImplemented
+        return self.Cells == other.Cells
+
+    def __hash__(self):
+        return hash((` + shim.Name + `._arraykey(self.Cells),))
+
+
+def main():
+    g = Grid()
+    _ = g
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestArrayMutableZeroEmit pins the fresh-per-slot zero for an array whose
+// element is itself a value, a struct or a nested array, where a shared
+// multiplied list would alias every slot: each slot is built by a comprehension
+// so a write to one element leaves the others untouched.
+func TestArrayMutableZeroEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\tvar pts [2]Point\n\tvar grid [2][3]int\n\t_ = pts\n\t_ = grid\n}\n"
+	want := `class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
+
+
+def main():
+    pts = [Point() for _ in range(2)]
+    grid = [[0] * 3 for _ in range(2)]
+    _ = pts
+    _ = grid
 
 
 if __name__ == "__main__":

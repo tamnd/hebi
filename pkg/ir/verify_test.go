@@ -295,6 +295,71 @@ func TestVerifyStructSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyArraySurface accepts a well-formed array definition alongside the
+// nodes that use it, the array zero, the array literal, the array clone, the
+// index write, and an array-typed struct field, and rejects an array zero with a
+// negative length or a nil element, an array literal with a nil element, an
+// array clone with a nil operand, an index write with a nil operand, and an
+// array-typed struct field with a nil zero.
+func TestVerifyArraySurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Structs: []*StructDef{
+				{Name: "Grid", Fields: []StructField{
+					{Name: "Cells", Kind: FieldArray, Zero: &ArrayZero{Len: 3, Elem: &IntLit{Text: "0"}}},
+				}},
+			},
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "a", Define: true, Value: &ArrayLit{Elems: []Expr{&IntLit{Text: "1"}, &IntLit{Text: "0"}}}},
+				&AssignStmt{Name: "b", Define: true, Value: &ArrayClone{X: &Ident{Name: "a"}}},
+				&SetIndex{Object: &Ident{Name: "b"}, Index: &IntLit{Text: "0"}, Value: &IntLit{Text: "9"}},
+				&AssignStmt{Name: "z", Define: true, Value: &ArrayZero{Len: 2, Elem: &IntLit{Text: "0"}}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed array surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"array field nil zero", func(m *Module) { m.Structs[0].Fields[0].Zero = nil }, "nil expression"},
+		{"array zero negative length", func(m *Module) {
+			m.Funcs[0].Body[3].(*AssignStmt).Value.(*ArrayZero).Len = -1
+		}, "negative length"},
+		{"array zero nil element", func(m *Module) {
+			m.Funcs[0].Body[3].(*AssignStmt).Value.(*ArrayZero).Elem = nil
+		}, "nil expression"},
+		{"array lit nil element", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*ArrayLit).Elems[0] = nil
+		}, "nil expression"},
+		{"array clone nil operand", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*ArrayClone).X = nil
+		}, "nil expression"},
+		{"set index nil object", func(m *Module) { m.Funcs[0].Body[2].(*SetIndex).Object = nil }, "nil expression"},
+		{"set index nil index", func(m *Module) { m.Funcs[0].Body[2].(*SetIndex).Index = nil }, "nil expression"},
+		{"set index nil value", func(m *Module) { m.Funcs[0].Body[2].(*SetIndex).Value = nil }, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.
