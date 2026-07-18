@@ -541,3 +541,47 @@ def _map_keys(m):
     if m is NIL_MAP:
         return []
     return list(m.keys())
+
+
+class FieldPtr:
+    """A Go pointer into a struct field, &s.Field, that reads and writes through.
+
+    A plain snapshot would break aliasing, since a write through the pointer must
+    be visible in the struct, so the pointer holds the struct object and the field
+    name and reads or writes the live attribute. Copying the pointer shares the
+    same struct, exactly as copying a Go pointer shares the pointee.
+    """
+
+    __slots__ = ("obj", "name")
+
+    def __init__(self, obj, name):
+        self.obj = obj
+        self.name = name
+
+    def get(self):
+        return getattr(self.obj, self.name)
+
+    def set(self, v):
+        setattr(self.obj, self.name, v)
+
+
+class IndexPtr:
+    """A Go pointer into an array or slice element, &a[i], that reads and writes.
+
+    Like FieldPtr it holds the container and the index and goes through to the live
+    element, so a write through the pointer is seen in the array or slice, and a
+    read sees a later write to the element. The container is the same Python list
+    or slice header the element lives in, so no copy is taken.
+    """
+
+    __slots__ = ("seq", "idx")
+
+    def __init__(self, seq, idx):
+        self.seq = seq
+        self.idx = idx
+
+    def get(self):
+        return self.seq[self.idx]
+
+    def set(self, v):
+        self.seq[self.idx] = v

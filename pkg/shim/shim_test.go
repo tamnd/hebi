@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -390,5 +390,47 @@ func TestMapHelpers(t *testing.T) {
 		"assignment to entry in nil map\n"
 	if got := string(out); got != want {
 		t.Errorf("map helper output = %q, want %q", got, want)
+	}
+}
+
+// TestPointerHelpers runs the field and element pointer helpers under CPython and
+// checks that a get reads the live slot and a set writes straight through it, so a
+// FieldPtr reaches the struct attribute and an IndexPtr reaches the sequence
+// element the pointer was taken over.
+func TestPointerHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"class Point:\n" +
+		"    __slots__ = ('X', 'Y')\n" +
+		"    def __init__(self, X=0, Y=0):\n" +
+		"        self.X = X\n" +
+		"        self.Y = Y\n" +
+		"p = Point(1, 2)\n" +
+		"fp = r.FieldPtr(p, 'X')\n" +
+		"print(fp.get())\n" +
+		"fp.set(9)\n" +
+		"print(p.X)\n" +
+		"a = [1, 2, 3]\n" +
+		"ip = r.IndexPtr(a, 1)\n" +
+		"print(ip.get())\n" +
+		"ip.set(20)\n" +
+		"print(a)"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run pointer helpers: %v\n%s", err, out)
+	}
+	want := "1\n9\n2\n[1, 20, 3]\n"
+	if got := string(out); got != want {
+		t.Errorf("pointer helper output = %q, want %q", got, want)
 	}
 }

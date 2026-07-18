@@ -129,6 +129,11 @@ func verifyStmt(where string, s Stmt) error {
 			return err
 		}
 		return verifyExpr(where+": value", s.Value)
+	case *DerefSet:
+		if err := verifyExpr(where+": pointer", s.Ptr); err != nil {
+			return err
+		}
+		return verifyExpr(where+": value", s.Value)
 	case *IfStmt:
 		if err := verifyExpr(where+": if condition", s.Cond); err != nil {
 			return err
@@ -254,6 +259,18 @@ func verifyExpr(where string, e Expr) error {
 			return fmt.Errorf("ir: %s is an intrinsic with no name", where)
 		}
 		return verifyArgs(where, e.Args)
+	case *AddrField:
+		if e.Name == "" {
+			return fmt.Errorf("ir: %s takes the address of a field with no name", where)
+		}
+		return verifyExpr(where+": container", e.Container)
+	case *AddrIndex:
+		if err := verifyExpr(where+": sequence", e.Seq); err != nil {
+			return err
+		}
+		return verifyExpr(where+": index", e.Index)
+	case *Deref:
+		return verifyExpr(where+": pointer", e.X)
 	case *FieldAccess:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s reads a field with no name", where)
