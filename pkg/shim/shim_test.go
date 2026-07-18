@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "NIL_SLICE", "def _decode_rune", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "NIL_SLICE", "def _slice_append", "def _grow", "def _decode_rune", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -195,6 +195,51 @@ func TestSliceHelpers(t *testing.T) {
 		"[[1 2] [3 4]]\n"
 	if got := string(out); got != want {
 		t.Errorf("slice helper output = %q, want %q", got, want)
+	}
+}
+
+// TestSliceAppendHelpers runs the append surface under CPython: appending to a
+// full slice reallocates onto a fresh backing so a later write through the grown
+// slice leaves the original alone, appending into spare capacity shares the backing
+// so the write is visible through both, appending to the nil sentinel produces a
+// fresh non-nil slice, and the growth curve doubles while small and eases toward a
+// quarter once large.
+func TestSliceAppendHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"a = r._slice_lit([1, 2])\n" +
+		"b = r._slice_append(a, 3)\n" +
+		"b[0] = 99\n" +
+		"print(r.go_str(a), r.go_str(b), len(b))\n" +
+		"s = r.Slice([0, 0, 0, 0], 0, 2, 4)\n" +
+		"s[0] = 1\n" +
+		"s[1] = 2\n" +
+		"t = r._slice_append(s, 5)\n" +
+		"t[0] = 7\n" +
+		"print(s[0], t[0], len(s), len(t))\n" +
+		"n = r._slice_append(r.NIL_SLICE, 8)\n" +
+		"print(r.go_str(n), len(n))\n" +
+		"print(r._grow(0, 1), r._grow(4, 5), r._grow(2, 3), r._grow(256, 257))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run append helpers: %v\n%s", err, out)
+	}
+	want := "[1 2] [99 2 3] 3\n" +
+		"7 7 2 3\n" +
+		"[8] 1\n" +
+		"1 8 4 512\n"
+	if got := string(out); got != want {
+		t.Errorf("append helper output = %q, want %q", got, want)
 	}
 }
 

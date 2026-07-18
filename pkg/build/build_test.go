@@ -584,6 +584,7 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"three-index slice", "package main\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tt := s[0:1:2]\n\t_ = t\n}\n"},
 		{"array reslice", "package main\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\ts := a[0:2]\n\t_ = s\n}\n"},
 		{"make of a map", "package main\n\nfunc main() {\n\tm := make(map[int]int)\n\t_ = m\n}\n"},
+		{"append spread", "package main\n\nfunc main() {\n\ta := []int{1, 2}\n\tb := []int{3, 4}\n\ta = append(a, b...)\n\t_ = a\n}\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1201,6 +1202,83 @@ def main():
     pts = ` + shim.Name + `.Slice([Point() for _ in range(2)], 0, 2, 2)
     pts[0].X = 7
     ` + shim.Name + `.println(ps, pts[0].X, len(pts), ps.cap)
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestSliceAppendSemantics runs whole programs three-way against the Go toolchain
+// to pin append's behavior: it grows a nil slice into a fresh backing, appends
+// several values at once, shares the backing when there is spare capacity so a
+// write through the grown slice is visible through the original, reallocates onto
+// a fresh backing when the capacity is full so the two slices stop aliasing, copies
+// a struct value into the backing rather than sharing it, accumulates across a loop,
+// and grows a row of a slice of slices without disturbing the outer slice. None of
+// these read cap after a growth, since the exact post-growth capacity is not pinned.
+func TestSliceAppendSemantics(t *testing.T) {
+	t.Parallel()
+	const point = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"append grows a nil slice", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar s []int\n\ts = append(s, 1)\n\ts = append(s, 2)\n\tfmt.Println(s, len(s))\n}\n"},
+		{"append several values at once", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar s []int\n\ts = append(s, 1, 2, 3)\n\tfmt.Println(s, len(s))\n}\n"},
+		{"append within cap shares the backing", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 2, 4)\n\ts[0] = 1\n\ts[1] = 2\n\tb := append(s, 3)\n\tb[0] = 99\n\tfmt.Println(s[0], b[0], len(s), len(b))\n}\n"},
+		{"append at cap reallocates and un-aliases", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 2, 2)\n\ts[0] = 1\n\ts[1] = 2\n\tb := append(s, 3)\n\tb[0] = 99\n\tfmt.Println(s[0], b[0], len(s), len(b))\n}\n"},
+		{"append copies a struct value in", point + "func main() {\n\tvar pts []Point\n\tp := Point{X: 1, Y: 2}\n\tpts = append(pts, p)\n\tp.X = 99\n\tfmt.Println(pts[0].X, pts[0].Y, p.X)\n}\n"},
+		{"append accumulates across a loop", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar s []int\n\tfor i := 0; i < 5; i++ {\n\t\ts = append(s, i*i)\n\t}\n\tfmt.Println(s, len(s))\n}\n"},
+		{"append grows a row independently", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar grid [][]int\n\trow := []int{1, 2}\n\tgrid = append(grid, row)\n\tr := append(grid[0], 3)\n\tfmt.Println(len(grid), len(r), r[2])\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestSliceAppendEmit pins the Python an append lowers to: the _slice_append
+// intrinsic over the slice and the appended values, with a struct value cloned in
+// through its copy method the way Go copies a value into the backing, and the
+// result assigned back over the slice.
+func TestSliceAppendEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Point struct {\n\tX int\n}\n\nfunc main() {\n\tvar s []int\n\ts = append(s, 1, 2)\n\tvar pts []Point\n\tp := Point{X: 5}\n\tpts = append(pts, p)\n\t_ = s\n\t_ = pts\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Point:
+    __slots__ = ("X",)
+
+    def __init__(self, X=0):
+        self.X = X
+
+    def copy(self):
+        return Point(self.X)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X
+
+    def __hash__(self):
+        return hash((self.X,))
+
+
+def main():
+    s = ` + shim.Name + `.NIL_SLICE
+    s = ` + shim.Name + `._slice_append(s, 1, 2)
+    pts = ` + shim.Name + `.NIL_SLICE
+    p = Point(X=5)
+    pts = ` + shim.Name + `._slice_append(pts, p.copy())
+    _ = s
+    _ = pts
 
 
 if __name__ == "__main__":

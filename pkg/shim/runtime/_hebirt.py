@@ -209,7 +209,10 @@ def _arraykey(a):
 # returns a new header sharing the backing rather than a copied list. Indexing
 # reads through the offset and is bounds-checked against the length, while
 # sub-slicing is bounds-checked against the capacity, matching Go's reslice into
-# reserved capacity. append growth and copy arrive with their own helpers.
+# reserved capacity. append writes into the shared backing while there is spare
+# capacity and reallocates onto a fresh backing once it is full, which is where an
+# appended-to slice stops aliasing the slices it grew from. copy arrives with its
+# own helper.
 
 
 class Slice:
@@ -276,6 +279,55 @@ def _subslice(s, sl):
 # slice variable or a slice-typed struct field takes, shared safely because it is
 # never mutated in place.
 NIL_SLICE = Slice([], 0, 0, 0)
+
+
+def _slice_append(s, *vals):
+    """Return s with vals appended, Go's way, sharing or reallocating the backing.
+
+    While the new length still fits the capacity the values go into the existing
+    backing and the returned header shares it with every other slice over it, so a
+    later write through any of them is visible through the rest, matching Go's
+    in-place append. Once the length would exceed the capacity a fresh, larger
+    backing is allocated and the elements copied into it, so the returned header no
+    longer aliases the slices it grew from, which is the reallocation programs feel
+    when an append silently un-shares a backing. The nil slice has capacity zero,
+    so an append to it always reallocates and returns a fresh non-nil slice.
+    """
+    n = s.length + len(vals)
+    if n <= s.cap:
+        arr = s.array
+        base = s.offset + s.length
+        for k, v in enumerate(vals):
+            arr[base + k] = v
+        return Slice(arr, s.offset, n, s.cap)
+    newcap = _grow(s.cap, n)
+    newarr = [None] * newcap
+    for k in range(s.length):
+        newarr[k] = s.array[s.offset + k]
+    for k, v in enumerate(vals):
+        newarr[s.length + k] = v
+    return Slice(newarr, 0, n, newcap)
+
+
+def _grow(oldcap, needed):
+    """Return the capacity Go grows a slice to when an append overflows it.
+
+    Go doubles the capacity while the slice is small and eases toward growing it
+    by a quarter once it is large, so a run of appends amortizes to constant time.
+    A single append that needs far more than double jumps straight to the needed
+    length. This reproduces the growth curve of the pinned Go toolchain; the final
+    rounding to a memory size class, which only shifts cap(s) by a few elements, is
+    left to the fidelity a fixture pins, per the compatibility ledger.
+    """
+    if needed > 2 * oldcap:
+        return needed
+    if oldcap < 256:
+        doubled = 2 * oldcap
+        return doubled if doubled >= needed else needed
+    newcap = oldcap
+    while newcap < needed:
+        newcap += (newcap + 3 * 256) >> 2
+    return newcap
 
 
 def _runtime_error(msg):
