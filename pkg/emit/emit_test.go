@@ -274,6 +274,80 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleSlice pins the emitter's slice surface directly: a literal builds a
+// header over a fresh backing through the slice-literal helper, a make with a
+// separate capacity reserves an immutable-element backing with a multiplied list
+// and a mutable-element backing with a per-slot comprehension, a two-index slice
+// expression is a Python slice of the header, an index write is a subscript
+// assignment, a capacity read is a field access on the header, and the nil slice
+// is the shim sentinel.
+func TestModuleSlice(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Structs: []*ir.StructDef{
+			{Name: "Point", Comparable: true, Fields: []ir.StructField{
+				{Name: "X", Kind: ir.FieldScalar, Zero: &ir.IntLit{Text: "0"}},
+			}},
+		},
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{
+				&ir.AssignStmt{Name: "s", Define: true, Value: &ir.SliceLit{Elems: []ir.Expr{
+					&ir.IntLit{Text: "1"}, &ir.IntLit{Text: "2"},
+				}}},
+				&ir.AssignStmt{Name: "m", Define: true, Value: &ir.SliceMake{Len: &ir.IntLit{Text: "2"}, Cap: &ir.IntLit{Text: "5"}, Elem: &ir.IntLit{Text: "0"}}},
+				&ir.AssignStmt{Name: "ps", Define: true, Value: &ir.SliceMake{Len: &ir.IntLit{Text: "1"}, Cap: &ir.IntLit{Text: "2"}, Elem: &ir.CallExpr{Name: "Point"}, ElemMutable: true}},
+				&ir.AssignStmt{Name: "b", Define: true, Value: &ir.SliceExpr{X: &ir.Ident{Name: "s"}, High: &ir.IntLit{Text: "1"}}},
+				&ir.SetIndex{Object: &ir.Ident{Name: "b"}, Index: &ir.IntLit{Text: "0"}, Value: &ir.IntLit{Text: "9"}},
+				&ir.AssignStmt{Name: "c", Define: true, Value: &ir.FieldAccess{X: &ir.Ident{Name: "m"}, Name: "cap"}},
+				&ir.AssignStmt{Name: "z", Define: true, Value: &ir.NilSlice{}},
+			},
+		}},
+	}
+	want := `import _hebirt
+
+
+class Point:
+    __slots__ = ("X",)
+
+    def __init__(self, X=0):
+        self.X = X
+
+    def copy(self):
+        return Point(self.X)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X
+
+    def __hash__(self):
+        return hash((self.X,))
+
+
+def main():
+    s = _hebirt._slice_lit([1, 2])
+    m = _hebirt.Slice([0] * 5, 0, 2, 5)
+    ps = _hebirt.Slice([Point() for _ in range(2)], 0, 1, 2)
+    b = s[:1]
+    b[0] = 9
+    c = m.cap
+    z = _hebirt.NIL_SLICE
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 func TestModuleMaskAndUnary(t *testing.T) {
 	t.Parallel()
 	// func main() { fmt.Println(_u8(-(a))) } exercises both new nodes and the

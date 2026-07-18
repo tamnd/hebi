@@ -357,6 +357,43 @@ type ArrayLit struct{ Elems []Expr }
 // become independent.
 type ArrayClone struct{ X Expr }
 
+// SliceLit builds a Go slice literal as a slice header over a fresh backing
+// list of its elements in order, through the slice-literal helper. Unlike an
+// array literal it is never padded, since a slice literal's length is exactly
+// its element count, and a value element that reads an existing value is cloned
+// by the lowering so the backing owns an independent copy.
+type SliceLit struct{ Elems []Expr }
+
+// SliceMake builds make([]T, len, cap) as a slice header over a freshly zeroed
+// backing. Len and Cap are the length and capacity expressions, equal when the
+// source gave no capacity. Elem is the zero value of one element and ElemMutable
+// picks the emitted backing form: an immutable scalar element repeats one value,
+// while a struct or array element is built fresh at each slot so the elements do
+// not alias.
+type SliceMake struct {
+	Len         Expr
+	Cap         Expr
+	Elem        Expr
+	ElemMutable bool
+}
+
+// SliceExpr is the two-index slice expression s[Low:High], which builds a new
+// slice header sharing the operand's backing rather than copying it, so the
+// result aliases the operand the way a Go reslice does. Low or High is nil when
+// the source omitted that bound, and the emitter leaves the corresponding side
+// of the Python slice empty. The three-index form arrives with its own slice.
+type SliceExpr struct {
+	X    Expr
+	Low  Expr
+	High Expr
+}
+
+// NilSlice is the nil slice sentinel, the zero value a slice variable or a
+// slice-typed struct field takes. It is the runtime's shared empty header, whose
+// length and capacity are zero, so it never aliases live data and is safe to
+// share, and an append to it allocates a fresh backing.
+type NilSlice struct{}
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -383,3 +420,7 @@ func (*Clone) isExpr()       {}
 func (*ArrayZero) isExpr()   {}
 func (*ArrayLit) isExpr()    {}
 func (*ArrayClone) isExpr()  {}
+func (*SliceLit) isExpr()    {}
+func (*SliceMake) isExpr()   {}
+func (*SliceExpr) isExpr()   {}
+func (*NilSlice) isExpr()    {}

@@ -579,9 +579,11 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"statement label", "package main\n\nfunc main() {\nDone:\n\tprintln(\"hi\")\n\t_ = 0\n\tgoto Done\n}\n"},
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
 		{"pointer field", "package main\n\ntype Node struct {\n\tV int\n\tNext *Node\n}\n\nfunc main() {\n\tvar n Node\n\t_ = n\n}\n"},
-		{"slice field", "package main\n\ntype Bag struct{ Items []int }\n\nfunc main() {\n\tvar b Bag\n\t_ = b\n}\n"},
 		{"keyed array element", "package main\n\nfunc main() {\n\ta := [3]int{0: 1, 2: 3}\n\t_ = a\n}\n"},
-		{"index assignment to slice", "package main\n\nfunc main() {\n\ts := make([]int, 3)\n\ts[0] = 1\n\t_ = s\n}\n"},
+		{"keyed slice element", "package main\n\nfunc main() {\n\ts := []int{0: 1, 2: 3}\n\t_ = s\n}\n"},
+		{"three-index slice", "package main\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tt := s[0:1:2]\n\t_ = t\n}\n"},
+		{"array reslice", "package main\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\ts := a[0:2]\n\t_ = s\n}\n"},
+		{"make of a map", "package main\n\nfunc main() {\n\tm := make(map[int]int)\n\t_ = m\n}\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1055,6 +1057,150 @@ def main():
     grid = [[0] * 3 for _ in range(2)]
     _ = pts
     _ = grid
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestSliceValueSemantics checks the slice surface against go run: a slice is a
+// header over a shared backing, so a sub-slice aliases the original and a write
+// through one is visible through the other, len and cap read the header, and cap
+// can exceed len after a make with spare capacity or a reslice into it. It covers
+// the literal, the sub-slice alias, the omitted bounds, a nested slice of slices
+// that aliases at each level, the nil-slice zero value distinct from an empty
+// literal, a slice-typed struct field that shallow-shares its header on a struct
+// copy, make with a length and with a length and cap, and a reslice that reaches
+// into the reserved capacity.
+func TestSliceValueSemantics(t *testing.T) {
+	t.Parallel()
+	const bag = "package main\n\nimport \"fmt\"\n\ntype Bag struct {\n\tItems []int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"literal index and len", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{10, 20, 30}\n\ts[1] = 99\n\tfmt.Println(s, len(s), cap(s))\n}\n"},
+		{"sub-slice aliases the backing", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3, 4}\n\tb := s[1:3]\n\tb[0] = 99\n\tfmt.Println(s, b, len(b), cap(b))\n}\n"},
+		{"omitted bounds slice the whole", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tfmt.Println(s[:2], s[1:], s[:])\n}\n"},
+		{"nested slice of slices aliases", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tm := [][]int{{1, 2}, {3, 4}}\n\tm[0][0] = 9\n\tfmt.Println(m, m[0][0], m[1][0])\n}\n"},
+		{"nil slice zero value", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar s []int\n\tfmt.Println(len(s), cap(s))\n}\n"},
+		{"empty literal is not nil", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{}\n\tfmt.Println(len(s), cap(s))\n}\n"},
+		{"slice field shares on copy", bag + "func main() {\n\tb := Bag{Items: []int{1, 2, 3}}\n\tc := b\n\tc.Items[0] = 7\n\tfmt.Println(b.Items[0], c.Items[0])\n}\n"},
+		{"slice field nil zero value", bag + "func main() {\n\tvar b Bag\n\tfmt.Println(len(b.Items))\n}\n"},
+		{"make with a length", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 3)\n\ts[0] = 5\n\tfmt.Println(s, len(s), cap(s))\n}\n"},
+		{"make with a length and cap", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 2, 5)\n\tfmt.Println(len(s), cap(s))\n}\n"},
+		{"reslice into reserved cap", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 2, 5)\n\tr := s[0:4]\n\tfmt.Println(len(s), cap(s), len(r), cap(r))\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestSliceEmit pins the Python a slice lowers to: a literal is a header over a
+// fresh backing through the slice-literal helper, a sub-slice is Python slice
+// syntax that the header turns into a new sharing header, an index write is a
+// subscript assignment through the header, make builds a header over a zeroed
+// backing, len reads the header length, and cap reads the header's cap field
+// since the length does not carry the reserved capacity.
+func TestSliceEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tt := s[1:3]\n\tt[0] = 9\n\ts = make([]int, 2, 5)\n\tfmt.Println(s, t, len(s), cap(s))\n}\n"
+	want := "import " + shim.Name + `
+
+
+def main():
+    s = ` + shim.Name + `._slice_lit([1, 2, 3])
+    t = s[1:3]
+    t[0] = 9
+    s = ` + shim.Name + `.Slice([0] * 5, 0, 2, 5)
+    ` + shim.Name + `.println(s, t, len(s), s.cap)
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestSliceFieldEmit pins the slice-typed struct field: it is a scalar-kind field
+// whose zero is the nil slice sentinel, so the constructor defaults it to the
+// shared sentinel and copy shares the same header, which is the reference
+// semantics a slice field wants. The struct holds a slice, so Go makes it not
+// comparable, and the emitter leaves it with Python's identity equality, emitting
+// no __eq__ or __hash__.
+func TestSliceFieldEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Bag struct {\n\tItems []int\n\tN     int\n}\n\nfunc main() {\n\tvar b Bag\n\t_ = b\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Bag:
+    __slots__ = ("Items", "N")
+
+    def __init__(self, Items=` + shim.Name + `.NIL_SLICE, N=0):
+        self.Items = Items
+        self.N = N
+
+    def copy(self):
+        return Bag(self.Items, self.N)
+
+
+def main():
+    b = Bag()
+    _ = b
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestSliceMakeEmit pins make's backing form by element mutability: an int slice
+// repeats one immutable zero across the backing, while a slice of structs builds
+// each slot fresh through a comprehension so the elements do not alias, and the
+// header spans the length with the capacity as its reserved size.
+func TestSliceMakeEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\tps := make([]int, 3, 5)\n\tpts := make([]Point, 2)\n\tpts[0].X = 7\n\tfmt.Println(ps, pts[0].X, len(pts), cap(ps))\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
+
+
+def main():
+    ps = ` + shim.Name + `.Slice([0] * 5, 0, 3, 5)
+    pts = ` + shim.Name + `.Slice([Point() for _ in range(2)], 0, 2, 2)
+    pts[0].X = 7
+    ` + shim.Name + `.println(ps, pts[0].X, len(pts), ps.cap)
 
 
 if __name__ == "__main__":

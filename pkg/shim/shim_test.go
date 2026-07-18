@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "def _decode_rune", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "NIL_SLICE", "def _decode_rune", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -155,6 +155,46 @@ func TestArrayHelpers(t *testing.T) {
 		"(1, (2, 3))\n"
 	if got := string(out); got != want {
 		t.Errorf("array helper output = %q, want %q", got, want)
+	}
+}
+
+// TestSliceHelpers runs the slice surface under CPython: a literal is a header
+// over a fresh backing, a sub-slice shares that backing so a write through the
+// sub-slice is visible in the original, len reads the header length and cap reads
+// the reserved capacity which the sub-slice narrows, go_str prints the visible
+// length in Go's bracket form with a nested slice recursing, and the nil sentinel
+// has length and capacity zero.
+func TestSliceHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"a = r._slice_lit([1, 2, 3, 4])\n" +
+		"b = a[1:3]\n" +
+		"b[0] = 99\n" +
+		"print(r.go_str(a), r.go_str(b), len(b), b.cap)\n" +
+		"print(a[1], len(a), a.cap)\n" +
+		"print(r.go_str(r.NIL_SLICE), len(r.NIL_SLICE), r.NIL_SLICE.cap)\n" +
+		"m = r._slice_lit([r._slice_lit([1, 2]), r._slice_lit([3, 4])])\n" +
+		"print(r.go_str(m))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run slice helpers: %v\n%s", err, out)
+	}
+	want := "[1 99 3 4] [99 3] 2 3\n" +
+		"99 4 4\n" +
+		"[] 0 0\n" +
+		"[[1 2] [3 4]]\n"
+	if got := string(out); got != want {
+		t.Errorf("slice helper output = %q, want %q", got, want)
 	}
 }
 

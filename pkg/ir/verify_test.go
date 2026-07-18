@@ -360,6 +360,74 @@ func TestVerifyArraySurface(t *testing.T) {
 	}
 }
 
+// TestVerifySliceSurface accepts a well-formed slice surface, a slice literal, a
+// make, a two-index slice expression, an index write, a cap read off the header,
+// a slice-typed struct field defaulting to the nil sentinel, and the nil sentinel
+// itself, then rejects each node with a nil operand: a slice-literal element, a
+// make length, capacity, or element zero, and a slice expression's operand.
+func TestVerifySliceSurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Structs: []*StructDef{
+				{Name: "Bag", Fields: []StructField{
+					{Name: "Items", Kind: FieldScalar, Zero: &NilSlice{}},
+				}},
+			},
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "s", Define: true, Value: &SliceLit{Elems: []Expr{&IntLit{Text: "1"}, &IntLit{Text: "2"}}}},
+				&AssignStmt{Name: "m", Define: true, Value: &SliceMake{Len: &IntLit{Text: "2"}, Cap: &IntLit{Text: "5"}, Elem: &IntLit{Text: "0"}}},
+				&AssignStmt{Name: "b", Define: true, Value: &SliceExpr{X: &Ident{Name: "s"}, High: &IntLit{Text: "1"}}},
+				&SetIndex{Object: &Ident{Name: "b"}, Index: &IntLit{Text: "0"}, Value: &IntLit{Text: "9"}},
+				&AssignStmt{Name: "c", Define: true, Value: &FieldAccess{X: &Ident{Name: "m"}, Name: "cap"}},
+				&AssignStmt{Name: "z", Define: true, Value: &NilSlice{}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed slice surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"slice lit nil element", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*SliceLit).Elems[0] = nil
+		}, "nil expression"},
+		{"make nil length", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*SliceMake).Len = nil
+		}, "nil expression"},
+		{"make nil capacity", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*SliceMake).Cap = nil
+		}, "nil expression"},
+		{"make nil element zero", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*SliceMake).Elem = nil
+		}, "nil expression"},
+		{"slice expr nil operand", func(m *Module) {
+			m.Funcs[0].Body[2].(*AssignStmt).Value.(*SliceExpr).X = nil
+		}, "nil expression"},
+		{"slice expr malformed high bound", func(m *Module) {
+			m.Funcs[0].Body[2].(*AssignStmt).Value.(*SliceExpr).High = &IntLit{}
+		}, "no text"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.

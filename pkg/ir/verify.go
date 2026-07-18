@@ -271,6 +271,34 @@ func verifyExpr(where string, e Expr) error {
 		}
 	case *ArrayClone:
 		return verifyExpr(where+": cloned", e.X)
+	case *SliceLit:
+		for i, el := range e.Elems {
+			if err := verifyExpr(fmt.Sprintf("%s: element %d", where, i), el); err != nil {
+				return err
+			}
+		}
+	case *SliceMake:
+		if err := verifyExpr(where+": length", e.Len); err != nil {
+			return err
+		}
+		if err := verifyExpr(where+": capacity", e.Cap); err != nil {
+			return err
+		}
+		return verifyExpr(where+": element zero", e.Elem)
+	case *SliceExpr:
+		if err := verifyExpr(where+": sliced", e.X); err != nil {
+			return err
+		}
+		if e.Low != nil {
+			if err := verifyExpr(where+": low bound", e.Low); err != nil {
+				return err
+			}
+		}
+		if e.High != nil {
+			return verifyExpr(where+": high bound", e.High)
+		}
+	case *NilSlice:
+		// The nil slice sentinel carries no operand, so there is nothing to check.
 	default:
 		return fmt.Errorf("ir: %s is an unknown expression type %T", where, e)
 	}

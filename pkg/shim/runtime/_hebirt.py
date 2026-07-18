@@ -37,6 +37,11 @@ def go_str(value):
         # spaces, each element formatted by its own rule, and a nested array
         # recurses, so [2][2]int reads as [[1 2] [3 4]] the way Go prints it.
         return "[" + " ".join(go_str(e) for e in value) + "]"
+    if isinstance(value, Slice):
+        # A Go slice prints the same bracket form as an array, walking the header
+        # so only the visible length is shown and the backing beyond it stays
+        # hidden, matching fmt's view of a slice through its length.
+        return "[" + " ".join(go_str(value.array[value.offset + k]) for k in range(value.length)) + "]"
     return str(value)
 
 
@@ -195,6 +200,92 @@ def _arraykey(a):
     through its own __hash__, so the whole array becomes a tuple of hashables.
     """
     return tuple(_arraykey(e) if isinstance(e, list) else e for e in a)
+
+
+# Slice helpers. A Go slice is not a plain list but a header over a shared
+# backing store: a backing array, an offset into it, a length, and a capacity.
+# Two headers over the same backing alias, so a write through one is visible
+# through the other, which a list copy would silently break, so sub-slicing
+# returns a new header sharing the backing rather than a copied list. Indexing
+# reads through the offset and is bounds-checked against the length, while
+# sub-slicing is bounds-checked against the capacity, matching Go's reslice into
+# reserved capacity. append growth and copy arrive with their own helpers.
+
+
+class Slice:
+    """A Go slice header: a shared backing array, an offset, a length, and a cap.
+
+    Indexing goes through the offset and is checked against the length, so a
+    header with offset 3 reads array[3 + i], len(s) is the length, and cap(s) is
+    the cap. A slice argument to the subscript is a sub-slice, which builds a new
+    header sharing this backing rather than copying the list, which is what makes
+    two slices over one backing alias the way Go's do.
+    """
+
+    __slots__ = ("array", "offset", "length", "cap")
+
+    def __init__(self, array, offset, length, cap):
+        self.array = array
+        self.offset = offset
+        self.length = length
+        self.cap = cap
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return _subslice(self, i)
+        if i < 0 or i >= self.length:
+            raise _runtime_error("index out of range")
+        return self.array[self.offset + i]
+
+    def __setitem__(self, i, v):
+        if i < 0 or i >= self.length:
+            raise _runtime_error("index out of range")
+        self.array[self.offset + i] = v
+
+    def __len__(self):
+        return self.length
+
+
+def _slice_lit(backing):
+    """Build a slice header over a fresh backing list, len and cap its length.
+
+    A slice literal owns its backing, so the header spans the whole list with no
+    spare capacity, exactly as a Go slice literal starts life full.
+    """
+    return Slice(backing, 0, len(backing), len(backing))
+
+
+def _subslice(s, sl):
+    """Return the header s[low:high] shares with s, offset and length adjusted.
+
+    The bounds are checked against the capacity, not the length, because Go lets
+    a reslice reach up to cap(s) into the reserved backing, and the new header's
+    capacity runs from low to the end of the original capacity, so a later append
+    knows how far it may still write before it must reallocate.
+    """
+    low = 0 if sl.start is None else sl.start
+    high = s.length if sl.stop is None else sl.stop
+    if low < 0 or high > s.cap or low > high:
+        raise _runtime_error("slice bounds out of range")
+    return Slice(s.array, s.offset + low, high - low, s.cap - low)
+
+
+# The nil slice is a distinct empty header with capacity zero: len and cap are
+# zero, indexing panics, and append to it allocates a fresh backing, so a slice
+# built up from a nil zero value grows the way Go's does. It is the zero value a
+# slice variable or a slice-typed struct field takes, shared safely because it is
+# never mutated in place.
+NIL_SLICE = Slice([], 0, 0, 0)
+
+
+def _runtime_error(msg):
+    """Build the exception a failed slice bounds check raises.
+
+    The full panic model arrives in a later milestone; for now the helper names
+    the failure the Go way and returns an exception the caller raises, so an
+    out-of-range index or reslice stops loudly rather than reading a wrong slot.
+    """
+    return IndexError(msg)
 
 
 # String helpers. A Go string is Python bytes, so byte indexing, length, and
