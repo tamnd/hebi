@@ -6,10 +6,36 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/tamnd/hebi/pkg/shim"
 )
+
+// goRunTokens bounds how many go run oracles compile at once across the parallel
+// differential tests. go run drives the Go compiler and linker, which are memory
+// heavy, so an unbounded t.Parallel fan-out launches one compile per core at
+// peak and spikes memory, more so under the race detector. A token per allowed
+// compile caps that peak. The ceiling mirrors the conformance harness: a small
+// fraction of the cores, never below two.
+var goRunTokens = make(chan struct{}, maxGoRun())
+
+func maxGoRun() int {
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < 2 {
+		return 2
+	}
+	return n
+}
+
+// acquireGoRun takes a compile token for the duration of the test, releasing it
+// when the test ends, so the oracle stays bounded without threading a release
+// call through each harness helper.
+func acquireGoRun(t *testing.T) {
+	t.Helper()
+	goRunTokens <- struct{}{}
+	t.Cleanup(func() { <-goRunTokens })
+}
 
 // writeModule drops a single-file Go module into a fresh temp dir and returns
 // the path to the source file, so a test can load it through the real frontend.
@@ -42,6 +68,7 @@ func assertMatchesGo(t *testing.T, body string) {
 	src := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\t" + body + "\n}\n"
 	file := writeModule(t, src)
 
+	acquireGoRun(t)
 	goCmd := exec.CommandContext(t.Context(), "go", "run", file)
 	goOut, err := goCmd.Output()
 	if err != nil {

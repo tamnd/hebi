@@ -147,6 +147,7 @@ func assertProgramMatchesGoVersion(t *testing.T, source, goLine string) {
 	}
 	file := writeModuleVersion(t, source, goLine)
 
+	acquireGoRun(t)
 	// Run the whole module so go honors the go directive that fixes the loop
 	// variable semantics. Passing the file path directly would build it as a
 	// standalone file under the toolchain default and ignore the directive.
