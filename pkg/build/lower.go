@@ -411,6 +411,12 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 	if arr, ok := t.Underlying().(*types.Array); ok {
 		return l.arrayZero(arr, pos)
 	}
+	if _, ok := t.Underlying().(*types.Slice); ok {
+		// A slice is a reference, so its zero value is the nil slice sentinel, which
+		// makes a slice-typed struct field a scalar field that shares the sentinel on
+		// copy, exactly the shallow-sharing a nil slice value wants.
+		return &ir.NilSlice{}, nil
+	}
 	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
 		switch info := basic.Info(); {
@@ -466,6 +472,17 @@ func isArrayValue(t types.Type) bool {
 	return ok
 }
 
+// isSliceValue reports whether a type is a Go slice, which is a reference to a
+// shared backing that aliases rather than copies, so it is indexed and sliced
+// through the Slice header and never cloned at a value read.
+func isSliceValue(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Slice)
+	return ok
+}
+
 // compoundOps maps a Go compound-assignment token to the plain binary operator
 // and the token narrow reads to decide masking. Only the operators whose binary
 // form hebi already lowers are here; division, remainder, and the bitwise family
@@ -510,10 +527,13 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		value = l.copyIfValueRead(s.Rhs[0], value)
 		return []ir.Stmt{&ir.SetField{Object: obj, Name: lhs.Sel.Name, Value: value}}, nil
 	case *ast.IndexExpr:
-		// An array element assignment writes through the backing list. A slice or
-		// map index target waits on those types, so only an array is placed here.
-		if !isArrayValue(l.pkg.Info.TypeOf(lhs.X)) {
-			return nil, l.errf(lhs.Pos(), "index assignment to %s is not supported yet", l.pkg.Info.TypeOf(lhs.X))
+		// An array element assignment writes through the backing list, and a slice
+		// element assignment writes through the Slice header's __setitem__, which
+		// reaches the shared backing so an aliasing slice sees the write. A map index
+		// target waits on its own type.
+		xt := l.pkg.Info.TypeOf(lhs.X)
+		if !isArrayValue(xt) && !isSliceValue(xt) {
+			return nil, l.errf(lhs.Pos(), "index assignment to %s is not supported yet", xt)
 		}
 		obj, err := l.lowerExpr(lhs.X)
 		if err != nil {
@@ -1350,6 +1370,8 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		return l.lowerBinary(e)
 	case *ast.IndexExpr:
 		return l.lowerIndex(e)
+	case *ast.SliceExpr:
+		return l.lowerSliceExpr(e)
 	case *ast.SelectorExpr:
 		return l.lowerSelector(e)
 	case *ast.CompositeLit:
@@ -1430,6 +1452,9 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	if arr, ok := t.Underlying().(*types.Array); ok {
 		return l.lowerArrayLit(e, arr)
 	}
+	if _, ok := t.Underlying().(*types.Slice); ok {
+		return l.lowerSliceLit(e)
+	}
 	named, ok := t.(*types.Named)
 	if !ok {
 		return nil, l.errf(e.Pos(), "composite literal of %s is not supported yet", t)
@@ -1501,6 +1526,26 @@ func (l *lowerer) lowerArrayLit(e *ast.CompositeLit, arr *types.Array) (ir.Expr,
 		elems = append(elems, zero)
 	}
 	return &ir.ArrayLit{Elems: elems}, nil
+}
+
+// lowerSliceLit lowers a slice composite literal to a SliceLit, a slice header
+// over a fresh backing list. Unlike an array literal it is never padded, since a
+// slice literal's length is exactly its element count, and a value element that
+// reads an existing value is cloned so the backing owns an independent copy. The
+// index-keyed form waits on the composite-literal slice, so it fails loudly.
+func (l *lowerer) lowerSliceLit(e *ast.CompositeLit) (ir.Expr, error) {
+	elems := make([]ir.Expr, 0, len(e.Elts))
+	for _, elt := range e.Elts {
+		if _, ok := elt.(*ast.KeyValueExpr); ok {
+			return nil, l.errf(elt.Pos(), "keyed slice elements are not supported yet")
+		}
+		value, err := l.lowerExpr(elt)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, l.copyIfValueRead(elt, value))
+	}
+	return &ir.SliceLit{Elems: elems}, nil
 }
 
 // ctorKeyword returns the constructor keyword for a keyed field of a struct,
@@ -1583,6 +1628,9 @@ func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
 		}
 	case *types.Array:
 		// An array index reads the element out of the Python list directly.
+	case *types.Slice:
+		// A slice index reads through the Slice header, which applies the offset and
+		// the bounds check; a value element is cloned by the caller, not here.
 	default:
 		return nil, l.errf(e.Pos(), "indexing %s is not supported yet", xType)
 	}
@@ -1595,6 +1643,38 @@ func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
 		return nil, err
 	}
 	return &ir.IndexExpr{X: x, Index: index}, nil
+}
+
+// lowerSliceExpr lowers the two-index slice expression s[low:high] to a
+// SliceExpr, which builds a new slice header sharing the operand's backing, so
+// the result aliases the operand the way a Go reslice does. Only a slice operand
+// is supported in this slice: a string reslice yields a string and an array
+// reslice yields a slice sharing the array's backing, and both wait on their own
+// slices. The three-index form, which sets the capacity explicitly, and a max
+// bound wait on the append slice, so they fail loudly here.
+func (l *lowerer) lowerSliceExpr(e *ast.SliceExpr) (ir.Expr, error) {
+	if e.Slice3 {
+		return nil, l.errf(e.Pos(), "three-index slice expression is not supported yet")
+	}
+	if !isSliceValue(l.pkg.Info.TypeOf(e.X)) {
+		return nil, l.errf(e.Pos(), "slicing %s is not supported yet", l.pkg.Info.TypeOf(e.X))
+	}
+	x, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	var low, high ir.Expr
+	if e.Low != nil {
+		if low, err = l.lowerExpr(e.Low); err != nil {
+			return nil, err
+		}
+	}
+	if e.High != nil {
+		if high, err = l.lowerExpr(e.High); err != nil {
+			return nil, err
+		}
+	}
+	return &ir.SliceExpr{X: x, Low: low, High: high}, nil
 }
 
 func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
@@ -1717,12 +1797,15 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 	}
 }
 
-// lowerBuiltin lowers a call to a Go builtin. len and cap of an array or a
-// string do not copy their argument, and cap of an array equals its length, so
-// both lower to Python's len over the plainly lowered argument with no value copy
-// injected, which keeps len(a) reading as len(a) rather than cloning the array
-// just to measure it. The other builtins wait on the slices that bring their
-// types, so an unhandled one fails loudly.
+// lowerBuiltin lowers a call to a Go builtin. len of an array, a string, or a
+// slice lowers to Python's len over the plainly lowered argument, which reads the
+// Slice header's length for a slice and the list or bytes length otherwise, with
+// no value copy injected so len(x) reads as len(x). cap of an array equals its
+// length and lowers the same way, but cap of a slice is the header's reserved
+// capacity, which the length does not carry, so it reads the header's cap field
+// directly. make builds a slice header over a freshly zeroed backing. The other
+// builtins wait on the slices that bring their types, so an unhandled one fails
+// loudly.
 func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin) (ir.Expr, error) {
 	switch fun.Name {
 	case "len", "cap":
@@ -1733,10 +1816,47 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		if err != nil {
 			return nil, err
 		}
+		if fun.Name == "cap" && isSliceValue(l.pkg.Info.TypeOf(e.Args[0])) {
+			return &ir.FieldAccess{X: arg, Name: "cap"}, nil
+		}
 		return &ir.CallExpr{Name: "len", Args: []ir.Expr{arg}}, nil
+	case "make":
+		return l.lowerMake(e)
 	default:
 		return nil, l.errf(e.Pos(), "builtin %s is not supported yet", fun.Name)
 	}
+}
+
+// lowerMake lowers make([]T, len) and make([]T, len, cap) to a SliceMake, a
+// slice header over a freshly zeroed backing whose length and capacity are the
+// call's arguments, the capacity defaulting to the length when the source gave
+// none. The element zero decides the backing form so a mutable element is built
+// fresh per slot. make of a map or a channel waits on those types, so it fails
+// loudly here.
+func (l *lowerer) lowerMake(e *ast.CallExpr) (ir.Expr, error) {
+	t := l.pkg.Info.TypeOf(e)
+	slice, ok := t.Underlying().(*types.Slice)
+	if !ok {
+		return nil, l.errf(e.Pos(), "make of %s is not supported yet", t)
+	}
+	if len(e.Args) < 2 {
+		return nil, l.errf(e.Pos(), "make of a slice needs a length")
+	}
+	length, err := l.lowerExpr(e.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	capacity := length
+	if len(e.Args) == 3 {
+		if capacity, err = l.lowerExpr(e.Args[2]); err != nil {
+			return nil, err
+		}
+	}
+	elem, err := l.zeroValueOfType(slice.Elem(), e.Pos())
+	if err != nil {
+		return nil, err
+	}
+	return &ir.SliceMake{Len: length, Cap: capacity, Elem: elem, ElemMutable: isMutableType(slice.Elem())}, nil
 }
 
 // lowerPrintlnArgs lowers the arguments of fmt.Println, wrapping a float32 in

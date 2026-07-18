@@ -195,6 +195,12 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.Elem)
 	case *ir.ArrayLit:
 		return argsUseShim(e.Elems)
+	case *ir.SliceLit, *ir.SliceMake, *ir.NilSlice:
+		// A slice literal, a make, and the nil sentinel all name a runtime helper,
+		// so each needs the shim import regardless of its operands.
+		return true
+	case *ir.SliceExpr:
+		return exprUsesShim(e.X) || exprUsesShim(e.Low) || exprUsesShim(e.High)
 	case *ir.StructLit:
 		for _, f := range e.Fields {
 			if exprUsesShim(f.Value) {
@@ -701,6 +707,55 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s._clone_array(%s)", shim.Name, x), nil
+	case *ir.SliceLit:
+		elems, err := emitArgs(e.Elems)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s._slice_lit([%s])", shim.Name, elems), nil
+	case *ir.SliceMake:
+		length, err := emitExpr(e.Len)
+		if err != nil {
+			return "", err
+		}
+		capacity, err := emitExpr(e.Cap)
+		if err != nil {
+			return "", err
+		}
+		elem, err := emitExpr(e.Elem)
+		if err != nil {
+			return "", err
+		}
+		backing := fmt.Sprintf("[%s] * %s", elem, capacity)
+		if e.ElemMutable {
+			// A struct or nested-array element must be built fresh at each slot, so a
+			// comprehension re-evaluates the zero per position; a repeated list would
+			// alias one mutable element across the whole backing.
+			backing = fmt.Sprintf("[%s for _ in range(%s)]", elem, capacity)
+		}
+		return fmt.Sprintf("%s.Slice(%s, 0, %s, %s)", shim.Name, backing, length, capacity), nil
+	case *ir.SliceExpr:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		low := ""
+		if e.Low != nil {
+			low, err = emitExpr(e.Low)
+			if err != nil {
+				return "", err
+			}
+		}
+		high := ""
+		if e.High != nil {
+			high, err = emitExpr(e.High)
+			if err != nil {
+				return "", err
+			}
+		}
+		return fmt.Sprintf("%s[%s:%s]", x, low, high), nil
+	case *ir.NilSlice:
+		return shim.Name + ".NIL_SLICE", nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}
