@@ -137,6 +137,11 @@ type lowerer struct {
 	// tells a break whether it leaves a loop or a switch and lets a labeled break
 	// find the loop it names.
 	scopes []scope
+	// resultNames holds the named result variables of the function being lowered,
+	// in declaration order, or nil when the function has unnamed results. A bare
+	// return in a function with named results returns these, so the lowerer needs
+	// them in hand while it walks the body.
+	resultNames []string
 }
 
 // scope is one enclosing breakable construct: a loop or a switch, carrying the Go
@@ -223,9 +228,11 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := l.checkResults(fd.Type.Results); err != nil {
+	prelude, err := l.beginResults(fd.Type.Results)
+	if err != nil {
 		return nil, err
 	}
+	defer func() { l.resultNames = nil }()
 	if fd.Body == nil {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
 	}
@@ -233,6 +240,7 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if err != nil {
 		return nil, err
 	}
+	body = append(prelude, body...)
 	body = resolveLabeledJumps(body)
 	return &ir.Func{Name: fd.Name.Name, Params: params, Body: body}, nil
 }
@@ -266,43 +274,86 @@ func (l *lowerer) lowerParams(fields *ast.FieldList) ([]string, error) {
 	return params, nil
 }
 
-// checkResults rejects the return shapes this milestone does not carry. A single
-// unnamed result is fine and flows through ReturnStmt; multiple results and named
-// results are the readable-tuple and defer-visible-binding work of M3, so they
-// fail loudly here rather than lowering to something wrong.
-func (l *lowerer) checkResults(fields *ast.FieldList) error {
+// beginResults records the function's named result variables on the lowerer and
+// returns the prelude that binds each to its zero value at the top of the body,
+// so a named result reads as its zero before the body writes it and a bare return
+// returns the current values. A function with unnamed results clears resultNames
+// and returns no prelude, so its returns flow through the explicit values. A
+// result named with the blank identifier is rejected, since it names a slot the
+// body cannot write yet a bare return would still have to return.
+func (l *lowerer) beginResults(fields *ast.FieldList) ([]ir.Stmt, error) {
+	l.resultNames = nil
 	if fields == nil {
-		return nil
+		return nil, nil
 	}
-	if len(fields.List) > 1 {
-		return l.errf(fields.Pos(), "multiple return values are not supported yet")
-	}
+	named := false
 	for _, field := range fields.List {
 		if len(field.Names) > 0 {
-			return l.errf(field.Pos(), "named return values are not supported yet")
+			named = true
+			break
 		}
 	}
-	return nil
+	if !named {
+		return nil, nil
+	}
+	var prelude []ir.Stmt
+	for _, field := range fields.List {
+		if len(field.Names) == 0 {
+			return nil, l.errf(field.Pos(), "a function mixing named and unnamed results is not supported yet")
+		}
+		zero, err := l.zeroValueOfType(l.pkg.Info.TypeOf(field.Type), field.Pos())
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				return nil, l.errf(name.Pos(), "a blank named result is not supported yet")
+			}
+			l.resultNames = append(l.resultNames, name.Name)
+			prelude = append(prelude, &ir.AssignStmt{Name: name.Name, Value: zero, Define: true})
+		}
+	}
+	return prelude, nil
 }
 
-// lowerReturn lowers a return statement. A bare return carries no value. A single
-// returned value that reads a struct value out of a copyable location is cloned,
+// lowerReturn lowers a return statement. A bare return in a function with unnamed
+// results carries no value; in a function with named results it returns the
+// current named values, one or several. A single returned value flows through
+// ReturnStmt, and several returned values become a tuple the caller unpacks. Every
+// returned value that reads a struct or array out of a copyable location is cloned,
 // since the caller receives an independent value, which is the copy-on-return site
-// of the value-semantics rule. Multiple returns wait on M3 and are rejected at the
-// function signature before a body reaches here.
+// of the value-semantics rule.
 func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
 	if len(s.Results) == 0 {
-		return []ir.Stmt{&ir.ReturnStmt{}}, nil
+		if len(l.resultNames) == 0 {
+			return []ir.Stmt{&ir.ReturnStmt{}}, nil
+		}
+		if len(l.resultNames) == 1 {
+			return []ir.Stmt{&ir.ReturnStmt{Value: &ir.Ident{Name: l.resultNames[0]}}}, nil
+		}
+		elems := make([]ir.Expr, len(l.resultNames))
+		for i, name := range l.resultNames {
+			elems[i] = &ir.Ident{Name: name}
+		}
+		return []ir.Stmt{&ir.ReturnStmt{Value: &ir.Tuple{Elems: elems}}}, nil
 	}
-	if len(s.Results) > 1 {
-		return nil, l.errf(s.Pos(), "multiple return values are not supported yet")
+	if len(s.Results) == 1 {
+		value, err := l.lowerExpr(s.Results[0])
+		if err != nil {
+			return nil, err
+		}
+		value = l.copyIfValueRead(s.Results[0], value)
+		return []ir.Stmt{&ir.ReturnStmt{Value: value}}, nil
 	}
-	value, err := l.lowerExpr(s.Results[0])
-	if err != nil {
-		return nil, err
+	elems := make([]ir.Expr, len(s.Results))
+	for i, r := range s.Results {
+		value, err := l.lowerExpr(r)
+		if err != nil {
+			return nil, err
+		}
+		elems[i] = l.copyIfValueRead(r, value)
 	}
-	value = l.copyIfValueRead(s.Results[0], value)
-	return []ir.Stmt{&ir.ReturnStmt{Value: value}}, nil
+	return []ir.Stmt{&ir.ReturnStmt{Value: &ir.Tuple{Elems: elems}}}, nil
 }
 
 func (l *lowerer) lowerBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
@@ -560,12 +611,10 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN {
 		return l.lowerCompoundAssign(s)
 	}
-	if len(s.Lhs) == 2 && len(s.Rhs) == 1 {
-		// A two-target assignment from one value is the comma-ok read v, ok := m[k];
-		// other two-value forms wait on their own slices and fail loudly there.
-		return l.lowerMapCommaOk(s)
+	if len(s.Lhs) > 1 {
+		return l.lowerMultiAssign(s)
 	}
-	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
+	if len(s.Rhs) != 1 {
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
 	}
 	value, err := l.lowerExpr(s.Rhs[0])
@@ -632,6 +681,78 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	default:
 		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
 	}
+}
+
+// lowerMultiAssign lowers an assignment with more than one target. Three forms
+// reach it: the comma-ok map read v, ok := m[k], which binds a value and a
+// present flag; the unpack of a call that returns several values, a, b := f(),
+// which binds each returned value positionally; and the parallel assignment
+// a, b = c, d, which Go evaluates in full before it binds any target, so a swap
+// a, b = b, a is faithful to a Python tuple assignment. A field or an index
+// target in a tuple assignment waits on its own slice and fails loudly.
+func (l *lowerer) lowerMultiAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
+	if len(s.Rhs) == 1 {
+		if call, ok := astUnparen(s.Rhs[0]).(*ast.CallExpr); ok {
+			return l.lowerUnpackCall(s, call)
+		}
+		if len(s.Lhs) == 2 {
+			return l.lowerMapCommaOk(s)
+		}
+		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
+	}
+	if len(s.Rhs) != len(s.Lhs) {
+		return nil, l.errf(s.Pos(), "a parallel assignment needs one value per target")
+	}
+	names, err := l.multiAssignNames(s.Lhs)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]ir.Expr, len(s.Rhs))
+	for i, r := range s.Rhs {
+		value, err := l.lowerExpr(r)
+		if err != nil {
+			return nil, err
+		}
+		// A struct or an array value assigned to a target copies, and a blank target
+		// discards its value and owes no copy, matching the single assignment.
+		if names[i] != "_" {
+			value = l.copyIfValueRead(r, value)
+		}
+		elems[i] = value
+	}
+	return []ir.Stmt{&ir.TupleAssign{Names: names, Value: &ir.Tuple{Elems: elems}, Define: s.Tok == token.DEFINE}}, nil
+}
+
+// lowerUnpackCall lowers a, b := f(), the unpack of a call that returns several
+// values, into a tuple assignment from the call. Python unpacks the returned
+// tuple positionally, and the function already cloned each struct or array value
+// on the way out, so the unpack binds independent values and owes no copy here.
+func (l *lowerer) lowerUnpackCall(s *ast.AssignStmt, call *ast.CallExpr) ([]ir.Stmt, error) {
+	names, err := l.multiAssignNames(s.Lhs)
+	if err != nil {
+		return nil, err
+	}
+	value, err := l.lowerExpr(call)
+	if err != nil {
+		return nil, err
+	}
+	return []ir.Stmt{&ir.TupleAssign{Names: names, Value: value, Define: s.Tok == token.DEFINE}}, nil
+}
+
+// multiAssignNames returns the plain-name targets of a tuple assignment. A
+// selector or an index target in a multiple assignment waits on its own slice,
+// so anything but an identifier, including the blank _, fails loudly here unless
+// it is a name.
+func (l *lowerer) multiAssignNames(lhs []ast.Expr) ([]string, error) {
+	names := make([]string, len(lhs))
+	for i, t := range lhs {
+		id, ok := t.(*ast.Ident)
+		if !ok {
+			return nil, l.errf(t.Pos(), "a multiple assignment target must be a name for now")
+		}
+		names[i] = id.Name
+	}
+	return names, nil
 }
 
 // lowerMapCommaOk lowers the two-value map read v, ok := m[k], which binds the

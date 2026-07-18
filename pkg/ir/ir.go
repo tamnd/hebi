@@ -485,6 +485,12 @@ type AddrIndex struct {
 // or element it points at.
 type Deref struct{ X Expr }
 
+// Tuple is a parenthesized sequence of expressions, which lowers to a Python
+// tuple. It carries a function's multiple return values, `return a, b`, and the
+// right side of a parallel assignment, `a, b = c, d`, so both flow through one
+// node the emitter renders as `(a, b)`.
+type Tuple struct{ Elems []Expr }
+
 func (*IntLit) isExpr()      {}
 func (*FloatLit) isExpr()    {}
 func (*StringLit) isExpr()   {}
@@ -500,6 +506,7 @@ func (*Intrinsic) isExpr()   {}
 func (*AddrField) isExpr()   {}
 func (*AddrIndex) isExpr()   {}
 func (*Deref) isExpr()       {}
+func (*Tuple) isExpr()       {}
 func (*FieldAccess) isExpr() {}
 func (*StructLit) isExpr()   {}
 func (*Clone) isExpr()       {}

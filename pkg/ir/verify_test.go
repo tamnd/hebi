@@ -559,6 +559,42 @@ func TestVerifyPointerSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyTupleSurface accepts a well-formed tuple, the multiple-return and
+// parallel-assignment carrier, and rejects a tuple with fewer than two elements
+// and one with a nil element.
+func TestVerifyTupleSurface(t *testing.T) {
+	t.Parallel()
+	good := &Module{Package: "main", Funcs: []*Func{{Name: "pair", Body: []Stmt{
+		&ReturnStmt{Value: &Tuple{Elems: []Expr{&IntLit{Text: "1"}, &IntLit{Text: "2"}}}},
+	}}}}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed tuple: %v", err)
+	}
+	tests := []struct {
+		name    string
+		value   Expr
+		wantSub string
+	}{
+		{"tuple too few elements", &Tuple{Elems: []Expr{&IntLit{Text: "1"}}}, "fewer than two elements"},
+		{"tuple nil element", &Tuple{Elems: []Expr{&IntLit{Text: "1"}, nil}}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&ReturnStmt{Value: tt.value},
+			}}}}
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.

@@ -271,6 +271,15 @@ func verifyExpr(where string, e Expr) error {
 		return verifyExpr(where+": index", e.Index)
 	case *Deref:
 		return verifyExpr(where+": pointer", e.X)
+	case *Tuple:
+		if len(e.Elems) < 2 {
+			return fmt.Errorf("ir: %s is a tuple with fewer than two elements", where)
+		}
+		for i, el := range e.Elems {
+			if err := verifyExpr(fmt.Sprintf("%s: element %d", where, i), el); err != nil {
+				return err
+			}
+		}
 	case *FieldAccess:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s reads a field with no name", where)

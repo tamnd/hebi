@@ -568,8 +568,6 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		source string
 	}{
 		{"method", "package main\n\ntype T struct{}\n\nfunc (T) m() {}\n\nfunc main() {}\n"},
-		{"multiple results", "package main\n\nfunc f() (int, int) { return 0, 0 }\n\nfunc main() { _, _ = f() }\n"},
-		{"named result", "package main\n\nfunc f() (n int) { return }\n\nfunc main() { _ = f() }\n"},
 		{"variadic parameter", "package main\n\nfunc f(xs ...int) {}\n\nfunc main() { f() }\n"},
 		{"embedded pointer field", "package main\n\ntype Inner struct{ N int }\n\ntype Outer struct {\n\t*Inner\n\tM int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"},
 		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},
@@ -1633,6 +1631,89 @@ def main():
     q = ` + shim.Name + `.IndexPtr(a, 1)
     _ = q.get()
     _ = px
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestMultipleReturns checks multiple and named return values against go run: a
+// two-value return unpacked at the call site, a three-value return, a named
+// result set by name and handed back by a bare return, a named struct result, a
+// parallel assignment and a swap, a struct returned twice proving copy on
+// return, a struct parallel assignment proving the copy, and a blank target
+// discarding one of the returned values.
+func TestMultipleReturns(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"two value return", "package main\n\nimport \"fmt\"\n\nfunc swap(a, b int) (int, int) {\n\treturn b, a\n}\n\nfunc main() {\n\tx, y := swap(1, 2)\n\tfmt.Println(x, y)\n}\n"},
+		{"three value return", "package main\n\nimport \"fmt\"\n\nfunc three() (int, int, int) {\n\treturn 1, 2, 3\n}\n\nfunc main() {\n\ta, b, c := three()\n\tfmt.Println(a, b, c)\n}\n"},
+		{"named results bare return", "package main\n\nimport \"fmt\"\n\nfunc split(n int) (lo, hi int) {\n\tlo = n - 1\n\thi = n + 1\n\treturn\n}\n\nfunc main() {\n\ta, b := split(5)\n\tfmt.Println(a, b)\n}\n"},
+		{"named struct result", "package main\n\nimport \"fmt\"\n\ntype P struct {\n\tX int\n}\n\nfunc build() (p P) {\n\tp.X = 7\n\treturn\n}\n\nfunc main() {\n\tq := build()\n\tfmt.Println(q.X)\n}\n"},
+		{"parallel assign and swap", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta, b := 1, 2\n\ta, b = b, a\n\tfmt.Println(a, b)\n}\n"},
+		{"struct returned twice copies", "package main\n\nimport \"fmt\"\n\ntype Box struct {\n\tV int\n}\n\nfunc two() (Box, Box) {\n\tb := Box{1}\n\treturn b, b\n}\n\nfunc main() {\n\tx, y := two()\n\tx.V = 100\n\tfmt.Println(x.V, y.V)\n}\n"},
+		{"struct parallel assign copies", "package main\n\nimport \"fmt\"\n\ntype P struct {\n\tX int\n}\n\nfunc main() {\n\ta := P{1}\n\tb := P{2}\n\ta, b = b, a\n\tb.X = 9\n\tfmt.Println(a.X, b.X)\n}\n"},
+		{"blank target discards", "package main\n\nimport \"fmt\"\n\nfunc pair() (int, int) {\n\treturn 3, 4\n}\n\nfunc main() {\n\t_, y := pair()\n\tfmt.Println(y)\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestMultipleReturnEmit pins the Python a multiple return and its consumers
+// lower to: a several-value return is a parenthesized tuple, an unpack of a call
+// is a tuple-target assignment from the call, and a parallel assignment is a
+// tuple-target assignment from a tuple of the right-side values.
+func TestMultipleReturnEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nfunc swap(a, b int) (int, int) {\n\treturn b, a\n}\n\nfunc main() {\n\tx, y := swap(1, 2)\n\tx, y = y, x\n\t_ = x\n\t_ = y\n}\n"
+	want := `def swap(a, b):
+    return (b, a)
+
+
+def main():
+    x, y = swap(1, 2)
+    x, y = (y, x)
+    _ = x
+    _ = y
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestNamedResultEmit pins the Python a named result lowers to: a zero-init
+// prelude binds each result name at the function top, and a bare return hands
+// back the named bindings as a tuple.
+func TestNamedResultEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nfunc split(n int) (lo, hi int) {\n\tlo = n\n\thi = n\n\treturn\n}\n\nfunc main() {\n\ta, b := split(3)\n\t_ = a\n\t_ = b\n}\n"
+	want := `def split(n):
+    lo = 0
+    hi = 0
+    lo = n
+    hi = n
+    return (lo, hi)
+
+
+def main():
+    a, b = split(3)
+    _ = a
+    _ = b
 
 
 if __name__ == "__main__":
