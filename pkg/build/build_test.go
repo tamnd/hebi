@@ -579,8 +579,6 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"statement label", "package main\n\nfunc main() {\nDone:\n\tprintln(\"hi\")\n\t_ = 0\n\tgoto Done\n}\n"},
 		{"unsupported call", "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.Exit(0)\n}\n"},
 		{"pointer field", "package main\n\ntype Node struct {\n\tV int\n\tNext *Node\n}\n\nfunc main() {\n\tvar n Node\n\t_ = n\n}\n"},
-		{"keyed array element", "package main\n\nfunc main() {\n\ta := [3]int{0: 1, 2: 3}\n\t_ = a\n}\n"},
-		{"keyed slice element", "package main\n\nfunc main() {\n\ts := []int{0: 1, 2: 3}\n\t_ = s\n}\n"},
 		{"array reslice", "package main\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\ts := a[0:2]\n\t_ = s\n}\n"},
 		{"map with an array key", "package main\n\nfunc main() {\n\tm := map[[2]int]int{}\n\t_ = m\n}\n"},
 		{"append spread", "package main\n\nfunc main() {\n\ta := []int{1, 2}\n\tb := []int{3, 4}\n\ta = append(a, b...)\n\t_ = a\n}\n"},
@@ -1483,6 +1481,86 @@ def main():
         _ = v
     for k in ` + shim.Name + `._map_keys(m):
         _ = k
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestCompositeLiterals runs the index-keyed and nested composite literal forms
+// three-way against go run. It covers a sparse array and slice that leave zeroed
+// gaps, a literal that mixes a keyed and a positional element so the running
+// index continues past the key, and nested elided literals where the inner
+// element type is left off, which compose through the recursive lowering.
+func TestCompositeLiterals(t *testing.T) {
+	t.Parallel()
+	const pointPre = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"sparse array fills gaps with zeros", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [5]int{0: 1, 4: 9}\n\tfmt.Println(a)\n}\n"},
+		{"sparse array out of order", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [4]int{2: 30, 0: 10}\n\tfmt.Println(a)\n}\n"},
+		{"keyed array shorter than length pads", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [6]int{1: 2, 3: 4}\n\tfmt.Println(a, len(a))\n}\n"},
+		{"sparse slice spans to highest index", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{2: 5}\n\tfmt.Println(s, len(s))\n}\n"},
+		{"mixed keyed and positional slice", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 5: 6, 7}\n\tfmt.Println(s, len(s))\n}\n"},
+		{"keyed then continue index", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{3: 30, 40, 50}\n\tfmt.Println(s, len(s))\n}\n"},
+		{"nested elided slice of struct", pointPre + "func main() {\n\ts := []Point{{1, 2}, {3, 4}}\n\tfmt.Println(s[0].X, s[1].Y)\n}\n"},
+		{"nested elided array of struct", pointPre + "func main() {\n\ta := [2]Point{{1, 2}, {3, 4}}\n\tfmt.Println(a[0].X, a[1].Y)\n}\n"},
+		{"nested elided array of array", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [2][3]int{{1, 2, 3}, {4, 5, 6}}\n\tfmt.Println(a)\n}\n"},
+		{"nested elided slice of slice", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := [][]int{{1, 2}, {3, 4, 5}}\n\tfmt.Println(s[0], s[1], len(s[1]))\n}\n"},
+		{"map value elided struct", pointPre + "func main() {\n\tm := map[string]Point{\"a\": {1, 2}}\n\tfmt.Println(m[\"a\"].X, m[\"a\"].Y)\n}\n"},
+		{"struct field nested literal", "package main\n\nimport \"fmt\"\n\ntype Grid struct {\n\tCells [2]int\n}\n\nfunc main() {\n\tg := Grid{Cells: [2]int{7, 8}}\n\tfmt.Println(g.Cells)\n}\n"},
+		{"sparse array of struct pads fresh zeros", pointPre + "func main() {\n\ta := [3]Point{1: {5, 6}}\n\ta[0].X = 1\n\tfmt.Println(a[0].X, a[1].X, a[2].X)\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestCompositeLiteralEmit pins the Python the new literal forms lower to: a
+// sparse array is a dense list with zeroed gaps, a sparse slice spans to its
+// highest index through _slice_lit, and a nested elided slice of structs builds
+// the inner constructor calls directly.
+func TestCompositeLiteralEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\ta := [5]int{0: 1, 4: 9}\n\ts := []int{2: 5}\n\tp := []Point{{1, 2}, {3, 4}}\n\t_ = a\n\t_ = s\n\t_ = p\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
+
+
+def main():
+    a = [1, 0, 0, 0, 9]
+    s = ` + shim.Name + `._slice_lit([0, 0, 5])
+    p = ` + shim.Name + `._slice_lit([Point(1, 2), Point(3, 4)])
+    _ = a
+    _ = s
+    _ = p
 
 
 if __name__ == "__main__":

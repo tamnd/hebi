@@ -3,6 +3,7 @@ package build
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"sort"
@@ -1677,26 +1678,17 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 }
 
 // lowerArrayLit lowers an array composite literal to an ArrayLit, a Python list
-// of its elements. Only the positional form is supported in this slice; an
-// index-keyed element waits on the composite-literal slice. A partial positional
-// literal is padded with zero-value elements to the array length, matching Go,
-// and a struct or array element that reads an existing value is cloned so the
-// literal stores an independent copy. Each padded zero is built separately, so
-// two zero elements never alias.
+// of its elements. Positional, index-keyed, and mixed forms are all supported
+// through lowerIndexedElements. A partial literal is padded with zero-value
+// elements to the array length, matching Go, and a struct or array element that
+// reads an existing value is cloned so the literal stores an independent copy.
+// Each padded zero is built separately, so two zero elements never alias.
 func (l *lowerer) lowerArrayLit(e *ast.CompositeLit, arr *types.Array) (ir.Expr, error) {
-	n := int(arr.Len())
-	elems := make([]ir.Expr, 0, n)
-	for _, elt := range e.Elts {
-		if _, ok := elt.(*ast.KeyValueExpr); ok {
-			return nil, l.errf(elt.Pos(), "keyed array elements are not supported yet")
-		}
-		value, err := l.lowerExpr(elt)
-		if err != nil {
-			return nil, err
-		}
-		elems = append(elems, l.copyIfValueRead(elt, value))
+	elems, err := l.lowerIndexedElements(e.Elts, arr.Elem(), e.Pos())
+	if err != nil {
+		return nil, err
 	}
-	for i := len(elems); i < n; i++ {
+	for i := len(elems); i < int(arr.Len()); i++ {
 		zero, err := l.zeroValueOfType(arr.Elem(), e.Pos())
 		if err != nil {
 			return nil, err
@@ -1708,22 +1700,78 @@ func (l *lowerer) lowerArrayLit(e *ast.CompositeLit, arr *types.Array) (ir.Expr,
 
 // lowerSliceLit lowers a slice composite literal to a SliceLit, a slice header
 // over a fresh backing list. Unlike an array literal it is never padded, since a
-// slice literal's length is exactly its element count, and a value element that
-// reads an existing value is cloned so the backing owns an independent copy. The
-// index-keyed form waits on the composite-literal slice, so it fails loudly.
+// slice literal's length is exactly the span its elements reach, and a value
+// element that reads an existing value is cloned so the backing owns an
+// independent copy. Positional, index-keyed, and mixed forms are all supported.
 func (l *lowerer) lowerSliceLit(e *ast.CompositeLit) (ir.Expr, error) {
-	elems := make([]ir.Expr, 0, len(e.Elts))
-	for _, elt := range e.Elts {
-		if _, ok := elt.(*ast.KeyValueExpr); ok {
-			return nil, l.errf(elt.Pos(), "keyed slice elements are not supported yet")
+	elem := l.pkg.Info.TypeOf(e).Underlying().(*types.Slice).Elem()
+	elems, err := l.lowerIndexedElements(e.Elts, elem, e.Pos())
+	if err != nil {
+		return nil, err
+	}
+	return &ir.SliceLit{Elems: elems}, nil
+}
+
+// lowerIndexedElements places the elements of an array or slice composite
+// literal into a dense list, honoring Go's index rule: a keyed element sets the
+// running index to its constant key, a positional element takes the running
+// index, and the index advances by one after each element. A gap left between
+// two indices is filled with a freshly built zero value so two zero elements
+// never alias, and a struct or array value that reads an existing value is
+// cloned so the backing owns an independent copy. The span returned reaches the
+// highest index written plus one, which for a slice is its length.
+func (l *lowerer) lowerIndexedElements(elts []ast.Expr, elem types.Type, pos token.Pos) ([]ir.Expr, error) {
+	placed := map[int]ir.Expr{}
+	maxIndex := -1
+	idx := 0
+	for _, elt := range elts {
+		valueExpr := elt
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			n, err := l.constIndex(kv.Key)
+			if err != nil {
+				return nil, err
+			}
+			idx = n
+			valueExpr = kv.Value
 		}
-		value, err := l.lowerExpr(elt)
+		value, err := l.lowerExpr(valueExpr)
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems, l.copyIfValueRead(elt, value))
+		placed[idx] = l.copyIfValueRead(valueExpr, value)
+		if idx > maxIndex {
+			maxIndex = idx
+		}
+		idx++
 	}
-	return &ir.SliceLit{Elems: elems}, nil
+	elems := make([]ir.Expr, 0, maxIndex+1)
+	for i := 0; i <= maxIndex; i++ {
+		if v, ok := placed[i]; ok {
+			elems = append(elems, v)
+			continue
+		}
+		zero, err := l.zeroValueOfType(elem, pos)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, zero)
+	}
+	return elems, nil
+}
+
+// constIndex reads the constant integer value of a composite-literal element
+// key. Go requires the key of an array or slice literal element to be a constant
+// index, so a non-constant key is diagnosed rather than emitted.
+func (l *lowerer) constIndex(key ast.Expr) (int, error) {
+	tv, ok := l.pkg.Info.Types[key]
+	if !ok || tv.Value == nil {
+		return 0, l.errf(key.Pos(), "composite literal index must be a constant")
+	}
+	n, ok := constant.Int64Val(constant.ToInt(tv.Value))
+	if !ok {
+		return 0, l.errf(key.Pos(), "composite literal index is out of range")
+	}
+	return int(n), nil
 }
 
 // lowerMapLit lowers a map composite literal to a MapLit, a Python dict of its
