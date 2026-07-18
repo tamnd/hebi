@@ -253,6 +253,7 @@ type LabeledBreak struct{ Label string }
 type LabeledContinue struct{ Label string }
 
 func (*ExprStmt) isStmt()        {}
+func (*FuncDef) isStmt()         {}
 func (*ReturnStmt) isStmt()      {}
 func (*AssignStmt) isStmt()      {}
 func (*TupleAssign) isStmt()     {}
@@ -491,6 +492,43 @@ type Deref struct{ X Expr }
 // node the emitter renders as `(a, b)`.
 type Tuple struct{ Elems []Expr }
 
+// Capture is one variable a closure snapshots at the point it is created, lowered
+// to a default-argument parameter, `name=value`. The reuse-name form, where the
+// parameter and its value share the source name, gives Go 1.22's per-iteration
+// loop variable: the default binds the current value once, so the closure keeps
+// the value the variable held when the closure was made rather than the value it
+// ends on.
+type Capture struct {
+	// Param is the default-argument parameter name the closure body reads.
+	Param string
+	// Value is the expression evaluated once, at closure creation, to seed Param.
+	Value Expr
+}
+
+// Lambda is a single-expression closure, the form a Go function literal whose
+// body is one `return expr` lowers to. Params are the literal's parameters in
+// order, Captures are the snapshot defaults appended after them, and Body is the
+// returned expression. A closure whose body is more than one statement lowers to
+// a FuncDef instead, since a Python lambda holds only an expression.
+type Lambda struct {
+	Params   []string
+	Captures []Capture
+	Body     Expr
+}
+
+// FuncDef is a multi-statement closure, hoisted to a nested Python def just above
+// the statement that creates it. Params and Captures mirror Lambda's. Nonlocals
+// are the enclosing locals the body assigns, declared nonlocal on the def's first
+// line so the write reaches the outer binding rather than making a fresh local,
+// matching Go's capture by reference. Body is the def's statement list.
+type FuncDef struct {
+	Name      string
+	Params    []string
+	Captures  []Capture
+	Nonlocals []string
+	Body      []Stmt
+}
+
 func (*IntLit) isExpr()      {}
 func (*FloatLit) isExpr()    {}
 func (*StringLit) isExpr()   {}
@@ -507,6 +545,7 @@ func (*AddrField) isExpr()   {}
 func (*AddrIndex) isExpr()   {}
 func (*Deref) isExpr()       {}
 func (*Tuple) isExpr()       {}
+func (*Lambda) isExpr()      {}
 func (*FieldAccess) isExpr() {}
 func (*StructLit) isExpr()   {}
 func (*Clone) isExpr()       {}

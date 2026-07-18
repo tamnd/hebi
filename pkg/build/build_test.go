@@ -580,6 +580,7 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"array reslice", "package main\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\ts := a[0:2]\n\t_ = s\n}\n"},
 		{"map with an array key", "package main\n\nfunc main() {\n\tm := map[[2]int]int{}\n\t_ = m\n}\n"},
 		{"append spread", "package main\n\nfunc main() {\n\ta := []int{1, 2}\n\tb := []int{3, 4}\n\ta = append(a, b...)\n\t_ = a\n}\n"},
+		{"closure writes package level var", "package main\n\nvar count int\n\nfunc main() {\n\tf := func() { count = 5 }\n\tf()\n}\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

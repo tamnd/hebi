@@ -176,6 +176,10 @@ func blockUsesShim(body []ir.Stmt) bool {
 		case *ir.RangeString:
 			// A range over a string always calls the rune decoder in the shim.
 			return true
+		case *ir.FuncDef:
+			if capturesUseShim(s.Captures) || blockUsesShim(s.Body) {
+				return true
+			}
 		}
 	}
 	return false
@@ -207,6 +211,8 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.X)
 	case *ir.Tuple:
 		return argsUseShim(e.Elems)
+	case *ir.Lambda:
+		return capturesUseShim(e.Captures) || exprUsesShim(e.Body)
 	case *ir.Clone:
 		return exprUsesShim(e.X)
 	case *ir.ArrayClone:
@@ -248,6 +254,10 @@ func exprUsesShim(e ir.Expr) bool {
 
 func argsUseShim(args []ir.Expr) bool {
 	return slices.ContainsFunc(args, exprUsesShim)
+}
+
+func capturesUseShim(caps []ir.Capture) bool {
+	return slices.ContainsFunc(caps, func(c ir.Capture) bool { return exprUsesShim(c.Value) })
 }
 
 func emitFunc(b *strings.Builder, fn *ir.Func) error {
@@ -411,6 +421,18 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		writeIndent(b, depth)
 		b.WriteString(expr)
 		b.WriteString("\n")
+	case *ir.FuncDef:
+		sig, err := emitSignature(s.Params, s.Captures)
+		if err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "def %s(%s):\n", s.Name, sig)
+		if len(s.Nonlocals) > 0 {
+			writeIndent(b, depth+1)
+			fmt.Fprintf(b, "nonlocal %s\n", strings.Join(s.Nonlocals, ", "))
+		}
+		return emitBlock(b, s.Body, depth+1)
 	case *ir.ReturnStmt:
 		writeIndent(b, depth)
 		if s.Value == nil {
@@ -768,6 +790,19 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("(%s)", parts), nil
+	case *ir.Lambda:
+		sig, err := emitSignature(e.Params, e.Captures)
+		if err != nil {
+			return "", err
+		}
+		body, err := emitExpr(e.Body)
+		if err != nil {
+			return "", err
+		}
+		if sig == "" {
+			return fmt.Sprintf("lambda: %s", body), nil
+		}
+		return fmt.Sprintf("lambda %s: %s", sig, body), nil
 	case *ir.StructLit:
 		parts := make([]string, len(e.Fields))
 		for i, f := range e.Fields {
@@ -909,6 +944,22 @@ func emitArgs(args []ir.Expr) (string, error) {
 			return "", err
 		}
 		parts[i] = s
+	}
+	return strings.Join(parts, ", "), nil
+}
+
+// emitSignature joins a closure's plain parameters with its captured defaults,
+// the parameters first and each capture as name=value after them, so the reuse
+// name form name=name reads as binding the current value once at creation.
+func emitSignature(params []string, caps []ir.Capture) (string, error) {
+	parts := make([]string, 0, len(params)+len(caps))
+	parts = append(parts, params...)
+	for _, c := range caps {
+		value, err := emitExpr(c.Value)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, c.Param+"="+value)
 	}
 	return strings.Join(parts, ", "), nil
 }

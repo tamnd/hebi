@@ -6,6 +6,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"go/version"
 	"sort"
 	"strconv"
 	"strings"
@@ -142,6 +143,19 @@ type lowerer struct {
 	// return in a function with named results returns these, so the lowerer needs
 	// them in hand while it walks the body.
 	resultNames []string
+	// pendingDefs holds the nested defs a closure lowering hoisted, waiting to be
+	// flushed just above the statement whose expression created them. A multi
+	// statement function literal cannot be an expression in Python, so it lowers to
+	// a def placed before its use; lowerBlock drains this before each statement.
+	pendingDefs []ir.Stmt
+	// funcSeq numbers the internal names hoisted closures take, _func, _func1, and
+	// so on, across the whole module in source order so the emit stays determinate.
+	funcSeq int
+	// snapshot is the set of Go 1.22 per-iteration loop variables in scope, the
+	// ones a closure in the loop body must freeze at creation with a default
+	// argument to keep the value the iteration held. It is empty under the pre-1.22
+	// shared-variable semantics, where a closure captures the one shared variable.
+	snapshot map[types.Object]bool
 }
 
 // scope is one enclosing breakable construct: a loop or a switch, carrying the Go
@@ -356,6 +370,322 @@ func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
 	return []ir.Stmt{&ir.ReturnStmt{Value: &ir.Tuple{Elems: elems}}}, nil
 }
 
+// lowerFuncLit lowers a Go function literal to a closure. A literal whose body is
+// a single return of one expression becomes a Python lambda, the readable form,
+// unless the caller forces a def because it will immediately call the closure,
+// which a lambda cannot carry as a statement. Every other literal, and every one
+// with named results or more than one statement, becomes a def hoisted just above
+// its use. A closure that reads a Go 1.22 per-iteration loop variable freezes it
+// with a default argument, and a closure that writes an enclosing local declares
+// that local nonlocal, so both match Go's capture by reference.
+func (l *lowerer) lowerFuncLit(e *ast.FuncLit, forceDef bool) (ir.Expr, error) {
+	params, err := l.lowerParams(e.Type.Params)
+	if err != nil {
+		return nil, err
+	}
+	captures, err := l.closureCaptures(e)
+	if err != nil {
+		return nil, err
+	}
+	if ret := singleReturnExpr(e); !forceDef && ret != nil && !containsFuncLit(ret) {
+		body, err := l.lowerExpr(ret)
+		if err != nil {
+			return nil, err
+		}
+		body = l.copyIfValueRead(ret, body)
+		return &ir.Lambda{Params: params, Captures: captures, Body: body}, nil
+	}
+	return l.lowerFuncLitDef(e, params, captures)
+}
+
+// lowerFuncLitDef lowers a function literal to a hoisted nested def, queued in
+// pendingDefs and referred to by the name it is given. It lowers the body under a
+// saved and restored result-name context, since the closure has its own results,
+// and computes the nonlocal declarations the body's writes to enclosing locals
+// need.
+func (l *lowerer) lowerFuncLitDef(e *ast.FuncLit, params []string, captures []ir.Capture) (ir.Expr, error) {
+	nonlocals, err := l.closureNonlocals(e)
+	if err != nil {
+		return nil, err
+	}
+	saved := l.resultNames
+	prelude, err := l.beginResults(e.Type.Results)
+	if err != nil {
+		l.resultNames = saved
+		return nil, err
+	}
+	body, err := l.lowerBlock(e.Body)
+	l.resultNames = saved
+	if err != nil {
+		return nil, err
+	}
+	body = append(prelude, body...)
+	body = resolveLabeledJumps(body)
+	name := seqName("_func", l.funcSeq)
+	l.funcSeq++
+	l.pendingDefs = append(l.pendingDefs, &ir.FuncDef{
+		Name:      name,
+		Params:    params,
+		Captures:  captures,
+		Nonlocals: nonlocals,
+		Body:      body,
+	})
+	return &ir.Ident{Name: name}, nil
+}
+
+// singleReturnExpr returns the single returned expression of a function literal
+// whose body is exactly one return of one value and whose results are unnamed, or
+// nil when the literal is not that shape, in which case it lowers to a def rather
+// than a lambda.
+func singleReturnExpr(e *ast.FuncLit) ast.Expr {
+	if hasNamedResults(e.Type.Results) {
+		return nil
+	}
+	if len(e.Body.List) != 1 {
+		return nil
+	}
+	ret, ok := e.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return nil
+	}
+	return ret.Results[0]
+}
+
+// hasNamedResults reports whether a result list names any of its results, which a
+// lambda cannot express, so such a literal lowers to a def.
+func hasNamedResults(results *ast.FieldList) bool {
+	if results == nil {
+		return false
+	}
+	for _, field := range results.List {
+		if len(field.Names) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// containsFuncLit reports whether an expression holds a nested function literal,
+// which a lambda body cannot hoist, so a return expression that does lowers its
+// closure to a def instead.
+func containsFuncLit(e ast.Expr) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+// closureCaptures builds the default-argument snapshots a closure needs, one for
+// each in-scope per-iteration loop variable it reads and does not itself write. A
+// read inside a nested closure counts too, since the value must be frozen where
+// this closure is made. A variable the closure writes is left to the nonlocal
+// path instead, so a name is never both a parameter and a nonlocal.
+func (l *lowerer) closureCaptures(e *ast.FuncLit) ([]ir.Capture, error) {
+	if len(l.snapshot) == 0 {
+		return nil, nil
+	}
+	writes := l.closureWrites(e)
+	seen := map[types.Object]bool{}
+	var caps []ir.Capture
+	ast.Inspect(e.Body, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		obj := l.pkg.Info.ObjectOf(id)
+		if obj == nil || !l.snapshot[obj] || writes[obj] || seen[obj] {
+			return true
+		}
+		seen[obj] = true
+		caps = append(caps, ir.Capture{Param: obj.Name(), Value: &ir.Ident{Name: obj.Name()}})
+		return true
+	})
+	sort.Slice(caps, func(i, j int) bool { return caps[i].Param < caps[j].Param })
+	return caps, nil
+}
+
+// closureNonlocals returns the enclosing locals a closure body assigns, which
+// Python needs declared nonlocal so the write reaches the outer binding rather
+// than making a fresh local, reproducing Go's capture by reference. It looks at
+// this closure's own writes, not a nested closure's, since Python resolves a
+// nested nonlocal to the nearest enclosing binding on its own. A write to a
+// package-level variable is a module global, which this slice does not handle, so
+// it fails loudly.
+func (l *lowerer) closureNonlocals(e *ast.FuncLit) ([]string, error) {
+	seen := map[types.Object]bool{}
+	var names []string
+	var bad error
+	for obj := range l.closureWrites(e) {
+		if obj.Pos() >= e.Pos() && obj.Pos() < e.End() {
+			// Declared inside the closure, so the write binds the closure's own local.
+			continue
+		}
+		if obj.Parent() != nil && obj.Pkg() != nil && obj.Parent() == obj.Pkg().Scope() {
+			bad = l.errf(e.Pos(), "assignment to package-level variable %s from a closure is not supported yet", obj.Name())
+			continue
+		}
+		if !seen[obj] {
+			seen[obj] = true
+			names = append(names, obj.Name())
+		}
+	}
+	if bad != nil {
+		return nil, bad
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// closureWrites returns the objects a closure body assigns directly, through =,
+// a compound assignment, or ++ and --, not descending into a nested closure,
+// which accounts for its own writes. A := target is a fresh local of the closure,
+// so it is not a write to an enclosing variable and is skipped.
+func (l *lowerer) closureWrites(e *ast.FuncLit) map[types.Object]bool {
+	w := map[types.Object]bool{}
+	record := func(target ast.Expr) {
+		id, ok := target.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			return
+		}
+		if obj := l.pkg.Info.ObjectOf(id); obj != nil {
+			w[obj] = true
+		}
+	}
+	first := true
+	ast.Inspect(e.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			if first {
+				first = false
+				return true
+			}
+			return false
+		case *ast.AssignStmt:
+			if n.Tok != token.DEFINE {
+				for _, lhs := range n.Lhs {
+					record(lhs)
+				}
+			}
+		case *ast.IncDecStmt:
+			record(n.X)
+		}
+		return true
+	})
+	return w
+}
+
+// forLoopVars returns the loop variables a three-clause for declares with := in
+// its init, the ones Go 1.22 makes fresh each iteration, or nil when the init is
+// not a short declaration.
+func forLoopVars(s *ast.ForStmt) []*ast.Ident {
+	init, ok := s.Init.(*ast.AssignStmt)
+	if !ok || init.Tok != token.DEFINE {
+		return nil
+	}
+	var ids []*ast.Ident
+	for _, lhs := range init.Lhs {
+		if id, ok := lhs.(*ast.Ident); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// identOf returns e as an identifier, or nil when it is absent or not a bare
+// name, so a range clause's key or value position resolves to the variable it
+// declares or to nothing.
+func identOf(e ast.Expr) *ast.Ident {
+	id, _ := e.(*ast.Ident)
+	return id
+}
+
+// snapshotLoopVars registers the given loop variables as per-iteration snapshots
+// for the duration of a loop body, under Go 1.22 semantics only, and returns a
+// function that removes them again. Under the older shared-variable semantics it
+// registers nothing, so a closure captures the one shared variable. A blank or
+// absent variable, or one the type checker did not record as a fresh declaration,
+// is skipped.
+func (l *lowerer) snapshotLoopVars(pos token.Pos, idents ...*ast.Ident) func() {
+	if !l.newLoopSemantics(pos) {
+		return func() {}
+	}
+	var added []types.Object
+	for _, id := range idents {
+		if id == nil || id.Name == "_" {
+			continue
+		}
+		obj := l.pkg.Info.Defs[id]
+		if obj == nil {
+			continue
+		}
+		if l.snapshot == nil {
+			l.snapshot = map[types.Object]bool{}
+		}
+		if !l.snapshot[obj] {
+			l.snapshot[obj] = true
+			added = append(added, obj)
+		}
+	}
+	return func() {
+		for _, obj := range added {
+			delete(l.snapshot, obj)
+		}
+	}
+}
+
+// loopVarCaptured reports whether a closure anywhere in the loop body reads the
+// loop variable by name, which is what makes the shared-versus-per-iteration
+// distinction observable and so decides whether the count sugar is safe under the
+// older semantics.
+func loopVarCaptured(body *ast.BlockStmt, name string) bool {
+	captured := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		fl, ok := n.(*ast.FuncLit)
+		if !ok {
+			return !captured
+		}
+		ast.Inspect(fl.Body, func(m ast.Node) bool {
+			if id, ok := m.(*ast.Ident); ok && id.Name == name {
+				captured = true
+			}
+			return !captured
+		})
+		return false
+	})
+	return captured
+}
+
+// newLoopSemantics reports whether the file at pos compiles under Go 1.22 or
+// later, where a loop declares a fresh variable each iteration. An unrecorded
+// version is treated as current, since the loaded module sets the language
+// version and only a deliberately older file opts out.
+func (l *lowerer) newLoopSemantics(pos token.Pos) bool {
+	v := l.fileVersion(pos)
+	if v == "" {
+		return true
+	}
+	return version.Compare(v, "go1.22") >= 0
+}
+
+// fileVersion returns the Go language version go/types resolved for the file that
+// contains pos, or the empty string when none was recorded.
+func (l *lowerer) fileVersion(pos token.Pos) string {
+	if l.pkg.Info.FileVersions == nil {
+		return ""
+	}
+	for _, f := range l.pkg.Files {
+		if pos >= f.FileStart && pos < f.FileEnd {
+			return l.pkg.Info.FileVersions[f]
+		}
+	}
+	return ""
+}
+
 func (l *lowerer) lowerBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
 	var out []ir.Stmt
 	for _, s := range block.List {
@@ -363,9 +693,23 @@ func (l *lowerer) lowerBlock(block *ast.BlockStmt) ([]ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A closure the statement created hoists to a def just above the statement
+		// that uses it, so its name is bound before the use.
+		out = append(out, l.flushPendingDefs()...)
 		out = append(out, lowered...)
 	}
 	return out, nil
+}
+
+// flushPendingDefs returns the closures hoisted so far and clears the queue, so
+// the caller can place them just above the statement that uses them.
+func (l *lowerer) flushPendingDefs() []ir.Stmt {
+	if len(l.pendingDefs) == 0 {
+		return nil
+	}
+	defs := l.pendingDefs
+	l.pendingDefs = nil
+	return defs
 }
 
 // lowerStmt returns the statements a single Go statement lowers to. Most Go
@@ -1130,6 +1474,8 @@ func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A closure in the condition hoists above the whole if, not into a branch.
+	pre := l.flushPendingDefs()
 	then, err := l.lowerBlock(s.Body)
 	if err != nil {
 		return nil, err
@@ -1155,7 +1501,7 @@ func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
 	default:
 		return nil, l.errf(s.Else.Pos(), "else branch %T is not supported yet", s.Else)
 	}
-	return []ir.Stmt{out}, nil
+	return append(pre, out), nil
 }
 
 // lowerSwitch lowers a switch to an if/elif chain, which is faithful because Go
@@ -1176,6 +1522,8 @@ func (l *lowerer) lowerSwitch(s *ast.SwitchStmt) ([]ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A closure in the tag hoists above the switch, before the tag temporary.
+		pre = append(pre, l.flushPendingDefs()...)
 		name := seqName("_tag", l.switchSeq)
 		l.switchSeq++
 		pre = append(pre, &ir.AssignStmt{Name: name, Value: t, Define: true})
@@ -1279,6 +1627,7 @@ func (l *lowerer) lowerCaseBody(list []ast.Stmt) ([]ir.Stmt, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		out = append(out, l.flushPendingDefs()...)
 		out = append(out, lowered...)
 	}
 	return out, fall, nil
@@ -1308,6 +1657,12 @@ func caseCond(tag ir.Expr, conds []ir.Expr) ir.Expr {
 // and otherwise a faithful while: the init runs before the loop, the condition
 // gates it, and the post runs at the bottom of the body.
 func (l *lowerer) lowerFor(s *ast.ForStmt, label string) ([]ir.Stmt, error) {
+	// A three-clause loop declares its variable with the init, so under Go 1.22 a
+	// closure in the body captures a fresh per-iteration copy; register it so the
+	// closure lowering freezes it. The while and sugar paths lower the body under
+	// the same registration.
+	undo := l.snapshotLoopVars(s.Pos(), forLoopVars(s)...)
+	defer undo()
 	if s.Init == nil && s.Post == nil {
 		return l.lowerWhile(s, label)
 	}
@@ -1322,7 +1677,8 @@ func (l *lowerer) lowerFor(s *ast.ForStmt, label string) ([]ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		pre = init
+		pre = append(pre, l.flushPendingDefs()...)
+		pre = append(pre, init...)
 	}
 	var cond ir.Expr
 	if s.Cond != nil {
@@ -1330,6 +1686,8 @@ func (l *lowerer) lowerFor(s *ast.ForStmt, label string) ([]ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A closure in the condition hoists above the loop, not into its body.
+		pre = append(pre, l.flushPendingDefs()...)
 		cond = c
 	}
 	body, err := l.lowerLoopBlock(s.Body, label)
@@ -1402,6 +1760,13 @@ func (l *lowerer) countSugar(s *ast.ForStmt, label string) (*ir.ForRange, error)
 		return nil, nil
 	}
 	if assignsInBody(s.Body, v.Name) {
+		return nil, nil
+	}
+	// Under the pre-1.22 shared-variable semantics a closure that captures the loop
+	// variable sees the value it holds after the loop, which the while form leaves
+	// one past the bound; a for-in-range would instead stop at the bound, so fall
+	// back to the while form to keep the shared final value faithful.
+	if !l.newLoopSemantics(s.Pos()) && loopVarCaptured(s.Body, v.Name) {
 		return nil, nil
 	}
 	// Match the comparison to the step direction, and reject the inclusive bound
@@ -1542,6 +1907,13 @@ func assignsInBody(body *ast.BlockStmt, name string) bool {
 func (l *lowerer) lowerRange(s *ast.RangeStmt, label string) ([]ir.Stmt, error) {
 	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN && s.Tok != token.ILLEGAL {
 		return nil, l.errf(s.Pos(), "range with %s is not supported yet", s.Tok)
+	}
+	// A range that declares its key and value with := gives each iteration a fresh
+	// pair under Go 1.22, so a closure in the body freezes them; register them for
+	// the body lowering the sub-paths share.
+	if s.Tok == token.DEFINE {
+		undo := l.snapshotLoopVars(s.Pos(), identOf(s.Key), identOf(s.Value))
+		defer undo()
 	}
 	srcType := l.pkg.Info.TypeOf(s.X)
 	if mp, ok := srcType.Underlying().(*types.Map); ok {
@@ -1687,6 +2059,8 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		return l.lowerCompositeLit(e)
 	case *ast.CallExpr:
 		return l.lowerCall(e)
+	case *ast.FuncLit:
+		return l.lowerFuncLit(e, false)
 	default:
 		return nil, l.errf(e.Pos(), "expression %T is not supported yet", e)
 	}
@@ -2249,7 +2623,19 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 	if l.isConversion(e) {
 		return l.lowerConversion(e)
 	}
-	switch fun := e.Fun.(type) {
+	switch fun := astUnparen(e.Fun).(type) {
+	case *ast.FuncLit:
+		// An immediately invoked function literal has no name to bind, and a def
+		// cannot be an expression, so it hoists to a def that the call then names.
+		callee, err := l.lowerFuncLit(fun, true)
+		if err != nil {
+			return nil, err
+		}
+		args, err := l.lowerCallArgs(e.Args)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.CallExpr{Name: callee.(*ir.Ident).Name, Args: args}, nil
 	case *ast.SelectorExpr:
 		if l.isFmtPrintln(fun) {
 			args, err := l.lowerPrintlnArgs(e.Args)
