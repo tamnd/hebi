@@ -581,7 +581,6 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"pointer field", "package main\n\ntype Node struct {\n\tV int\n\tNext *Node\n}\n\nfunc main() {\n\tvar n Node\n\t_ = n\n}\n"},
 		{"keyed array element", "package main\n\nfunc main() {\n\ta := [3]int{0: 1, 2: 3}\n\t_ = a\n}\n"},
 		{"keyed slice element", "package main\n\nfunc main() {\n\ts := []int{0: 1, 2: 3}\n\t_ = s\n}\n"},
-		{"three-index slice", "package main\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tt := s[0:1:2]\n\t_ = t\n}\n"},
 		{"array reslice", "package main\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\ts := a[0:2]\n\t_ = s\n}\n"},
 		{"make of a map", "package main\n\nfunc main() {\n\tm := make(map[int]int)\n\t_ = m\n}\n"},
 		{"append spread", "package main\n\nfunc main() {\n\ta := []int{1, 2}\n\tb := []int{3, 4}\n\ta = append(a, b...)\n\t_ = a\n}\n"},
@@ -1279,6 +1278,101 @@ def main():
     pts = ` + shim.Name + `._slice_append(pts, p.copy())
     _ = s
     _ = pts
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestSliceThreeIndexSemantics checks the full slice s[low:high:max] against Go:
+// the result shares the operand's backing, its length runs low to high, and its
+// capacity is capped at max minus low, so an append that overflows the capped
+// capacity reallocates and stops sharing exactly where Go's does.
+func TestSliceThreeIndexSemantics(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"capped capacity bounds a later append", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 4, 8)\n\ts[0] = 1\n\ts[1] = 2\n\tt := s[0:1:2]\n\tfmt.Println(len(t), cap(t))\n}\n"},
+		{"within capped cap the append shares", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 2, 8)\n\ts[0] = 1\n\ts[1] = 2\n\tt := s[0:1:4]\n\tt = append(t, 9)\n\tfmt.Println(s[1], len(t), cap(t))\n}\n"},
+		{"at capped cap the append reallocates", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 2, 8)\n\ts[0] = 1\n\ts[1] = 2\n\tt := s[0:1:1]\n\tt = append(t, 9)\n\tt[0] = 99\n\tfmt.Println(s[0], t[0], len(t))\n}\n"},
+		{"omitted low defaults to zero", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := make([]int, 4, 8)\n\tt := s[:2:3]\n\tfmt.Println(len(t), cap(t))\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestSliceThreeIndexEmit pins the Python a full slice lowers to: the _subslice3
+// helper over the operand and its three bounds, the low bound defaulting to 0
+// when the source omits it, since Python's slice syntax carries no third bound.
+func TestSliceThreeIndexEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nfunc main() {\n\ts := make([]int, 4, 8)\n\tt := s[1:2:3]\n\tu := s[:2:3]\n\t_ = t\n\t_ = u\n}\n"
+	want := "import " + shim.Name + `
+
+
+def main():
+    s = ` + shim.Name + `.Slice([0] * 8, 0, 4, 8)
+    t = ` + shim.Name + `._subslice3(s, 1, 2, 3)
+    u = ` + shim.Name + `._subslice3(s, 0, 2, 3)
+    _ = t
+    _ = u
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestSliceCopySemantics checks copy(dst, src) against Go: it moves the overlap
+// of the two slices, returns that count, writes through the destination's backing
+// so a slice sharing it sees the change, and moves safely when the source and
+// destination overlap in one backing.
+func TestSliceCopySemantics(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"copy returns the shorter length", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tsrc := []int{1, 2, 3}\n\tdst := make([]int, 2)\n\tn := copy(dst, src)\n\tfmt.Println(n, dst[0], dst[1])\n}\n"},
+		{"copy fills through the shared backing", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tsrc := []int{7, 8, 9}\n\tdst := make([]int, 3)\n\tcopy(dst, src)\n\tfmt.Println(dst[0], dst[1], dst[2])\n}\n"},
+		{"copy from a longer source truncates", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tsrc := []int{1, 2, 3, 4}\n\tdst := make([]int, 2)\n\tn := copy(dst, src)\n\tfmt.Println(n, len(dst))\n}\n"},
+		{"copy overlaps within one backing", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3, 4, 5}\n\tn := copy(s[1:], s[0:4])\n\tfmt.Println(n, s[0], s[1], s[2], s[3], s[4])\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestSliceCopyEmit pins the Python a copy lowers to: the _slice_copy intrinsic
+// over the two slices, both lowered plainly since copy moves through the backings
+// and copies neither header.
+func TestSliceCopyEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nfunc main() {\n\tsrc := []int{1, 2, 3}\n\tdst := make([]int, 3)\n\tn := copy(dst, src)\n\t_ = n\n}\n"
+	want := "import " + shim.Name + `
+
+
+def main():
+    src = ` + shim.Name + `._slice_lit([1, 2, 3])
+    dst = ` + shim.Name + `.Slice([0] * 3, 0, 3, 3)
+    n = ` + shim.Name + `._slice_copy(dst, src)
+    _ = n
 
 
 if __name__ == "__main__":

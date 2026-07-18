@@ -295,7 +295,12 @@ func verifyExpr(where string, e Expr) error {
 			}
 		}
 		if e.High != nil {
-			return verifyExpr(where+": high bound", e.High)
+			if err := verifyExpr(where+": high bound", e.High); err != nil {
+				return err
+			}
+		}
+		if e.Max != nil {
+			return verifyExpr(where+": max bound", e.Max)
 		}
 	case *NilSlice:
 		// The nil slice sentinel carries no operand, so there is nothing to check.

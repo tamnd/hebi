@@ -377,15 +377,19 @@ type SliceMake struct {
 	ElemMutable bool
 }
 
-// SliceExpr is the two-index slice expression s[Low:High], which builds a new
-// slice header sharing the operand's backing rather than copying it, so the
-// result aliases the operand the way a Go reslice does. Low or High is nil when
-// the source omitted that bound, and the emitter leaves the corresponding side
-// of the Python slice empty. The three-index form arrives with its own slice.
+// SliceExpr is a slice expression s[Low:High] or the full form s[Low:High:Max],
+// which builds a new slice header sharing the operand's backing rather than
+// copying it, so the result aliases the operand the way a Go reslice does. Low or
+// High is nil when the source omitted that bound, and the two-index emitter leaves
+// the corresponding side of the Python slice empty. Max is nil for the two-index
+// form; when it is set the expression is the full slice, which caps the result's
+// reserved capacity explicitly, and the emitter routes it through the runtime
+// since Python's slice syntax carries no third bound.
 type SliceExpr struct {
 	X    Expr
 	Low  Expr
 	High Expr
+	Max  Expr
 }
 
 // NilSlice is the nil slice sentinel, the zero value a slice variable or a

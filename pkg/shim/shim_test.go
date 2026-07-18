@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "NIL_SLICE", "def _slice_append", "def _grow", "def _decode_rune", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -240,6 +240,72 @@ func TestSliceAppendHelpers(t *testing.T) {
 		"1 8 4 512\n"
 	if got := string(out); got != want {
 		t.Errorf("append helper output = %q, want %q", got, want)
+	}
+}
+
+// TestSliceThreeIndexHelpers runs the full slice surface under CPython: the
+// _subslice3 header shares the operand's backing so a write through it is visible
+// through the operand, its length runs low to high, and its capacity is capped at
+// max minus low rather than running to the end of the backing.
+func TestSliceThreeIndexHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"s = r.Slice([1, 2, 3, 4, 5], 0, 4, 5)\n" +
+		"t = r._subslice3(s, 1, 3, 4)\n" +
+		"print(r.go_str(t), len(t), t.cap)\n" +
+		"t[0] = 99\n" +
+		"print(s[1])"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run three-index helpers: %v\n%s", err, out)
+	}
+	want := "[2 3] 2 3\n99\n"
+	if got := string(out); got != want {
+		t.Errorf("three-index helper output = %q, want %q", got, want)
+	}
+}
+
+// TestSliceCopyHelpers runs the copy surface under CPython: copy moves the overlap
+// of the two slices and returns that count, writing through the destination's
+// backing, and it moves safely when the source and destination overlap in one
+// backing, matching Go's memmove so a forward-overlapping copy runs backward.
+func TestSliceCopyHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"src = r._slice_lit([1, 2, 3])\n" +
+		"dst = r.Slice([0, 0], 0, 2, 2)\n" +
+		"n = r._slice_copy(dst, src)\n" +
+		"print(n, r.go_str(dst))\n" +
+		"s = r._slice_lit([1, 2, 3, 4, 5])\n" +
+		"m = r._slice_copy(r._subslice(s, slice(1, None)), r._subslice(s, slice(0, 4)))\n" +
+		"print(m, r.go_str(s))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run copy helpers: %v\n%s", err, out)
+	}
+	want := "2 [1 2]\n4 [1 1 2 3 4]\n"
+	if got := string(out); got != want {
+		t.Errorf("copy helper output = %q, want %q", got, want)
 	}
 }
 

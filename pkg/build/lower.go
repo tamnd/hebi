@@ -1645,17 +1645,15 @@ func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
 	return &ir.IndexExpr{X: x, Index: index}, nil
 }
 
-// lowerSliceExpr lowers the two-index slice expression s[low:high] to a
-// SliceExpr, which builds a new slice header sharing the operand's backing, so
-// the result aliases the operand the way a Go reslice does. Only a slice operand
-// is supported in this slice: a string reslice yields a string and an array
-// reslice yields a slice sharing the array's backing, and both wait on their own
-// slices. The three-index form, which sets the capacity explicitly, and a max
-// bound wait on the append slice, so they fail loudly here.
+// lowerSliceExpr lowers the slice expression s[low:high] or the full form
+// s[low:high:max] to a SliceExpr, which builds a new slice header sharing the
+// operand's backing, so the result aliases the operand the way a Go reslice does.
+// The full form carries a max bound that caps the result's reserved capacity,
+// which the emitter routes through the runtime since Python's slice syntax has no
+// third bound. Only a slice operand is supported in this slice: a string reslice
+// yields a string and an array reslice yields a slice sharing the array's backing,
+// and both wait on their own slices, so they fail loudly here.
 func (l *lowerer) lowerSliceExpr(e *ast.SliceExpr) (ir.Expr, error) {
-	if e.Slice3 {
-		return nil, l.errf(e.Pos(), "three-index slice expression is not supported yet")
-	}
 	if !isSliceValue(l.pkg.Info.TypeOf(e.X)) {
 		return nil, l.errf(e.Pos(), "slicing %s is not supported yet", l.pkg.Info.TypeOf(e.X))
 	}
@@ -1663,7 +1661,7 @@ func (l *lowerer) lowerSliceExpr(e *ast.SliceExpr) (ir.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	var low, high ir.Expr
+	var low, high, max ir.Expr
 	if e.Low != nil {
 		if low, err = l.lowerExpr(e.Low); err != nil {
 			return nil, err
@@ -1674,7 +1672,12 @@ func (l *lowerer) lowerSliceExpr(e *ast.SliceExpr) (ir.Expr, error) {
 			return nil, err
 		}
 	}
-	return &ir.SliceExpr{X: x, Low: low, High: high}, nil
+	if e.Slice3 {
+		if max, err = l.lowerExpr(e.Max); err != nil {
+			return nil, err
+		}
+	}
+	return &ir.SliceExpr{X: x, Low: low, High: high, Max: max}, nil
 }
 
 func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
@@ -1824,9 +1827,39 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		return l.lowerMake(e)
 	case "append":
 		return l.lowerAppend(e)
+	case "copy":
+		return l.lowerCopy(e)
 	default:
 		return nil, l.errf(e.Pos(), "builtin %s is not supported yet", fun.Name)
 	}
+}
+
+// lowerCopy lowers copy(dst, src) to the _slice_copy intrinsic, which moves the
+// overlap of the two slices element by element and returns the number of elements
+// moved, the smaller of the two lengths. Both arguments are slices lowered
+// plainly, since copy reads the two headers and moves through the backing without
+// copying either header. The runtime handles a source and destination that share
+// a backing the way Go's memmove does, so overlapping regions move safely. copy
+// from a string waits on its own lowering, so it fails loudly here.
+func (l *lowerer) lowerCopy(e *ast.CallExpr) (ir.Expr, error) {
+	if len(e.Args) != 2 {
+		return nil, l.errf(e.Pos(), "copy takes a destination and a source")
+	}
+	if !isSliceValue(l.pkg.Info.TypeOf(e.Args[0])) {
+		return nil, l.errf(e.Pos(), "copy into %s is not supported yet", l.pkg.Info.TypeOf(e.Args[0]))
+	}
+	if !isSliceValue(l.pkg.Info.TypeOf(e.Args[1])) {
+		return nil, l.errf(e.Pos(), "copy from %s is not supported yet", l.pkg.Info.TypeOf(e.Args[1]))
+	}
+	dst, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	src, err := l.lowerExpr(e.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "_slice_copy", Args: []ir.Expr{dst, src}}, nil
 }
 
 // lowerAppend lowers append(s, v1, v2, ...) to the _slice_append intrinsic, which
