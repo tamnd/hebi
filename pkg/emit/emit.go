@@ -205,6 +205,8 @@ func exprUsesShim(e ir.Expr) bool {
 		return true
 	case *ir.Deref:
 		return exprUsesShim(e.X)
+	case *ir.Tuple:
+		return argsUseShim(e.Elems)
 	case *ir.Clone:
 		return exprUsesShim(e.X)
 	case *ir.ArrayClone:
@@ -760,6 +762,12 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.get()", x), nil
+	case *ir.Tuple:
+		parts, err := emitArgs(e.Elems)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("(%s)", parts), nil
 	case *ir.StructLit:
 		parts := make([]string, len(e.Fields))
 		for i, f := range e.Fields {
