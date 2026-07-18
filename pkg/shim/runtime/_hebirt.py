@@ -211,8 +211,8 @@ def _arraykey(a):
 # sub-slicing is bounds-checked against the capacity, matching Go's reslice into
 # reserved capacity. append writes into the shared backing while there is spare
 # capacity and reallocates onto a fresh backing once it is full, which is where an
-# appended-to slice stops aliasing the slices it grew from. copy arrives with its
-# own helper.
+# appended-to slice stops aliasing the slices it grew from. copy moves elements
+# between two slices and handles an overlapping backing the way Go's memmove does.
 
 
 class Slice:
@@ -273,6 +273,20 @@ def _subslice(s, sl):
     return Slice(s.array, s.offset + low, high - low, s.cap - low)
 
 
+def _subslice3(s, low, high, max):
+    """Return the full slice s[low:high:max], its capacity capped at max - low.
+
+    The three-index form sets the capacity explicitly rather than running it to the
+    end of the backing, which is how Go bounds a later append: the returned header
+    can reach only up to max before an append must reallocate. The bounds are
+    checked the Go way, low through high through max, with max itself no larger than
+    the operand's capacity, and any violation raises a bounds panic.
+    """
+    if low < 0 or high < low or max < high or max > s.cap:
+        raise _runtime_error("slice bounds out of range")
+    return Slice(s.array, s.offset + low, high - low, max - low)
+
+
 # The nil slice is a distinct empty header with capacity zero: len and cap are
 # zero, indexing panics, and append to it allocates a fresh backing, so a slice
 # built up from a nil zero value grows the way Go's does. It is the zero value a
@@ -328,6 +342,26 @@ def _grow(oldcap, needed):
     while newcap < needed:
         newcap += (newcap + 3 * 256) >> 2
     return newcap
+
+
+def _slice_copy(dst, src):
+    """Copy min(len(dst), len(src)) elements from src into dst and return the count.
+
+    Go's copy moves as many elements as the shorter slice holds, and it handles a
+    source and destination that overlap in the same backing as if through a
+    temporary, so copying a slice onto a later position of itself does not clobber
+    a source element before it is read. When the two share a backing and the
+    destination starts after the source the copy runs backward to preserve that,
+    matching Go's memmove.
+    """
+    n = dst.length if dst.length < src.length else src.length
+    if dst.array is src.array and dst.offset > src.offset:
+        for k in range(n - 1, -1, -1):
+            dst.array[dst.offset + k] = src.array[src.offset + k]
+    else:
+        for k in range(n):
+            dst.array[dst.offset + k] = src.array[src.offset + k]
+    return n
 
 
 def _runtime_error(msg):

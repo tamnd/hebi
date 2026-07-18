@@ -364,7 +364,8 @@ func TestVerifyArraySurface(t *testing.T) {
 // make, a two-index slice expression, an index write, a cap read off the header,
 // a slice-typed struct field defaulting to the nil sentinel, and the nil sentinel
 // itself, then rejects each node with a nil operand: a slice-literal element, a
-// make length, capacity, or element zero, and a slice expression's operand.
+// make length, capacity, or element zero, a slice expression's operand, and a
+// malformed high or max bound on a slice expression.
 func TestVerifySliceSurface(t *testing.T) {
 	t.Parallel()
 	build := func() *Module {
@@ -410,6 +411,9 @@ func TestVerifySliceSurface(t *testing.T) {
 		}, "nil expression"},
 		{"slice expr malformed high bound", func(m *Module) {
 			m.Funcs[0].Body[2].(*AssignStmt).Value.(*SliceExpr).High = &IntLit{}
+		}, "no text"},
+		{"slice expr malformed max bound", func(m *Module) {
+			m.Funcs[0].Body[2].(*AssignStmt).Value.(*SliceExpr).Max = &IntLit{}
 		}, "no text"},
 	}
 	for _, tt := range tests {

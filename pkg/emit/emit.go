@@ -200,6 +200,11 @@ func exprUsesShim(e ir.Expr) bool {
 		// so each needs the shim import regardless of its operands.
 		return true
 	case *ir.SliceExpr:
+		// The full slice with a max bound names the _subslice3 helper, so it always
+		// needs the shim; a two-index slice needs it only if an operand does.
+		if e.Max != nil {
+			return true
+		}
 		return exprUsesShim(e.X) || exprUsesShim(e.Low) || exprUsesShim(e.High)
 	case *ir.StructLit:
 		for _, f := range e.Fields {
@@ -752,6 +757,20 @@ func emitExpr(e ir.Expr) (string, error) {
 			if err != nil {
 				return "", err
 			}
+		}
+		if e.Max != nil {
+			// The full slice caps the reserved capacity, which Python's slice syntax
+			// cannot express, so it routes through the runtime helper. A low bound that
+			// the source omitted defaults to zero there, since the helper takes it as an
+			// explicit offset rather than an empty slot.
+			max, err := emitExpr(e.Max)
+			if err != nil {
+				return "", err
+			}
+			if low == "" {
+				low = "0"
+			}
+			return fmt.Sprintf("%s._subslice3(%s, %s, %s, %s)", shim.Name, x, low, high, max), nil
 		}
 		return fmt.Sprintf("%s[%s:%s]", x, low, high), nil
 	case *ir.NilSlice:
