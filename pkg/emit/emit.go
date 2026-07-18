@@ -142,6 +142,13 @@ func blockUsesShim(body []ir.Stmt) bool {
 			if exprUsesShim(s.Value) {
 				return true
 			}
+		case *ir.TupleAssign:
+			if exprUsesShim(s.Value) {
+				return true
+			}
+		case *ir.RangeMap:
+			// A range over a map always calls the snapshot helper in the shim.
+			return true
 		case *ir.SetField:
 			if exprUsesShim(s.Object) || exprUsesShim(s.Value) {
 				return true
@@ -199,6 +206,15 @@ func exprUsesShim(e ir.Expr) bool {
 		// A slice literal, a make, and the nil sentinel all name a runtime helper,
 		// so each needs the shim import regardless of its operands.
 		return true
+	case *ir.NilMap:
+		// The nil map sentinel names a runtime helper, so it needs the shim import.
+		return true
+	case *ir.MapLit:
+		for _, en := range e.Entries {
+			if exprUsesShim(en.Key) || exprUsesShim(en.Value) {
+				return true
+			}
+		}
 	case *ir.SliceExpr:
 		// The full slice with a max bound names the _subslice3 helper, so it always
 		// needs the shim; a two-index slice needs it only if an operand does.
@@ -401,6 +417,19 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		}
 		writeIndent(b, depth)
 		fmt.Fprintf(b, "%s = %s\n", s.Name, value)
+	case *ir.TupleAssign:
+		// A comma-ok read binds two names from one tuple-valued call, v, ok = ...,
+		// which Python unpacks positionally; := and = read the same here.
+		value, err := emitExpr(s.Value)
+		if err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "%s = %s\n", strings.Join(s.Names, ", "), value)
+	case *ir.RangeMap:
+		if err := emitRangeMap(b, s, depth); err != nil {
+			return err
+		}
 	case *ir.SetField:
 		obj, err := emitExpr(s.Object)
 		if err != nil {
@@ -542,6 +571,29 @@ func emitForRange(b *strings.Builder, s *ir.ForRange, depth int) error {
 	}
 	writeIndent(b, depth)
 	fmt.Fprintf(b, "for %s in range(%s):\n", name, args)
+	return emitBlock(b, s.Body, depth+1)
+}
+
+// emitRangeMap writes the for loop a range over a map lowers to. It iterates a
+// snapshot the runtime takes of the map's items or keys, so a delete during the
+// range is safe the way Go's is and the nil map yields nothing. A key-and-value
+// range walks the items, a key-only range walks the keys, and a blank target
+// spends the throwaway name so the iteration still runs.
+func emitRangeMap(b *strings.Builder, s *ir.RangeMap, depth int) error {
+	src, err := emitExpr(s.Source)
+	if err != nil {
+		return err
+	}
+	key := s.Key
+	if key == "" {
+		key = "_"
+	}
+	writeIndent(b, depth)
+	if s.Value != "" {
+		fmt.Fprintf(b, "for %s, %s in %s._map_items(%s):\n", key, s.Value, shim.Name, src)
+	} else {
+		fmt.Fprintf(b, "for %s in %s._map_keys(%s):\n", key, shim.Name, src)
+	}
 	return emitBlock(b, s.Body, depth+1)
 }
 
@@ -775,6 +827,22 @@ func emitExpr(e ir.Expr) (string, error) {
 		return fmt.Sprintf("%s[%s:%s]", x, low, high), nil
 	case *ir.NilSlice:
 		return shim.Name + ".NIL_SLICE", nil
+	case *ir.MapLit:
+		parts := make([]string, len(e.Entries))
+		for i, en := range e.Entries {
+			key, err := emitExpr(en.Key)
+			if err != nil {
+				return "", err
+			}
+			value, err := emitExpr(en.Value)
+			if err != nil {
+				return "", err
+			}
+			parts[i] = key + ": " + value
+		}
+		return "{" + strings.Join(parts, ", ") + "}", nil
+	case *ir.NilMap:
+		return shim.Name + ".NIL_MAP", nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}

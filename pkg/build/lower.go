@@ -417,6 +417,11 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		// copy, exactly the shallow-sharing a nil slice value wants.
 		return &ir.NilSlice{}, nil
 	}
+	if _, ok := t.Underlying().(*types.Map); ok {
+		// A map is a reference too, so its zero value is the nil map sentinel, which
+		// reads as empty and panics on write exactly as a Go nil map does.
+		return &ir.NilMap{}, nil
+	}
 	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
 		switch info := basic.Info(); {
@@ -483,6 +488,58 @@ func isSliceValue(t types.Type) bool {
 	return ok
 }
 
+// isMapValue reports whether a type is a Go map, which like a slice is a
+// reference: it aliases rather than copies, so a map value read is never cloned
+// and a nil map reads as empty yet panics on write.
+func isMapValue(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Map)
+	return ok
+}
+
+// checkMapKey rejects the map key types this slice does not carry. A basic key
+// such as an int or a string is hashable in Python as it is, and a comparable
+// struct key carries the generated hash and equality, so both pass. An array key
+// is comparable in Go but lowers to a mutable, unhashable Python list, so it waits
+// on the tuple-key form a later slice adds and fails loudly here.
+func (l *lowerer) checkMapKey(key types.Type, pos token.Pos) error {
+	switch key.Underlying().(type) {
+	case *types.Basic, *types.Struct:
+		return nil
+	default:
+		return l.errf(pos, "map with a %s key is not supported yet", key)
+	}
+}
+
+// cloneForType wraps x in the value copy a struct or an array read owes, and
+// returns nil for a reference or scalar type that shares or copies on its own.
+// It is the clone the comma-ok read and the map range inject when they bind a
+// value the caller may mutate independently of the map.
+func (l *lowerer) cloneForType(t types.Type, x ir.Expr) ir.Expr {
+	switch {
+	case isStructValue(t):
+		return &ir.Clone{X: x}
+	case isArrayValue(t):
+		return &ir.ArrayClone{X: x}
+	default:
+		return nil
+	}
+}
+
+// astUnparen strips any enclosing parentheses from an expression, so a
+// parenthesized comma-ok source such as (m[k]) is recognized as a map index.
+func astUnparen(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok {
+			return e
+		}
+		e = p.X
+	}
+}
+
 // compoundOps maps a Go compound-assignment token to the plain binary operator
 // and the token narrow reads to decide masking. Only the operators whose binary
 // form hebi already lowers are here; division, remainder, and the bitwise family
@@ -501,6 +558,11 @@ var compoundOps = map[token.Token]struct {
 func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if s.Tok != token.DEFINE && s.Tok != token.ASSIGN {
 		return l.lowerCompoundAssign(s)
+	}
+	if len(s.Lhs) == 2 && len(s.Rhs) == 1 {
+		// A two-target assignment from one value is the comma-ok read v, ok := m[k];
+		// other two-value forms wait on their own slices and fail loudly there.
+		return l.lowerMapCommaOk(s)
 	}
 	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
@@ -530,10 +592,16 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		// An array element assignment writes through the backing list, and a slice
 		// element assignment writes through the Slice header's __setitem__, which
 		// reaches the shared backing so an aliasing slice sees the write. A map index
-		// target waits on its own type.
+		// assignment writes the entry through the dict, and a write to a nil map
+		// raises through the sentinel's __setitem__, exactly as Go panics.
 		xt := l.pkg.Info.TypeOf(lhs.X)
-		if !isArrayValue(xt) && !isSliceValue(xt) {
+		if !isArrayValue(xt) && !isSliceValue(xt) && !isMapValue(xt) {
 			return nil, l.errf(lhs.Pos(), "index assignment to %s is not supported yet", xt)
+		}
+		if mp, ok := xt.Underlying().(*types.Map); ok {
+			if err := l.checkMapKey(mp.Key(), lhs.Pos()); err != nil {
+				return nil, err
+			}
 		}
 		obj, err := l.lowerExpr(lhs.X)
 		if err != nil {
@@ -543,11 +611,71 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
+		if isMapValue(xt) {
+			// Go copies the key into the map on insert, so a struct key is cloned; a
+			// basic key is left alone by copyIfValueRead.
+			index = l.copyIfValueRead(lhs.Index, index)
+		}
 		value = l.copyIfValueRead(s.Rhs[0], value)
 		return []ir.Stmt{&ir.SetIndex{Object: obj, Index: index, Value: value}}, nil
 	default:
 		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
 	}
+}
+
+// lowerMapCommaOk lowers the two-value map read v, ok := m[k], which binds the
+// value and a boolean that is true when the key was present. It becomes a tuple
+// assignment from the _map_lookup helper, which returns the pair, and when the
+// value type is a struct or an array the bound value is cloned afterward so it is
+// an independent copy the body may mutate, matching the single-value read. A
+// two-value assignment whose right side is not a map index, a type assertion or a
+// channel receive, waits on its own slice, so it fails loudly.
+func (l *lowerer) lowerMapCommaOk(s *ast.AssignStmt) ([]ir.Stmt, error) {
+	idx, ok := astUnparen(s.Rhs[0]).(*ast.IndexExpr)
+	if !ok || !isMapValue(l.pkg.Info.TypeOf(idx.X)) {
+		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
+	}
+	valName := tupleName(s.Lhs[0])
+	okName := tupleName(s.Lhs[1])
+	if valName == "" || okName == "" {
+		return nil, l.errf(s.Pos(), "the comma-ok read binds two plain names")
+	}
+	mp := l.pkg.Info.TypeOf(idx.X).Underlying().(*types.Map)
+	if err := l.checkMapKey(mp.Key(), s.Pos()); err != nil {
+		return nil, err
+	}
+	m, err := l.lowerExpr(idx.X)
+	if err != nil {
+		return nil, err
+	}
+	key, err := l.lowerExpr(idx.Index)
+	if err != nil {
+		return nil, err
+	}
+	zero, err := l.zeroValueOfType(mp.Elem(), s.Pos())
+	if err != nil {
+		return nil, err
+	}
+	out := []ir.Stmt{&ir.TupleAssign{
+		Names:  []string{valName, okName},
+		Value:  &ir.Intrinsic{Name: "_map_lookup", Args: []ir.Expr{m, key, zero}},
+		Define: s.Tok == token.DEFINE,
+	}}
+	if valName != "_" {
+		if clone := l.cloneForType(mp.Elem(), &ir.Ident{Name: valName}); clone != nil {
+			out = append(out, &ir.AssignStmt{Name: valName, Value: clone})
+		}
+	}
+	return out, nil
+}
+
+// tupleName returns the name of a comma-ok target, or the empty string when the
+// target is not a plain identifier, which the caller rejects.
+func tupleName(e ast.Expr) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return id.Name
+	}
+	return ""
 }
 
 // lowerFieldTarget lowers the object of a field-assignment target, s.field = v,
@@ -757,6 +885,10 @@ func rewriteJumps(stmts []ir.Stmt, innerLabel string, innerStep []ir.Stmt, used 
 			out = unwindLoop(out, s, &s.Body, s.Label, nil, innerLabel, innerStep, escapes, used)
 		case *ir.RangeString:
 			out = unwindLoop(out, s, &s.Body, s.Label, s.ContinueStep, innerLabel, innerStep, escapes, used)
+		case *ir.RangeMap:
+			// A range over a map advances on its own like a for-in-range, so a
+			// continue to it owes no step.
+			out = unwindLoop(out, s, &s.Body, s.Label, nil, innerLabel, innerStep, escapes, used)
 		default:
 			out = append(out, s)
 		}
@@ -1280,6 +1412,9 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt, label string) ([]ir.Stmt, error) 
 		return nil, l.errf(s.Pos(), "range with %s is not supported yet", s.Tok)
 	}
 	srcType := l.pkg.Info.TypeOf(s.X)
+	if mp, ok := srcType.Underlying().(*types.Map); ok {
+		return l.lowerRangeMap(s, mp, label)
+	}
 	basic, ok := srcType.Underlying().(*types.Basic)
 	if !ok {
 		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
@@ -1347,6 +1482,46 @@ func (l *lowerer) lowerRangeInt(s *ast.RangeStmt, label string) ([]ir.Stmt, erro
 		return nil, err
 	}
 	return []ir.Stmt{&ir.ForRange{Var: rangeIdent(s.Key), Stop: stop, Body: body, Label: label}}, nil
+}
+
+// lowerRangeMap lowers a range over a map to a RangeMap, which the emitter turns
+// into a for over a snapshot of the map's keys or key-value pairs. Go visits the
+// entries in a random order and lets the body delete an entry it has not reached,
+// so the snapshot, taken by the shim helper before the loop, makes a delete during
+// the range safe the way Python's live-dict iteration is not. A key-only range
+// binds the key, a two-variable range binds the key and the value, and a blank in
+// either position drops that binding. Each iteration binds a fresh copy of a
+// struct or array key or value, so the body may mutate it without reaching back
+// into the map, matching Go.
+func (l *lowerer) lowerRangeMap(s *ast.RangeStmt, mp *types.Map, label string) ([]ir.Stmt, error) {
+	if err := l.checkMapKey(mp.Key(), s.Pos()); err != nil {
+		return nil, err
+	}
+	src, err := l.lowerExpr(s.X)
+	if err != nil {
+		return nil, err
+	}
+	keyName := rangeIdent(s.Key)
+	valName := rangeIdent(s.Value)
+	body, err := l.lowerLoopBlock(s.Body, label)
+	if err != nil {
+		return nil, err
+	}
+	// The per-iteration copies are prepended to the body, so a struct value the
+	// body mutates is its own copy, not the one the map still holds.
+	var pre []ir.Stmt
+	if valName != "" {
+		if clone := l.cloneForType(mp.Elem(), &ir.Ident{Name: valName}); clone != nil {
+			pre = append(pre, &ir.AssignStmt{Name: valName, Value: clone})
+		}
+	}
+	if keyName != "" {
+		if clone := l.cloneForType(mp.Key(), &ir.Ident{Name: keyName}); clone != nil {
+			pre = append(pre, &ir.AssignStmt{Name: keyName, Value: clone})
+		}
+	}
+	body = append(pre, body...)
+	return []ir.Stmt{&ir.RangeMap{Key: keyName, Value: valName, Source: src, Body: body, Label: label}}, nil
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
@@ -1455,6 +1630,9 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	if _, ok := t.Underlying().(*types.Slice); ok {
 		return l.lowerSliceLit(e)
 	}
+	if mp, ok := t.Underlying().(*types.Map); ok {
+		return l.lowerMapLit(e, mp)
+	}
 	named, ok := t.(*types.Named)
 	if !ok {
 		return nil, l.errf(e.Pos(), "composite literal of %s is not supported yet", t)
@@ -1548,6 +1726,37 @@ func (l *lowerer) lowerSliceLit(e *ast.CompositeLit) (ir.Expr, error) {
 	return &ir.SliceLit{Elems: elems}, nil
 }
 
+// lowerMapLit lowers a map composite literal to a MapLit, a Python dict of its
+// entries. A map literal has only the keyed form, so every element is a key-value
+// pair. A struct key or a struct or array value that reads an existing value is
+// cloned, so the dict owns independent copies the way Go stores independent keys
+// and values.
+func (l *lowerer) lowerMapLit(e *ast.CompositeLit, mp *types.Map) (ir.Expr, error) {
+	if err := l.checkMapKey(mp.Key(), e.Pos()); err != nil {
+		return nil, err
+	}
+	entries := make([]ir.MapEntry, 0, len(e.Elts))
+	for _, elt := range e.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			return nil, l.errf(elt.Pos(), "a map literal element must be a key-value pair")
+		}
+		key, err := l.lowerExpr(kv.Key)
+		if err != nil {
+			return nil, err
+		}
+		value, err := l.lowerExpr(kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, ir.MapEntry{
+			Key:   l.copyIfValueRead(kv.Key, key),
+			Value: l.copyIfValueRead(kv.Value, value),
+		})
+	}
+	return &ir.MapLit{Entries: entries}, nil
+}
+
 // ctorKeyword returns the constructor keyword for a keyed field of a struct,
 // applying the same shadow-avoiding rule the emitter uses so a keyed literal's
 // keyword matches the parameter name. When the struct is not in the table, which
@@ -1631,6 +1840,8 @@ func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
 	case *types.Slice:
 		// A slice index reads through the Slice header, which applies the offset and
 		// the bounds check; a value element is cloned by the caller, not here.
+	case *types.Map:
+		return l.lowerMapIndex(e, u)
 	default:
 		return nil, l.errf(e.Pos(), "indexing %s is not supported yet", xType)
 	}
@@ -1643,6 +1854,31 @@ func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
 		return nil, err
 	}
 	return &ir.IndexExpr{X: x, Index: index}, nil
+}
+
+// lowerMapIndex lowers a single-value map read m[k] to the _map_index intrinsic,
+// which returns the stored value or, on a missing key, the value type's zero, so
+// the read never fails the way a Go map read does not. A struct or array value the
+// read binds is cloned by the caller through copyIfValueRead, exactly as a slice
+// element read is, so it is not cloned here. The two-value comma-ok form is a
+// different lowering the assignment handles, so it never reaches here.
+func (l *lowerer) lowerMapIndex(e *ast.IndexExpr, mp *types.Map) (ir.Expr, error) {
+	if err := l.checkMapKey(mp.Key(), e.Pos()); err != nil {
+		return nil, err
+	}
+	m, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	key, err := l.lowerExpr(e.Index)
+	if err != nil {
+		return nil, err
+	}
+	zero, err := l.zeroValueOfType(mp.Elem(), e.Pos())
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "_map_index", Args: []ir.Expr{m, key, zero}}, nil
 }
 
 // lowerSliceExpr lowers the slice expression s[low:high] or the full form
@@ -1829,9 +2065,52 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		return l.lowerAppend(e)
 	case "copy":
 		return l.lowerCopy(e)
+	case "delete":
+		return l.lowerDelete(e)
+	case "clear":
+		return l.lowerClear(e)
 	default:
 		return nil, l.errf(e.Pos(), "builtin %s is not supported yet", fun.Name)
 	}
+}
+
+// lowerDelete lowers delete(m, k) to the _map_delete intrinsic, which removes the
+// key when present and does nothing otherwise, including on a nil map, matching
+// Go's delete. The key is read, not stored, so it is not cloned.
+func (l *lowerer) lowerDelete(e *ast.CallExpr) (ir.Expr, error) {
+	if len(e.Args) != 2 {
+		return nil, l.errf(e.Pos(), "delete takes a map and a key")
+	}
+	if !isMapValue(l.pkg.Info.TypeOf(e.Args[0])) {
+		return nil, l.errf(e.Pos(), "delete from %s is not supported yet", l.pkg.Info.TypeOf(e.Args[0]))
+	}
+	m, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	key, err := l.lowerExpr(e.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "_map_delete", Args: []ir.Expr{m, key}}, nil
+}
+
+// lowerClear lowers clear(m) on a map to the _map_clear intrinsic, which removes
+// every entry and is a no-op on a nil map. clear of a slice zeroes its elements
+// in place, a different operation that waits on its own lowering, so it fails
+// loudly here.
+func (l *lowerer) lowerClear(e *ast.CallExpr) (ir.Expr, error) {
+	if len(e.Args) != 1 {
+		return nil, l.errf(e.Pos(), "clear takes one argument")
+	}
+	if !isMapValue(l.pkg.Info.TypeOf(e.Args[0])) {
+		return nil, l.errf(e.Pos(), "clear of %s is not supported yet", l.pkg.Info.TypeOf(e.Args[0]))
+	}
+	m, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "_map_clear", Args: []ir.Expr{m}}, nil
 }
 
 // lowerCopy lowers copy(dst, src) to the _slice_copy intrinsic, which moves the
@@ -1901,6 +2180,14 @@ func (l *lowerer) lowerAppend(e *ast.CallExpr) (ir.Expr, error) {
 // loudly here.
 func (l *lowerer) lowerMake(e *ast.CallExpr) (ir.Expr, error) {
 	t := l.pkg.Info.TypeOf(e)
+	if mp, ok := t.Underlying().(*types.Map); ok {
+		// make of a map builds an empty dict; the optional size argument is only a
+		// capacity hint, which a Python dict has no use for, so it is dropped.
+		if err := l.checkMapKey(mp.Key(), e.Pos()); err != nil {
+			return nil, err
+		}
+		return &ir.MapLit{}, nil
+	}
 	slice, ok := t.Underlying().(*types.Slice)
 	if !ok {
 		return nil, l.errf(e.Pos(), "make of %s is not supported yet", t)

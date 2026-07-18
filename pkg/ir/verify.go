@@ -98,6 +98,21 @@ func verifyStmt(where string, s Stmt) error {
 			return fmt.Errorf("ir: %s assigns to an empty name", where)
 		}
 		return verifyExpr(where+": value", s.Value)
+	case *TupleAssign:
+		if len(s.Names) < 2 {
+			return fmt.Errorf("ir: %s assigns a tuple to fewer than two names", where)
+		}
+		for i, n := range s.Names {
+			if n == "" {
+				return fmt.Errorf("ir: %s: tuple target %d has no name", where, i)
+			}
+		}
+		return verifyExpr(where+": value", s.Value)
+	case *RangeMap:
+		if err := verifyExpr(where+": range source", s.Source); err != nil {
+			return err
+		}
+		return verifyBlock(where+": body", s.Body)
 	case *SetField:
 		if s.Name == "" {
 			return fmt.Errorf("ir: %s assigns to an empty field name", where)
@@ -304,6 +319,17 @@ func verifyExpr(where string, e Expr) error {
 		}
 	case *NilSlice:
 		// The nil slice sentinel carries no operand, so there is nothing to check.
+	case *MapLit:
+		for i, en := range e.Entries {
+			if err := verifyExpr(fmt.Sprintf("%s: entry %d key", where, i), en.Key); err != nil {
+				return err
+			}
+			if err := verifyExpr(fmt.Sprintf("%s: entry %d value", where, i), en.Value); err != nil {
+				return err
+			}
+		}
+	case *NilMap:
+		// The nil map sentinel carries no operand, so there is nothing to check.
 	default:
 		return fmt.Errorf("ir: %s is an unknown expression type %T", where, e)
 	}

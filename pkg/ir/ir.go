@@ -187,6 +187,31 @@ type RangeString struct {
 	ContinueStep []Stmt
 }
 
+// TupleAssign binds a tuple-valued expression to several names at once,
+// Names = Value, matching a Go comma-ok read v, ok := m[k]. Define is true for a
+// short declaration and false for a plain assignment, though Python draws no
+// distinction so the emitter renders both as a tuple target. A blank name in
+// Names is the throwaway, which Python allows as an ordinary target.
+type TupleAssign struct {
+	Names  []string
+	Value  Expr
+	Define bool
+}
+
+// RangeMap is a range over a map, for k, v := range m or for k := range m, which
+// iterates a snapshot of the map's items or keys so a delete during the range is
+// safe the way Go's is. Key is the key variable and Value is the value variable,
+// either empty when the Go program used the blank identifier or omitted the
+// clause; when Value is empty the loop ranges the keys alone. Source is the map,
+// which the runtime snapshots and reads as empty when it is the nil map.
+type RangeMap struct {
+	Key    string
+	Value  string
+	Source Expr
+	Body   []Stmt
+	Label  string
+}
+
 // SetField assigns to a struct field, obj.Name = Value, matching a Go field
 // assignment. Object is the struct instance expression.
 type SetField struct {
@@ -221,6 +246,8 @@ type LabeledContinue struct{ Label string }
 func (*ExprStmt) isStmt()        {}
 func (*ReturnStmt) isStmt()      {}
 func (*AssignStmt) isStmt()      {}
+func (*TupleAssign) isStmt()     {}
+func (*RangeMap) isStmt()        {}
 func (*SetField) isStmt()        {}
 func (*SetIndex) isStmt()        {}
 func (*IfStmt) isStmt()          {}
@@ -398,6 +425,25 @@ type SliceExpr struct {
 // share, and an append to it allocates a fresh backing.
 type NilSlice struct{}
 
+// MapLit builds a Go map literal or a make(map) as a Python dict, {k: v, ...},
+// with the entries in source order. An empty Entries list builds an empty dict,
+// the form both map[K]V{} and make(map[K]V) take, distinct from the nil map. A
+// value entry that reads an existing value is cloned by the lowering so the map
+// owns an independent copy.
+type MapLit struct{ Entries []MapEntry }
+
+// MapEntry is one key-value pair of a map literal.
+type MapEntry struct {
+	Key   Expr
+	Value Expr
+}
+
+// NilMap is the nil map sentinel, the zero value a map variable or a map-typed
+// struct field takes. It is the runtime's shared empty map, which reads as empty
+// and yields no iterations, and panics with Go's "assignment to entry in nil map"
+// on any write, so a read-only use is fine and a write is a panic, exactly as Go.
+type NilMap struct{}
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -428,3 +474,5 @@ func (*SliceLit) isExpr()    {}
 func (*SliceMake) isExpr()   {}
 func (*SliceExpr) isExpr()   {}
 func (*NilSlice) isExpr()    {}
+func (*MapLit) isExpr()      {}
+func (*NilMap) isExpr()      {}
