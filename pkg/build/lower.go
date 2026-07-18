@@ -1822,9 +1822,42 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		return &ir.CallExpr{Name: "len", Args: []ir.Expr{arg}}, nil
 	case "make":
 		return l.lowerMake(e)
+	case "append":
+		return l.lowerAppend(e)
 	default:
 		return nil, l.errf(e.Pos(), "builtin %s is not supported yet", fun.Name)
 	}
+}
+
+// lowerAppend lowers append(s, v1, v2, ...) to the _slice_append intrinsic, which
+// writes into the shared backing while there is capacity and reallocates onto a
+// fresh backing once it is full, matching Go's growth and its aliasing. The first
+// argument is the slice, lowered plainly because append reads its header and does
+// not copy it, and each appended value goes through the value copy Go performs
+// when a value type is stored into the backing, so a struct or an array is cloned
+// in. The spread form append(s, other...) waits on its own lowering, so it fails
+// loudly.
+func (l *lowerer) lowerAppend(e *ast.CallExpr) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "append with a spread argument is not supported yet")
+	}
+	if len(e.Args) < 1 {
+		return nil, l.errf(e.Pos(), "append needs a slice")
+	}
+	slice, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	args := make([]ir.Expr, 0, len(e.Args))
+	args = append(args, slice)
+	for _, a := range e.Args[1:] {
+		v, err := l.lowerExpr(a)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, l.copyIfValueRead(a, v))
+	}
+	return &ir.Intrinsic{Name: "_slice_append", Args: args}, nil
 }
 
 // lowerMake lowers make([]T, len) and make([]T, len, cap) to a SliceMake, a
