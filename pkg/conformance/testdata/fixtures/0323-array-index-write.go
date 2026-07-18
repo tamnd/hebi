@@ -1,0 +1,9 @@
+package main
+
+import "fmt"
+
+func main() {
+	a := [3]int{1, 2, 3}
+	a[2] = 99
+	fmt.Println(a)
+}
