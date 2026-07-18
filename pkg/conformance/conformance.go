@@ -9,9 +9,31 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 
 	"github.com/tamnd/hebi/pkg/build"
 )
+
+// goRunTokens bounds how many go run oracles compile at once. Every fixture
+// spawns go run in its own parallel subtest, and go run drives the Go compiler
+// and linker, which are memory heavy. Left unbounded, a wide t.Parallel fan-out
+// across the whole fixture band launches one compile per core at peak, which
+// spikes memory far past what the small program sizes suggest, especially under
+// the race detector. A token per allowed compile caps that peak while leaving
+// the cheaper compiled and python steps free to run.
+var goRunTokens = make(chan struct{}, maxGoRun())
+
+// maxGoRun is the compile ceiling: a small fraction of the cores so the oracle
+// stays parallel enough to be quick without letting concurrent compiles stack
+// up. It never drops below two so a single-core runner still overlaps a compile
+// with a python run.
+func maxGoRun() int {
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < 2 {
+		return 2
+	}
+	return n
+}
 
 // Observation is a program run's observable behavior: what the differential
 // oracle compares across tiers. At M0 that is standard output and the exit
@@ -41,6 +63,12 @@ func stage(dir, source string) (string, error) {
 // RunGo observes a fixture under the go tool with go run. It is the oracle every
 // other tier is checked against.
 func RunGo(ctx context.Context, source string) (Observation, error) {
+	select {
+	case goRunTokens <- struct{}{}:
+		defer func() { <-goRunTokens }()
+	case <-ctx.Done():
+		return Observation{}, ctx.Err()
+	}
 	dir, err := os.MkdirTemp("", "hebi-go-*")
 	if err != nil {
 		return Observation{}, err
