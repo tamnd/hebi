@@ -582,7 +582,7 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"keyed array element", "package main\n\nfunc main() {\n\ta := [3]int{0: 1, 2: 3}\n\t_ = a\n}\n"},
 		{"keyed slice element", "package main\n\nfunc main() {\n\ts := []int{0: 1, 2: 3}\n\t_ = s\n}\n"},
 		{"array reslice", "package main\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\ts := a[0:2]\n\t_ = s\n}\n"},
-		{"make of a map", "package main\n\nfunc main() {\n\tm := make(map[int]int)\n\t_ = m\n}\n"},
+		{"map with an array key", "package main\n\nfunc main() {\n\tm := map[[2]int]int{}\n\t_ = m\n}\n"},
 		{"append spread", "package main\n\nfunc main() {\n\ta := []int{1, 2}\n\tb := []int{3, 4}\n\ta = append(a, b...)\n\t_ = a\n}\n"},
 	}
 	for _, tt := range tests {
@@ -1373,6 +1373,116 @@ def main():
     dst = ` + shim.Name + `.Slice([0] * 3, 0, 3, 3)
     n = ` + shim.Name + `._slice_copy(dst, src)
     _ = n
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestMaps checks the map surface against go run: a literal and a make build a
+// dict, an index reads a present value or the value type's zero on a miss, an
+// index target writes an entry, the comma-ok read reports presence, delete removes
+// a key and is a no-op on a missing one, clear empties the map, len counts the
+// entries, fmt prints the entries with sorted keys, and a range walks a snapshot so
+// a delete during it is safe. It also covers the nil map, which reads as empty,
+// prints as map[], and reports absence, and the value and key copies a struct map
+// makes so a mutation never reaches back into the map.
+func TestMaps(t *testing.T) {
+	t.Parallel()
+	const pre = "package main\n\nimport \"fmt\"\n\n"
+	const boxPre = pre + "type Box struct {\n\tN int\n}\n\n"
+	const pointPre = pre + "type Point struct {\n\tX int\n\tY int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"literal and read", pre + "func main() {\n\tm := map[string]int{\"a\": 1, \"b\": 2}\n\tfmt.Println(m[\"a\"], m[\"b\"])\n}\n"},
+		{"make and write", pre + "func main() {\n\tm := make(map[string]int)\n\tm[\"x\"] = 5\n\tm[\"y\"] = 7\n\tfmt.Println(m[\"x\"], m[\"y\"])\n}\n"},
+		{"read missing is zero", pre + "func main() {\n\tm := map[string]int{\"a\": 1}\n\tfmt.Println(m[\"z\"])\n}\n"},
+		{"write overwrites", pre + "func main() {\n\tm := map[string]int{\"a\": 1}\n\tm[\"a\"] = 9\n\tfmt.Println(m[\"a\"])\n}\n"},
+		{"comma-ok present and absent", pre + "func main() {\n\tm := map[string]int{\"a\": 1}\n\tv, ok := m[\"a\"]\n\tw, ok2 := m[\"z\"]\n\tfmt.Println(v, ok, w, ok2)\n}\n"},
+		{"delete then check", pre + "func main() {\n\tm := map[string]int{\"a\": 1, \"b\": 2}\n\tdelete(m, \"a\")\n\t_, ok := m[\"a\"]\n\tfmt.Println(ok, len(m))\n}\n"},
+		{"delete missing is a no-op", pre + "func main() {\n\tm := map[string]int{\"a\": 1}\n\tdelete(m, \"z\")\n\tfmt.Println(len(m))\n}\n"},
+		{"len counts entries", pre + "func main() {\n\tm := map[int]int{1: 1, 2: 2, 3: 3}\n\tfmt.Println(len(m))\n}\n"},
+		{"print sorts string keys", pre + "func main() {\n\tm := map[string]int{\"b\": 2, \"a\": 1, \"c\": 3}\n\tfmt.Println(m)\n}\n"},
+		{"print sorts int keys", pre + "func main() {\n\tm := map[int]string{3: \"c\", 1: \"a\", 2: \"b\"}\n\tfmt.Println(m)\n}\n"},
+		{"print empty map", pre + "func main() {\n\tm := make(map[int]int)\n\tfmt.Println(m)\n}\n"},
+		{"bool value default", pre + "func main() {\n\tm := map[string]bool{\"a\": true}\n\tfmt.Println(m[\"a\"], m[\"z\"])\n}\n"},
+		{"clear empties the map", pre + "func main() {\n\tm := map[string]int{\"a\": 1, \"b\": 2}\n\tclear(m)\n\tfmt.Println(len(m))\n}\n"},
+		{"range sums values", pre + "func main() {\n\tm := map[string]int{\"a\": 1, \"b\": 2, \"c\": 3}\n\tsum := 0\n\tfor _, v := range m {\n\t\tsum += v\n\t}\n\tfmt.Println(sum)\n}\n"},
+		{"range sums keys", pre + "func main() {\n\tm := map[int]int{1: 0, 2: 0, 4: 0}\n\tn := 0\n\tfor k := range m {\n\t\tn += k\n\t}\n\tfmt.Println(n)\n}\n"},
+		{"range key and value", pre + "func main() {\n\tm := map[int]int{1: 10, 2: 20}\n\ts := 0\n\tfor k, v := range m {\n\t\ts += k * v\n\t}\n\tfmt.Println(s)\n}\n"},
+		{"delete during range", pre + "func main() {\n\tm := map[int]int{1: 1, 2: 2, 3: 3}\n\tfor k := range m {\n\t\tif k == 2 {\n\t\t\tdelete(m, 2)\n\t\t}\n\t}\n\tfmt.Println(len(m))\n}\n"},
+		{"nil map reads empty", pre + "func main() {\n\tvar m map[string]int\n\tfmt.Println(m[\"x\"], len(m))\n}\n"},
+		{"nil map prints empty", pre + "func main() {\n\tvar m map[string]int\n\tfmt.Println(m)\n}\n"},
+		{"nil map comma-ok", pre + "func main() {\n\tvar m map[string]int\n\tv, ok := m[\"x\"]\n\tfmt.Println(v, ok)\n}\n"},
+		{"nil map delete is a no-op", pre + "func main() {\n\tvar m map[string]int\n\tdelete(m, \"x\")\n\tfmt.Println(len(m))\n}\n"},
+		{"nil map ranges nothing", pre + "func main() {\n\tvar m map[int]int\n\tn := 0\n\tfor range m {\n\t\tn++\n\t}\n\tfmt.Println(n)\n}\n"},
+		{"struct value read copies", boxPre + "func main() {\n\tm := map[string]Box{\"a\": {1}}\n\tb := m[\"a\"]\n\tb.N = 99\n\tfmt.Println(m[\"a\"].N, b.N)\n}\n"},
+		{"struct value comma-ok copies", boxPre + "func main() {\n\tm := map[string]Box{\"a\": {5}}\n\tb, ok := m[\"a\"]\n\tb.N = 42\n\tfmt.Println(m[\"a\"].N, b.N, ok)\n}\n"},
+		{"struct key lookup", pointPre + "func main() {\n\tm := map[Point]int{}\n\tm[Point{1, 2}] = 7\n\tfmt.Println(m[Point{1, 2}], m[Point{3, 4}])\n}\n"},
+		{"struct key copies on insert", pointPre + "func main() {\n\tp := Point{1, 2}\n\tm := map[Point]int{}\n\tm[p] = 5\n\tp.X = 9\n\tfmt.Println(m[Point{1, 2}], m[Point{9, 2}])\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestMapEmit pins the Python the map operations lower to: a make is an empty
+// dict, an index target writes an entry, an index read routes through _map_index
+// with the value type's zero, the comma-ok read is a tuple assignment from
+// _map_lookup, and delete and clear are their intrinsics. A Go string key is
+// Python bytes, so it emits with the b prefix.
+func TestMapEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nfunc main() {\n\tm := make(map[string]int)\n\tm[\"a\"] = 1\n\tx := m[\"a\"]\n\tv, ok := m[\"b\"]\n\tdelete(m, \"a\")\n\tclear(m)\n\t_ = x\n\t_ = v\n\t_ = ok\n}\n"
+	want := "import " + shim.Name + `
+
+
+def main():
+    m = {}
+    m[b"a"] = 1
+    x = ` + shim.Name + `._map_index(m, b"a", 0)
+    v, ok = ` + shim.Name + `._map_lookup(m, b"b", 0)
+    ` + shim.Name + `._map_delete(m, b"a")
+    ` + shim.Name + `._map_clear(m)
+    _ = x
+    _ = v
+    _ = ok
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestMapRangeEmit pins the Python a range over a map lowers to: a two-variable
+// range walks a snapshot of the key-value pairs through _map_items, and a key-only
+// range walks a snapshot of the keys through _map_keys, so a delete during the
+// range is safe.
+func TestMapRangeEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\nfunc main() {\n\tm := map[int]int{1: 10, 2: 20}\n\tfor k, v := range m {\n\t\t_ = k\n\t\t_ = v\n\t}\n\tfor k := range m {\n\t\t_ = k\n\t}\n}\n"
+	want := "import " + shim.Name + `
+
+
+def main():
+    m = {1: 10, 2: 20}
+    for k, v in ` + shim.Name + `._map_items(m):
+        _ = k
+        _ = v
+    for k in ` + shim.Name + `._map_keys(m):
+        _ = k
 
 
 if __name__ == "__main__":

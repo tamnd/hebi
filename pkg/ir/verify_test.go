@@ -432,6 +432,71 @@ func TestVerifySliceSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyMapSurface accepts a well-formed map surface alongside the nodes that
+// use it, the map literal, the nil map sentinel, the tuple assignment of a
+// comma-ok read, and the range over a map, and rejects a map literal with a nil
+// key or value, a tuple assignment to fewer than two names or with an empty name
+// or a nil value, and a range over a map with a nil source.
+func TestVerifyMapSurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "m", Define: true, Value: &MapLit{Entries: []MapEntry{
+					{Key: &IntLit{Text: "1"}, Value: &IntLit{Text: "10"}},
+				}}},
+				&AssignStmt{Name: "z", Define: true, Value: &NilMap{}},
+				&TupleAssign{Names: []string{"v", "ok"}, Define: true, Value: &Intrinsic{Name: "_map_lookup", Args: []Expr{&Ident{Name: "m"}, &IntLit{Text: "1"}, &IntLit{Text: "0"}}}},
+				&RangeMap{Key: "k", Value: "n", Source: &Ident{Name: "m"}, Body: []Stmt{
+					&AssignStmt{Name: "_", Value: &Ident{Name: "n"}},
+				}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed map surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"map lit nil key", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*MapLit).Entries[0].Key = nil
+		}, "nil expression"},
+		{"map lit nil value", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*MapLit).Entries[0].Value = nil
+		}, "nil expression"},
+		{"tuple too few names", func(m *Module) {
+			m.Funcs[0].Body[2].(*TupleAssign).Names = []string{"v"}
+		}, "fewer than two names"},
+		{"tuple empty name", func(m *Module) {
+			m.Funcs[0].Body[2].(*TupleAssign).Names = []string{"v", ""}
+		}, "tuple target 1 has no name"},
+		{"tuple nil value", func(m *Module) {
+			m.Funcs[0].Body[2].(*TupleAssign).Value = nil
+		}, "nil expression"},
+		{"range map nil source", func(m *Module) {
+			m.Funcs[0].Body[3].(*RangeMap).Source = nil
+		}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.

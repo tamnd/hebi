@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -331,5 +331,64 @@ func TestShimBehavior(t *testing.T) {
 	}
 	if got, want := string(out), "1 true false hi\n"; got != want {
 		t.Errorf("println output = %q, want %q", got, want)
+	}
+}
+
+// TestMapHelpers runs the map surface under CPython: a read of a present key
+// returns its value and a read of a missing key the supplied zero, the comma-ok
+// lookup reports presence, delete removes a key and is a no-op on a missing one,
+// clear empties the map, the snapshot helpers let a delete during a range run
+// safely, and the nil map reads as empty, yields nothing, prints as map[], and
+// panics the Go way on a write.
+func TestMapHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"m = {}\n" +
+		"m['a'] = 1\n" +
+		"print(r._map_index(m, 'a', 0), r._map_index(m, 'z', 0))\n" +
+		"print(r._map_lookup(m, 'a', 0), r._map_lookup(m, 'z', 0))\n" +
+		"r._map_delete(m, 'a')\n" +
+		"r._map_delete(m, 'z')\n" +
+		"print(len(m))\n" +
+		"d = {1: 1, 2: 2, 3: 3}\n" +
+		"for k in r._map_keys(d):\n" +
+		"    if k == 2:\n" +
+		"        r._map_delete(d, 2)\n" +
+		"print(len(d), r.go_str(d))\n" +
+		"r._map_clear(d)\n" +
+		"print(len(d), r.go_str(d))\n" +
+		"print(r._map_index(r.NIL_MAP, 'x', 0), len(r.NIL_MAP), r.go_str(r.NIL_MAP))\n" +
+		"print(r._map_lookup(r.NIL_MAP, 'x', 0), r._map_keys(r.NIL_MAP), r._map_items(r.NIL_MAP))\n" +
+		"r._map_delete(r.NIL_MAP, 'x')\n" +
+		"r._map_clear(r.NIL_MAP)\n" +
+		"try:\n" +
+		"    r.NIL_MAP['x'] = 1\n" +
+		"    print('no panic')\n" +
+		"except Exception as e:\n" +
+		"    print(e)"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run map helpers: %v\n%s", err, out)
+	}
+	want := "1 0\n" +
+		"(1, True) (0, False)\n" +
+		"0\n" +
+		"2 map[1:1 3:3]\n" +
+		"0 map[]\n" +
+		"0 0 map[]\n" +
+		"(0, False) [] []\n" +
+		"assignment to entry in nil map\n"
+	if got := string(out); got != want {
+		t.Errorf("map helper output = %q, want %q", got, want)
 	}
 }

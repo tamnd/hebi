@@ -42,6 +42,20 @@ def go_str(value):
         # so only the visible length is shown and the backing beyond it stays
         # hidden, matching fmt's view of a slice through its length.
         return "[" + " ".join(go_str(value.array[value.offset + k]) for k in range(value.length)) + "]"
+    if value is NIL_MAP:
+        # A nil map prints as an empty map, the same form an empty map takes, since
+        # Go's fmt shows both as map[].
+        return "map[]"
+    if isinstance(value, dict):
+        # A Go map prints as map[k:v ...] with its keys sorted, which fmt does so
+        # the output is stable, so the entries are sorted by key where the key type
+        # orders; a key type Python cannot order (a struct) falls back to insertion
+        # order, the one map-print case that is not a fidelity target.
+        try:
+            items = sorted(value.items(), key=lambda kv: kv[0])
+        except TypeError:
+            items = list(value.items())
+        return "map[" + " ".join(go_str(k) + ":" + go_str(v) for k, v in items) + "]"
     return str(value)
 
 
@@ -419,3 +433,111 @@ def _decode_rune(s, i):
             ), 4
         return 0xFFFD, 1
     return 0xFFFD, 1
+
+
+# Map helpers. A Go map is a Python dict, but three behaviors need the runtime: a
+# read of a missing key returns the value type's zero rather than raising, a
+# range takes a snapshot so a delete during iteration is safe the way Go's is,
+# and a nil map reads as empty yet panics on write. The nil map is a distinct
+# sentinel so those behaviors are exact, since a bare empty dict would allow the
+# write Go forbids.
+
+
+class _NilMap:
+    """The nil map sentinel: reads as empty, yields nothing, panics on write.
+
+    A Go nil map returns the value type's zero on every read, has length zero, and
+    yields no iterations, all of which this object provides, and it raises Go's
+    "assignment to entry in nil map" panic on any write, so a read-only use is fine
+    and a write stops loudly, exactly as Go.
+    """
+
+    __slots__ = ()
+
+    def __len__(self):
+        return 0
+
+    def __contains__(self, key):
+        return False
+
+    def get(self, key, default=None):
+        return default
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        return ()
+
+    def keys(self):
+        return ()
+
+    def __setitem__(self, key, value):
+        raise _runtime_error("assignment to entry in nil map")
+
+
+NIL_MAP = _NilMap()
+
+
+def _map_index(m, k, zero):
+    """Return m[k], or the value type's zero when the key is missing, matching Go.
+
+    Go returns the zero value on a miss rather than raising, so the read defaults
+    to the caller-supplied zero, and a nil map reads as empty so every key misses.
+    """
+    if m is NIL_MAP:
+        return zero
+    return m.get(k, zero)
+
+
+def _map_lookup(m, k, zero):
+    """Return the comma-ok pair (value, present) for m[k], Go's v, ok := m[k].
+
+    On a hit the stored value and True come back, and on a miss the value type's
+    zero and False, so ok distinguishes a present zero from an absent key. A nil
+    map misses every key.
+    """
+    if m is NIL_MAP:
+        return (zero, False)
+    if k in m:
+        return (m[k], True)
+    return (zero, False)
+
+
+def _map_delete(m, k):
+    """Delete key k from map m, a no-op when the key or the map is absent.
+
+    Go's delete of a missing key does nothing, which pop with a default matches,
+    and delete on a nil map is allowed and does nothing.
+    """
+    if m is not NIL_MAP:
+        m.pop(k, None)
+
+
+def _map_clear(m):
+    """Remove every entry from map m, matching Go 1.21 clear, a no-op on a nil map."""
+    if m is not NIL_MAP:
+        m.clear()
+
+
+def _map_items(m):
+    """Return a snapshot list of the map's key-value pairs for a range to walk.
+
+    Ranging the snapshot rather than the live map lets the body delete entries the
+    way a Go range can, since mutating a dict mid-iteration raises in Python, and a
+    nil map yields nothing.
+    """
+    if m is NIL_MAP:
+        return []
+    return list(m.items())
+
+
+def _map_keys(m):
+    """Return a snapshot list of the map's keys for a key-only range to walk.
+
+    Like the item snapshot this lets the body delete during the range, and a nil
+    map yields nothing.
+    """
+    if m is NIL_MAP:
+        return []
+    return list(m.keys())
