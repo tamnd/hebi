@@ -87,6 +87,22 @@ func verifyStmt(where string, s Stmt) error {
 		return fmt.Errorf("ir: %s is nil", where)
 	case *ExprStmt:
 		return verifyExpr(where, s.X)
+	case *FuncDef:
+		if s.Name == "" {
+			return fmt.Errorf("ir: %s is a nested def with no name", where)
+		}
+		if err := verifyParamNames(where, s.Params); err != nil {
+			return err
+		}
+		if err := verifyCaptures(where, s.Captures); err != nil {
+			return err
+		}
+		for i, n := range s.Nonlocals {
+			if n == "" {
+				return fmt.Errorf("ir: %s: nonlocal %d has no name", where, i)
+			}
+		}
+		return verifyBlock(where+": "+s.Name+" body", s.Body)
 	case *ReturnStmt:
 		if s.Value == nil {
 			// A bare return carries no value, so there is nothing to check.
@@ -280,6 +296,14 @@ func verifyExpr(where string, e Expr) error {
 				return err
 			}
 		}
+	case *Lambda:
+		if err := verifyParamNames(where, e.Params); err != nil {
+			return err
+		}
+		if err := verifyCaptures(where, e.Captures); err != nil {
+			return err
+		}
+		return verifyExpr(where+": lambda body", e.Body)
 	case *FieldAccess:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s reads a field with no name", where)
@@ -365,6 +389,27 @@ func verifyExpr(where string, e Expr) error {
 func verifyArgs(where string, args []Expr) error {
 	for i, a := range args {
 		if err := verifyExpr(fmt.Sprintf("%s: arg %d", where, i), a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyParamNames(where string, params []string) error {
+	for i, p := range params {
+		if p == "" {
+			return fmt.Errorf("ir: %s: parameter %d has no name", where, i)
+		}
+	}
+	return nil
+}
+
+func verifyCaptures(where string, caps []Capture) error {
+	for i, c := range caps {
+		if c.Param == "" {
+			return fmt.Errorf("ir: %s: capture %d has no name", where, i)
+		}
+		if err := verifyExpr(fmt.Sprintf("%s: capture %d value", where, i), c.Value); err != nil {
 			return err
 		}
 	}

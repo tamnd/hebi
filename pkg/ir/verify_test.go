@@ -595,6 +595,60 @@ func TestVerifyTupleSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyClosureSurface accepts a well-formed lambda and a well-formed nested
+// def, each with a captured default and the def with a nonlocal, and rejects a
+// def with no name, a parameter with no name, a capture with no name, a capture
+// with a nil value, a nonlocal with no name, a nil lambda body, and a nil def
+// body statement.
+func TestVerifyClosureSurface(t *testing.T) {
+	t.Parallel()
+	good := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+		&FuncDef{Name: "_func", Params: []string{"x"}, Captures: []Capture{{Param: "n", Value: &Ident{Name: "n"}}}, Nonlocals: []string{"count"}, Body: []Stmt{
+			&AssignStmt{Name: "count", Value: &Ident{Name: "x"}},
+			&ReturnStmt{},
+		}},
+		&AssignStmt{Name: "f", Define: true, Value: &Lambda{Params: []string{"y"}, Captures: []Capture{{Param: "k", Value: &Ident{Name: "k"}}}, Body: &Ident{Name: "y"}}},
+	}}}}
+	if err := Verify(good); err != nil {
+		t.Fatalf("Verify rejected a well-formed closure surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"def no name", func(m *Module) { m.Funcs[0].Body[0].(*FuncDef).Name = "" }, "nested def with no name"},
+		{"def empty param", func(m *Module) { m.Funcs[0].Body[0].(*FuncDef).Params[0] = "" }, "parameter 0 has no name"},
+		{"def capture no name", func(m *Module) { m.Funcs[0].Body[0].(*FuncDef).Captures[0].Param = "" }, "capture 0 has no name"},
+		{"def capture nil value", func(m *Module) { m.Funcs[0].Body[0].(*FuncDef).Captures[0].Value = nil }, "nil expression"},
+		{"def empty nonlocal", func(m *Module) { m.Funcs[0].Body[0].(*FuncDef).Nonlocals[0] = "" }, "nonlocal 0 has no name"},
+		{"def nil body stmt", func(m *Module) { m.Funcs[0].Body[0].(*FuncDef).Body[0] = nil }, "statement 0 is nil"},
+		{"lambda empty param", func(m *Module) { m.Funcs[0].Body[1].(*AssignStmt).Value.(*Lambda).Params[0] = "" }, "parameter 0 has no name"},
+		{"lambda capture nil value", func(m *Module) { m.Funcs[0].Body[1].(*AssignStmt).Value.(*Lambda).Captures[0].Value = nil }, "nil expression"},
+		{"lambda nil body", func(m *Module) { m.Funcs[0].Body[1].(*AssignStmt).Value.(*Lambda).Body = nil }, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &Module{Package: "main", Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&FuncDef{Name: "_func", Params: []string{"x"}, Captures: []Capture{{Param: "n", Value: &Ident{Name: "n"}}}, Nonlocals: []string{"count"}, Body: []Stmt{
+					&AssignStmt{Name: "count", Value: &Ident{Name: "x"}},
+					&ReturnStmt{},
+				}},
+				&AssignStmt{Name: "f", Define: true, Value: &Lambda{Params: []string{"y"}, Captures: []Capture{{Param: "k", Value: &Ident{Name: "k"}}}, Body: &Ident{Name: "y"}}},
+			}}}}
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.
