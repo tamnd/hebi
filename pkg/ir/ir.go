@@ -230,6 +230,15 @@ type SetIndex struct {
 	Value  Expr
 }
 
+// DerefSet assigns through a pointer, *p = Value, which lowers to the pointer's
+// set. The value is cloned by the lowering where Go copies it, so writing a
+// struct or array value through the pointer stores an independent copy in the
+// field or element it points at.
+type DerefSet struct {
+	Ptr   Expr
+	Value Expr
+}
+
 // LabeledBreak marks a Go break that names an outer loop. It is a transient node
 // the lowering emits at the break site and the labeled-break pass rewrites away
 // into a flag set and a plain break before the module is verified, so it never
@@ -250,6 +259,7 @@ func (*TupleAssign) isStmt()     {}
 func (*RangeMap) isStmt()        {}
 func (*SetField) isStmt()        {}
 func (*SetIndex) isStmt()        {}
+func (*DerefSet) isStmt()        {}
 func (*IfStmt) isStmt()          {}
 func (*ForStmt) isStmt()         {}
 func (*ForRange) isStmt()        {}
@@ -452,6 +462,29 @@ type Intrinsic struct {
 	Args []Expr
 }
 
+// AddrField is the address of a struct field, &s.Field. It lowers to a FieldPtr
+// over the struct object and the field name, which reads and writes the live
+// field, so a write through the pointer is visible in the struct. Container is
+// the object holding the field, which for a promoted field is the embedded value
+// rather than the outer struct.
+type AddrField struct {
+	Container Expr
+	Name      string
+}
+
+// AddrIndex is the address of an array or slice element, &a[i]. It lowers to an
+// IndexPtr over the container and the index, which reads and writes the live
+// element, so a write through the pointer is visible in the array or slice.
+type AddrIndex struct {
+	Seq   Expr
+	Index Expr
+}
+
+// Deref reads through a pointer, *p, which lowers to the pointer's get. The
+// pointer is a FieldPtr or IndexPtr, so the read goes through to the live field
+// or element it points at.
+type Deref struct{ X Expr }
+
 func (*IntLit) isExpr()      {}
 func (*FloatLit) isExpr()    {}
 func (*StringLit) isExpr()   {}
@@ -464,6 +497,9 @@ func (*Convert) isExpr()     {}
 func (*IndexExpr) isExpr()   {}
 func (*CallExpr) isExpr()    {}
 func (*Intrinsic) isExpr()   {}
+func (*AddrField) isExpr()   {}
+func (*AddrIndex) isExpr()   {}
+func (*Deref) isExpr()       {}
 func (*FieldAccess) isExpr() {}
 func (*StructLit) isExpr()   {}
 func (*Clone) isExpr()       {}

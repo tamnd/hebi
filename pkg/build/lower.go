@@ -619,6 +619,16 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		}
 		value = l.copyIfValueRead(s.Rhs[0], value)
 		return []ir.Stmt{&ir.SetIndex{Object: obj, Index: index, Value: value}}, nil
+	case *ast.StarExpr:
+		// A write through a pointer, *p = v, reaches the pointed-at slot through the
+		// pointer object's set, so a struct value is cloned first exactly as a write
+		// to any other location copies.
+		ptr, err := l.lowerExpr(lhs.X)
+		if err != nil {
+			return nil, err
+		}
+		value = l.copyIfValueRead(s.Rhs[0], value)
+		return []ir.Stmt{&ir.DerefSet{Ptr: ptr, Value: value}}, nil
 	default:
 		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
 	}
@@ -1550,6 +1560,8 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		return l.lowerSliceExpr(e)
 	case *ast.SelectorExpr:
 		return l.lowerSelector(e)
+	case *ast.StarExpr:
+		return l.lowerDeref(e)
 	case *ast.CompositeLit:
 		return l.lowerCompositeLit(e)
 	case *ast.CallExpr:
@@ -1983,9 +1995,65 @@ func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.UnaryExpr{Op: e.Op.String(), X: x}, nil
+	case token.AND:
+		return l.lowerAddr(e)
 	default:
 		return nil, l.errf(e.Pos(), "unary %s is not supported yet", e.Op)
 	}
+}
+
+// lowerAddr lowers the address-of operator, &s.field and &a[i], into a pointer
+// object that names the location it points at. A field address becomes a FieldPtr
+// carrying the container object and the field name, and an element address becomes
+// an IndexPtr carrying the sequence and the index, so a later deref reads and a
+// deref-assign writes straight through to the same slot. The address of a struct
+// field steps through the same embedded-field path a field read follows, so
+// &u.ID resolves to &u.Base.ID when ID is promoted. Taking the address of a
+// composite literal or a plain local scalar is deferred to the pointer-as-cell
+// slice, so it is diagnosed rather than emitted.
+func (l *lowerer) lowerAddr(e *ast.UnaryExpr) (ir.Expr, error) {
+	switch operand := astUnparen(e.X).(type) {
+	case *ast.SelectorExpr:
+		selection, ok := l.pkg.Info.Selections[operand]
+		if !ok || selection.Kind() != types.FieldVal {
+			return nil, l.errf(e.Pos(), "taking the address of %s is not supported yet", operand.Sel.Name)
+		}
+		base, err := l.lowerExpr(operand.X)
+		if err != nil {
+			return nil, err
+		}
+		index := selection.Index()
+		container := l.fieldChain(base, l.pkg.Info.TypeOf(operand.X), index[:len(index)-1])
+		return &ir.AddrField{Container: container, Name: operand.Sel.Name}, nil
+	case *ast.IndexExpr:
+		xt := l.pkg.Info.TypeOf(operand.X)
+		if !isArrayValue(xt) && !isSliceValue(xt) {
+			return nil, l.errf(e.Pos(), "taking the address of an element of %s is not supported yet", xt)
+		}
+		seq, err := l.lowerExpr(operand.X)
+		if err != nil {
+			return nil, err
+		}
+		index, err := l.lowerExpr(operand.Index)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.AddrIndex{Seq: seq, Index: index}, nil
+	default:
+		return nil, l.errf(e.Pos(), "taking the address of %T is not supported yet", operand)
+	}
+}
+
+// lowerDeref lowers a pointer dereference read, *p, into a Deref that reads
+// through the pointer object the address-of operator produced. A deref used as an
+// assignment target is handled by lowerAssign, which builds a DerefSet instead so
+// the write reaches the pointed-at slot.
+func (l *lowerer) lowerDeref(e *ast.StarExpr) (ir.Expr, error) {
+	x, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Deref{X: x}, nil
 }
 
 // narrow renarrows inner to e's result type when the carrier is wider than the

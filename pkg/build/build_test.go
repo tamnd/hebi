@@ -1570,3 +1570,75 @@ if __name__ == "__main__":
 		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+func TestPointers(t *testing.T) {
+	t.Parallel()
+	const pointPre = "package main\n\nimport \"fmt\"\n\ntype Point struct {\n\tX int\n\tY int\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"read through field pointer", pointPre + "func main() {\n\tp := Point{1, 2}\n\tpx := &p.X\n\tfmt.Println(*px)\n}\n"},
+		{"write through field pointer", pointPre + "func main() {\n\tp := Point{1, 2}\n\tpx := &p.X\n\t*px = 9\n\tfmt.Println(p.X)\n}\n"},
+		{"two field pointers in an expression", pointPre + "func main() {\n\tp := Point{3, 4}\n\tpx := &p.X\n\tpy := &p.Y\n\tfmt.Println(*px + *py)\n}\n"},
+		{"write through array element pointer", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ta := [3]int{1, 2, 3}\n\tq := &a[1]\n\t*q = 20\n\tfmt.Println(a)\n}\n"},
+		{"write through slice element pointer", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tq := &s[2]\n\t*q = 30\n\tfmt.Println(s)\n}\n"},
+		{"slice element pointer writes shared backing", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\ts := []int{1, 2, 3}\n\tt := s[:]\n\tq := &s[0]\n\t*q = 100\n\tfmt.Println(t[0])\n}\n"},
+		{"promoted field pointer", "package main\n\nimport \"fmt\"\n\ntype Base struct {\n\tID int\n}\n\ntype User struct {\n\tBase\n\tName string\n}\n\nfunc main() {\n\tu := User{Base{5}, \"a\"}\n\tp := &u.ID\n\t*p = 9\n\tfmt.Println(u.ID)\n}\n"},
+		{"write struct value through element pointer", pointPre + "func main() {\n\ta := [2]Point{{1, 2}, {3, 4}}\n\tq := &a[0]\n\t*q = Point{7, 8}\n\tfmt.Println(a[0].X, a[0].Y)\n}\n"},
+		{"struct written through field pointer is cloned", "package main\n\nimport \"fmt\"\n\ntype Inner struct {\n\tV int\n}\n\ntype Outer struct {\n\tIn Inner\n}\n\nfunc main() {\n\to := Outer{Inner{5}}\n\tp := &o.In\n\tsrc := Inner{9}\n\t*p = src\n\tsrc.V = 100\n\tfmt.Println(o.In.V)\n}\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestPointerEmit pins the Python the address-of and deref forms lower to: a
+// field address is a FieldPtr over the object and the field name, an element
+// address is an IndexPtr over the sequence and the index, a deref read is the
+// pointer's get, and a deref-assign is the pointer's set.
+func TestPointerEmit(t *testing.T) {
+	t.Parallel()
+	source := "package main\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\tp := Point{1, 2}\n\tpx := &p.X\n\t*px = 9\n\ta := [3]int{1, 2, 3}\n\tq := &a[1]\n\t_ = *q\n\t_ = px\n}\n"
+	want := "import " + shim.Name + `
+
+
+class Point:
+    __slots__ = ("X", "Y")
+
+    def __init__(self, X=0, Y=0):
+        self.X = X
+        self.Y = Y
+
+    def copy(self):
+        return Point(self.X, self.Y)
+
+    def __eq__(self, other):
+        if other.__class__ is not Point:
+            return NotImplemented
+        return self.X == other.X and self.Y == other.Y
+
+    def __hash__(self):
+        return hash((self.X, self.Y))
+
+
+def main():
+    p = Point(1, 2)
+    px = ` + shim.Name + `.FieldPtr(p, "X")
+    px.set(9)
+    a = [1, 2, 3]
+    q = ` + shim.Name + `.IndexPtr(a, 1)
+    _ = q.get()
+    _ = px
+
+
+if __name__ == "__main__":
+    main()
+`
+	if got := emitOf(t, source); got != want {
+		t.Errorf("emit mismatch\n got:\n%s\nwant:\n%s", got, want)
+	}
+}

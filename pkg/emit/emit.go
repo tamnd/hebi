@@ -157,6 +157,10 @@ func blockUsesShim(body []ir.Stmt) bool {
 			if exprUsesShim(s.Object) || exprUsesShim(s.Index) || exprUsesShim(s.Value) {
 				return true
 			}
+		case *ir.DerefSet:
+			if exprUsesShim(s.Ptr) || exprUsesShim(s.Value) {
+				return true
+			}
 		case *ir.IfStmt:
 			if exprUsesShim(s.Cond) || blockUsesShim(s.Then) || blockUsesShim(s.Else) {
 				return true
@@ -192,6 +196,14 @@ func exprUsesShim(e ir.Expr) bool {
 	case *ir.CallExpr:
 		return argsUseShim(e.Args)
 	case *ir.FieldAccess:
+		return exprUsesShim(e.X)
+	case *ir.AddrField:
+		// The field-pointer helper always comes from the runtime shim.
+		return true
+	case *ir.AddrIndex:
+		// The index-pointer helper always comes from the runtime shim.
+		return true
+	case *ir.Deref:
 		return exprUsesShim(e.X)
 	case *ir.Clone:
 		return exprUsesShim(e.X)
@@ -456,6 +468,17 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		}
 		writeIndent(b, depth)
 		fmt.Fprintf(b, "%s[%s] = %s\n", obj, index, value)
+	case *ir.DerefSet:
+		ptr, err := emitExpr(s.Ptr)
+		if err != nil {
+			return err
+		}
+		value, err := emitExpr(s.Value)
+		if err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "%s.set(%s)\n", ptr, value)
 	case *ir.IfStmt:
 		cond, err := emitExpr(s.Cond)
 		if err != nil {
@@ -715,6 +738,28 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.%s", x, e.Name), nil
+	case *ir.AddrField:
+		container, err := emitExpr(e.Container)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.FieldPtr(%s, %q)", shim.Name, container, e.Name), nil
+	case *ir.AddrIndex:
+		seq, err := emitExpr(e.Seq)
+		if err != nil {
+			return "", err
+		}
+		index, err := emitExpr(e.Index)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.IndexPtr(%s, %s)", shim.Name, seq, index), nil
+	case *ir.Deref:
+		x, err := emitExpr(e.X)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.get()", x), nil
 	case *ir.StructLit:
 		parts := make([]string, len(e.Fields))
 		for i, f := range e.Fields {

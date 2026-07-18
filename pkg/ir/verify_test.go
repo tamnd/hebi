@@ -497,6 +497,68 @@ func TestVerifyMapSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyPointerSurface accepts a well-formed pointer surface, a field
+// address, an element address, a deref read, and a deref-assign, and rejects each
+// with a missing name or a nil operand.
+func TestVerifyPointerSurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "fp", Define: true, Value: &AddrField{Container: &Ident{Name: "p"}, Name: "X"}},
+				&AssignStmt{Name: "ip", Define: true, Value: &AddrIndex{Seq: &Ident{Name: "a"}, Index: &IntLit{Text: "0"}}},
+				&AssignStmt{Name: "v", Define: true, Value: &Deref{X: &Ident{Name: "fp"}}},
+				&DerefSet{Ptr: &Ident{Name: "fp"}, Value: &IntLit{Text: "9"}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed pointer surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"addr field empty name", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*AddrField).Name = ""
+		}, "address of a field with no name"},
+		{"addr field nil container", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*AddrField).Container = nil
+		}, "nil expression"},
+		{"addr index nil seq", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*AddrIndex).Seq = nil
+		}, "nil expression"},
+		{"addr index nil index", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*AddrIndex).Index = nil
+		}, "nil expression"},
+		{"deref nil pointer", func(m *Module) {
+			m.Funcs[0].Body[2].(*AssignStmt).Value.(*Deref).X = nil
+		}, "nil expression"},
+		{"deref set nil pointer", func(m *Module) {
+			m.Funcs[0].Body[3].(*DerefSet).Ptr = nil
+		}, "nil expression"},
+		{"deref set nil value", func(m *Module) {
+			m.Funcs[0].Body[3].(*DerefSet).Value = nil
+		}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyForRange accepts a well-formed for-in-range loop with each of its
 // optional bounds present or absent, and rejects one without a stop bound and
 // one whose bounds are nil expressions.
