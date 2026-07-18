@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _decode_rune", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "def _decode_rune", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -109,6 +109,52 @@ func TestStringHelpers(t *testing.T) {
 		"(65533, 1) (65533, 1)\n"
 	if got := string(out); got != want {
 		t.Errorf("string helper output = %q, want %q", got, want)
+	}
+}
+
+// TestArrayHelpers runs the array surface under CPython: go_str prints a list
+// in Go's bracket form with nested arrays recursing, the clone helper deep-copies
+// so a write to the copy leaves the original alone at every level including a
+// struct element cloned through its own copy method, and the array-key helper
+// projects an array to a hashable tuple.
+func TestArrayHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"print(r.go_str([1, 2, 3]), r.go_str([[1, 2], [3, 4]]))\n" +
+		"a = [[1, 2], [3, 4]]\n" +
+		"b = r._clone_array(a)\n" +
+		"b[0][0] = 9\n" +
+		"print(r.go_str(a), r.go_str(b))\n" +
+		"class P:\n" +
+		"    def __init__(self, x):\n" +
+		"        self.x = x\n" +
+		"    def copy(self):\n" +
+		"        return P(self.x)\n" +
+		"c = [P(1)]\n" +
+		"d = r._clone_array(c)\n" +
+		"d[0].x = 9\n" +
+		"print(c[0].x, d[0].x)\n" +
+		"print(r._arraykey([1, [2, 3]]))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run array helpers: %v\n%s", err, out)
+	}
+	want := "[1 2 3] [[1 2] [3 4]]\n" +
+		"[[1 2] [3 4]] [[9 2] [3 4]]\n" +
+		"1 9\n" +
+		"(1, (2, 3))\n"
+	if got := string(out); got != want {
+		t.Errorf("array helper output = %q, want %q", got, want)
 	}
 }
 

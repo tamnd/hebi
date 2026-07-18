@@ -39,6 +39,10 @@ func Verify(m *Module) error {
 				if f.Struct == "" {
 					return fmt.Errorf("ir: %s is a struct field with no type", where)
 				}
+			case FieldArray:
+				if err := verifyExpr(where+": zero", f.Zero); err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("ir: %s has an unknown kind %d", where, f.Kind)
 			}
@@ -99,6 +103,14 @@ func verifyStmt(where string, s Stmt) error {
 			return fmt.Errorf("ir: %s assigns to an empty field name", where)
 		}
 		if err := verifyExpr(where+": object", s.Object); err != nil {
+			return err
+		}
+		return verifyExpr(where+": value", s.Value)
+	case *SetIndex:
+		if err := verifyExpr(where+": object", s.Object); err != nil {
+			return err
+		}
+		if err := verifyExpr(where+": index", s.Index); err != nil {
 			return err
 		}
 		return verifyExpr(where+": value", s.Value)
@@ -245,6 +257,19 @@ func verifyExpr(where string, e Expr) error {
 			}
 		}
 	case *Clone:
+		return verifyExpr(where+": cloned", e.X)
+	case *ArrayZero:
+		if e.Len < 0 {
+			return fmt.Errorf("ir: %s builds an array with a negative length %d", where, e.Len)
+		}
+		return verifyExpr(where+": element zero", e.Elem)
+	case *ArrayLit:
+		for i, el := range e.Elems {
+			if err := verifyExpr(fmt.Sprintf("%s: element %d", where, i), el); err != nil {
+				return err
+			}
+		}
+	case *ArrayClone:
 		return verifyExpr(where+": cloned", e.X)
 	default:
 		return fmt.Errorf("ir: %s is an unknown expression type %T", where, e)

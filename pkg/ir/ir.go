@@ -65,12 +65,17 @@ const (
 	// FieldStruct is a value-struct field: its zero value is a fresh instance of
 	// the field's struct type and copy recurses into that type's copy method.
 	FieldStruct
+	// FieldArray is an array field: a Go array is a value, so like a value struct
+	// it defaults to a fresh zero array built in the constructor body and copies
+	// element-wise through the array clone helper, never by sharing the list.
+	FieldArray
 )
 
 // StructField is one field of a struct. Zero is the constructor default for a
-// scalar field, the Go zero value of its type. Struct is the field's struct type
-// name for a value-struct field, used to build its zero instance and to recurse
-// in copy.
+// scalar field, the Go zero value of its type, and for an array field the fresh
+// zero array the constructor builds when the field is omitted. Struct is the
+// field's struct type name for a value-struct field, used to build its zero
+// instance and to recurse in copy.
 type StructField struct {
 	Name   string
 	Kind   FieldKind
@@ -190,6 +195,16 @@ type SetField struct {
 	Value  Expr
 }
 
+// SetIndex assigns to an element of an indexable value, Object[Index] = Value,
+// matching a Go array element assignment. The value is cloned by the lowering
+// where Go copies it, so storing a struct or array value into an element stores
+// an independent copy.
+type SetIndex struct {
+	Object Expr
+	Index  Expr
+	Value  Expr
+}
+
 // LabeledBreak marks a Go break that names an outer loop. It is a transient node
 // the lowering emits at the break site and the labeled-break pass rewrites away
 // into a flag set and a plain break before the module is verified, so it never
@@ -207,6 +222,7 @@ func (*ExprStmt) isStmt()        {}
 func (*ReturnStmt) isStmt()      {}
 func (*AssignStmt) isStmt()      {}
 func (*SetField) isStmt()        {}
+func (*SetIndex) isStmt()        {}
 func (*IfStmt) isStmt()          {}
 func (*ForStmt) isStmt()         {}
 func (*ForRange) isStmt()        {}
@@ -317,6 +333,30 @@ type StructArg struct {
 // struct-typed field that yields a value.
 type Clone struct{ X Expr }
 
+// ArrayZero builds the zero value of a Go array [Len]T as a Python list. Elem is
+// the zero value of one element, so a nested array carries an ArrayZero of its
+// own and an array of structs carries a StructLit. ElemMutable tells the emitter
+// which form keeps every element independent: a scalar element is immutable, so
+// the list may repeat one value, while a struct or array element must be built
+// fresh per position so the elements do not alias.
+type ArrayZero struct {
+	Len         int
+	Elem        Expr
+	ElemMutable bool
+}
+
+// ArrayLit builds a Go array literal as a Python list of its elements in order.
+// A partial Go literal is padded to the array length with zero-value elements by
+// the lowering, so Elems always holds exactly the array's length.
+type ArrayLit struct{ Elems []Expr }
+
+// ArrayClone copies a Go array value element-wise through the array clone helper,
+// emitted at a site where Go performs a value copy of an array: an assignment,
+// an argument, a return, or a read of an array-typed field or element that
+// yields a value. The helper recurses so nested arrays and struct elements each
+// become independent.
+type ArrayClone struct{ X Expr }
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -340,3 +380,6 @@ func (*Intrinsic) isExpr()   {}
 func (*FieldAccess) isExpr() {}
 func (*StructLit) isExpr()   {}
 func (*Clone) isExpr()       {}
+func (*ArrayZero) isExpr()   {}
+func (*ArrayLit) isExpr()    {}
+func (*ArrayClone) isExpr()  {}

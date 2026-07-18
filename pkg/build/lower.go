@@ -102,6 +102,16 @@ func (l *lowerer) structField(name string, t types.Type, pos token.Pos) (ir.Stru
 		}
 		return ir.StructField{Name: name, Kind: ir.FieldStruct, Struct: named.Obj().Name()}, nil
 	}
+	if arr, ok := t.Underlying().(*types.Array); ok {
+		// An array field is a value like a struct field, so it carries its fresh
+		// zero array and copies element-wise; the emitter builds it in the body and
+		// clones it in copy, never sharing the list.
+		zero, err := l.arrayZero(arr, pos)
+		if err != nil {
+			return ir.StructField{}, err
+		}
+		return ir.StructField{Name: name, Kind: ir.FieldArray, Zero: zero}, nil
+	}
 	zero, err := l.zeroValueOfType(t, pos)
 	if err != nil {
 		return ir.StructField{}, err
@@ -398,6 +408,9 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		}
 		return &ir.StructLit{Type: named.Obj().Name()}, nil
 	}
+	if arr, ok := t.Underlying().(*types.Array); ok {
+		return l.arrayZero(arr, pos)
+	}
 	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
 		switch info := basic.Info(); {
@@ -415,6 +428,42 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		}
 	}
 	return nil, l.errf(pos, "zero value of %s is not supported yet", t)
+}
+
+// arrayZero builds the zero value of an array type as an ArrayZero, recursing so
+// a nested array's element is itself an ArrayZero and an array of structs carries
+// a StructLit element. The element's mutability decides which emitted form keeps
+// each slot independent, so a scalar array repeats one immutable value while a
+// struct or nested-array element is built fresh per position.
+func (l *lowerer) arrayZero(arr *types.Array, pos token.Pos) (ir.Expr, error) {
+	elem, err := l.zeroValueOfType(arr.Elem(), pos)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.ArrayZero{Len: int(arr.Len()), Elem: elem, ElemMutable: isMutableType(arr.Elem())}, nil
+}
+
+// isMutableType reports whether a value of the type is mutable in the Python
+// representation, so a zero array of it must build each element fresh rather than
+// repeat one. A struct is a mutable object and an array is a mutable list; the
+// scalar kinds are immutable, so an array of them may repeat one value safely.
+func isMutableType(t types.Type) bool {
+	switch t.Underlying().(type) {
+	case *types.Struct, *types.Array:
+		return true
+	default:
+		return false
+	}
+}
+
+// isArrayValue reports whether a type is a Go array, which is a value that copies
+// element-wise at every copy site, distinct from a slice, which shares a backing.
+func isArrayValue(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Array)
+	return ok
 }
 
 // compoundOps maps a Go compound-assignment token to the plain binary operator
@@ -460,6 +509,22 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		}
 		value = l.copyIfValueRead(s.Rhs[0], value)
 		return []ir.Stmt{&ir.SetField{Object: obj, Name: lhs.Sel.Name, Value: value}}, nil
+	case *ast.IndexExpr:
+		// An array element assignment writes through the backing list. A slice or
+		// map index target waits on those types, so only an array is placed here.
+		if !isArrayValue(l.pkg.Info.TypeOf(lhs.X)) {
+			return nil, l.errf(lhs.Pos(), "index assignment to %s is not supported yet", l.pkg.Info.TypeOf(lhs.X))
+		}
+		obj, err := l.lowerExpr(lhs.X)
+		if err != nil {
+			return nil, err
+		}
+		index, err := l.lowerExpr(lhs.Index)
+		if err != nil {
+			return nil, err
+		}
+		value = l.copyIfValueRead(s.Rhs[0], value)
+		return []ir.Stmt{&ir.SetIndex{Object: obj, Index: index, Value: value}}, nil
 	default:
 		return nil, l.errf(s.Lhs[0].Pos(), "assignment target %T is not supported yet", s.Lhs[0])
 	}
@@ -1362,6 +1427,9 @@ func structOf(t types.Type) *types.Struct {
 // aggregate slices.
 func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	t := l.pkg.Info.TypeOf(e)
+	if arr, ok := t.Underlying().(*types.Array); ok {
+		return l.lowerArrayLit(e, arr)
+	}
 	named, ok := t.(*types.Named)
 	if !ok {
 		return nil, l.errf(e.Pos(), "composite literal of %s is not supported yet", t)
@@ -1405,6 +1473,36 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	return lit, nil
 }
 
+// lowerArrayLit lowers an array composite literal to an ArrayLit, a Python list
+// of its elements. Only the positional form is supported in this slice; an
+// index-keyed element waits on the composite-literal slice. A partial positional
+// literal is padded with zero-value elements to the array length, matching Go,
+// and a struct or array element that reads an existing value is cloned so the
+// literal stores an independent copy. Each padded zero is built separately, so
+// two zero elements never alias.
+func (l *lowerer) lowerArrayLit(e *ast.CompositeLit, arr *types.Array) (ir.Expr, error) {
+	n := int(arr.Len())
+	elems := make([]ir.Expr, 0, n)
+	for _, elt := range e.Elts {
+		if _, ok := elt.(*ast.KeyValueExpr); ok {
+			return nil, l.errf(elt.Pos(), "keyed array elements are not supported yet")
+		}
+		value, err := l.lowerExpr(elt)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, l.copyIfValueRead(elt, value))
+	}
+	for i := len(elems); i < n; i++ {
+		zero, err := l.zeroValueOfType(arr.Elem(), e.Pos())
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, zero)
+	}
+	return &ir.ArrayLit{Elems: elems}, nil
+}
+
 // ctorKeyword returns the constructor keyword for a keyed field of a struct,
 // applying the same shadow-avoiding rule the emitter uses so a keyed literal's
 // keyword matches the parameter name. When the struct is not in the table, which
@@ -1416,19 +1514,27 @@ func (l *lowerer) ctorKeyword(structName, fieldName string) string {
 	return fieldName
 }
 
-// copyIfValueRead wraps a lowered expression in a Clone when the source reads a
-// struct value out of a location Go would copy: a plain variable or a field
-// selector. A composite literal or a call already yields a fresh value, so it is
+// copyIfValueRead wraps a lowered expression in the value copy Go performs when
+// the source reads a value type out of a location Go would copy: a plain
+// variable, a field selector, or an array index. A struct value clones through
+// its copy method and an array value clones element-wise through the array
+// helper. A composite literal or a call already yields a fresh value, so it is
 // left alone, matching the rule that the copy is injected only at a value read
 // and never over an already-independent value.
 func (l *lowerer) copyIfValueRead(src ast.Expr, lowered ir.Expr) ir.Expr {
-	if !isStructValue(l.pkg.Info.TypeOf(src)) {
+	t := l.pkg.Info.TypeOf(src)
+	isStruct := isStructValue(t)
+	isArray := isArrayValue(t)
+	if !isStruct && !isArray {
 		return lowered
 	}
 	switch src := src.(type) {
 	case *ast.ParenExpr:
 		return l.copyIfValueRead(src.X, lowered)
 	case *ast.Ident, *ast.SelectorExpr, *ast.IndexExpr:
+		if isArray {
+			return &ir.ArrayClone{X: lowered}
+		}
 		return &ir.Clone{X: lowered}
 	default:
 		return lowered
@@ -1461,15 +1567,23 @@ func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
 	return l.narrow(e, e.Op, inner), nil
 }
 
-// lowerIndex lowers an index expression. Only indexing a string is supported in
-// this slice, which yields a byte as an int 0-255 because a Go string is Python
-// bytes; indexing slices, arrays, and maps arrives with those types. Generic
-// instantiation shares the IndexExpr syntax but never has a string operand, so
-// the type guard keeps the two apart.
+// lowerIndex lowers an index expression. Indexing a string yields a byte as an
+// int 0-255, because a Go string is Python bytes, and indexing an array reads the
+// element out of the backing list; a struct or array element that yields a value
+// is cloned by the caller through copyIfValueRead, not here. Indexing slices and
+// maps arrives with those types. Generic instantiation shares the IndexExpr
+// syntax but has neither a string nor an array operand, so the type guard keeps
+// the two apart.
 func (l *lowerer) lowerIndex(e *ast.IndexExpr) (ir.Expr, error) {
 	xType := l.pkg.Info.TypeOf(e.X)
-	basic, ok := xType.Underlying().(*types.Basic)
-	if !ok || basic.Info()&types.IsString == 0 {
+	switch u := xType.Underlying().(type) {
+	case *types.Basic:
+		if u.Info()&types.IsString == 0 {
+			return nil, l.errf(e.Pos(), "indexing %s is not supported yet", xType)
+		}
+	case *types.Array:
+		// An array index reads the element out of the Python list directly.
+	default:
 		return nil, l.errf(e.Pos(), "indexing %s is not supported yet", xType)
 	}
 	x, err := l.lowerExpr(e.X)
@@ -1590,6 +1704,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		}
 		return nil, l.errf(e.Pos(), "call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
 	case *ast.Ident:
+		if b, ok := l.pkg.Info.Uses[fun].(*types.Builtin); ok {
+			return l.lowerBuiltin(e, fun, b)
+		}
 		args, err := l.lowerCallArgs(e.Args)
 		if err != nil {
 			return nil, err
@@ -1597,6 +1714,28 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		return &ir.CallExpr{Name: fun.Name, Args: args}, nil
 	default:
 		return nil, l.errf(e.Pos(), "call target %T is not supported yet", e.Fun)
+	}
+}
+
+// lowerBuiltin lowers a call to a Go builtin. len and cap of an array or a
+// string do not copy their argument, and cap of an array equals its length, so
+// both lower to Python's len over the plainly lowered argument with no value copy
+// injected, which keeps len(a) reading as len(a) rather than cloning the array
+// just to measure it. The other builtins wait on the slices that bring their
+// types, so an unhandled one fails loudly.
+func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin) (ir.Expr, error) {
+	switch fun.Name {
+	case "len", "cap":
+		if len(e.Args) != 1 {
+			return nil, l.errf(e.Pos(), "%s takes one argument", fun.Name)
+		}
+		arg, err := l.lowerExpr(e.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &ir.CallExpr{Name: "len", Args: []ir.Expr{arg}}, nil
+	default:
+		return nil, l.errf(e.Pos(), "builtin %s is not supported yet", fun.Name)
 	}
 }
 

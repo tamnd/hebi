@@ -32,6 +32,11 @@ def go_str(value):
         # any invalid byte, matching Go's decode. A []byte is a bytearray, not
         # bytes, so it does not take this path and still prints as its ints.
         return value.decode("utf-8", "replace")
+    if isinstance(value, list):
+        # A Go array prints as its elements in brackets separated by single
+        # spaces, each element formatted by its own rule, and a nested array
+        # recurses, so [2][2]int reads as [[1 2] [3 4]] the way Go prints it.
+        return "[" + " ".join(go_str(e) for e in value) + "]"
     return str(value)
 
 
@@ -155,6 +160,41 @@ def _gofixed(ds, exp):
     if point > 0:
         return ds[:point] + "." + ds[point:]
     return "0." + "0" * -point + ds
+
+
+# Array helpers. A Go array is a value type, represented as a plain Python list
+# that the copy machinery always clones, so it never aliases the way a slice
+# does. Cloning recurses so nested arrays and struct elements each become
+# independent, while an immutable scalar element is shared safely. The array-key
+# helper projects an array to a hashable tuple, since a struct that contains a
+# comparable array is a valid Go map key but a Python list is not hashable.
+
+
+def _clone_array(a):
+    """Deep-copy a Go array value element by element.
+
+    A nested array recurses, a struct element copies through its own copy method,
+    and a scalar element is shared because it is immutable, which together
+    reproduce Go's value copy of an array at every copy site.
+    """
+    out = []
+    for e in a:
+        if isinstance(e, list):
+            out.append(_clone_array(e))
+        elif hasattr(e, "copy"):
+            out.append(e.copy())
+        else:
+            out.append(e)
+    return out
+
+
+def _arraykey(a):
+    """Return a hashable form of a Go array value for use as a map key.
+
+    A nested array recurses to a tuple, and a struct element is already hashable
+    through its own __hash__, so the whole array becomes a tuple of hashables.
+    """
+    return tuple(_arraykey(e) if isinstance(e, list) else e for e in a)
 
 
 # String helpers. A Go string is Python bytes, so byte indexing, length, and
