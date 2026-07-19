@@ -47,6 +47,27 @@ func Verify(m *Module) error {
 				return fmt.Errorf("ir: %s has an unknown kind %d", where, f.Kind)
 			}
 		}
+		methods := make(map[string]bool, len(sd.Methods))
+		for j, method := range sd.Methods {
+			if method == nil {
+				return fmt.Errorf("ir: struct %s: method %d is nil", sd.Name, j)
+			}
+			if method.Name == "" {
+				return fmt.Errorf("ir: struct %s: method %d has no name", sd.Name, j)
+			}
+			if methods[method.Name] {
+				return fmt.Errorf("ir: struct %s: method %s is defined more than once", sd.Name, method.Name)
+			}
+			methods[method.Name] = true
+			for k, p := range method.Params {
+				if p == "" {
+					return fmt.Errorf("ir: struct %s: method %s: parameter %d has no name", sd.Name, method.Name, k)
+				}
+			}
+			if err := verifyBlock(fmt.Sprintf("struct %s: method %s", sd.Name, method.Name), method.Body); err != nil {
+				return err
+			}
+		}
 	}
 	seen := make(map[string]bool, len(m.Funcs))
 	for i, fn := range m.Funcs {
@@ -268,6 +289,14 @@ func verifyExpr(where string, e Expr) error {
 	case *CallExpr:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s calls an empty name", where)
+		}
+		return verifyArgs(where, e.Args)
+	case *MethodCall:
+		if e.Name == "" {
+			return fmt.Errorf("ir: %s calls a method with no name", where)
+		}
+		if err := verifyExpr(where+": receiver", e.Recv); err != nil {
+			return err
 		}
 		return verifyArgs(where, e.Args)
 	case *Intrinsic:

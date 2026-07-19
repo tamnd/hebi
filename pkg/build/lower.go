@@ -51,6 +51,14 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 				// to lower here; the type checker already read them.
 				continue
 			}
+			if fd.Recv != nil {
+				owner, method, err := l.lowerMethod(fd)
+				if err != nil {
+					return nil, err
+				}
+				owner.Methods = append(owner.Methods, method)
+				continue
+			}
 			fn, err := l.lowerFunc(fd)
 			if err != nil {
 				return nil, err
@@ -168,6 +176,22 @@ type lowerer struct {
 	// the cell's get and set. Taking the address of such a local is then just naming
 	// its cell, which is how a pointer to a plain local reads on Python.
 	boxed map[types.Object]bool
+	// recv is the receiver variable of the method being lowered, or nil when the
+	// current function is not a method. Every read of the receiver lowers to self,
+	// whatever the Go source named it, so the method body reads as ordinary Python.
+	recv types.Object
+	// aliased is the set of struct and array locals in the function being lowered
+	// whose address is taken. A struct or array is already a reference object in
+	// Python, so its address is the instance itself with no cell, and a pointer to
+	// it and the local share that one instance. Rebinding such a local wholesale
+	// would strand the pointer on the old instance, so that one write is diagnosed.
+	aliased map[types.Object]bool
+	// instancePtr is the set of pointer locals bound to the address of a struct or
+	// array local, so the pointer is that instance rather than a cell. A field or
+	// element pointer is a cell that carries a set, so a write through it works, but
+	// a whole write through an instance pointer would need a field-by-field copy
+	// into the shared instance, so that one write is diagnosed rather than emitted.
+	instancePtr map[types.Object]bool
 }
 
 // scope is one enclosing breakable construct: a loop or a switch, carrying the Go
@@ -263,7 +287,9 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
 	}
 	l.boxed = l.computeBoxed(fd)
-	defer func() { l.boxed = nil }()
+	l.aliased = l.computeAliased(fd)
+	l.instancePtr = l.computeInstancePtrs(fd, l.aliased)
+	defer func() { l.boxed = nil; l.aliased = nil; l.instancePtr = nil }()
 	boxInit := l.boxParamInits(fd.Type.Params)
 	body, err := l.lowerBlock(fd.Body)
 	if err != nil {
@@ -272,6 +298,71 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	body = append(append(boxInit, prelude...), body...)
 	body = resolveLabeledJumps(body)
 	return &ir.Func{Name: fd.Name.Name, Params: params, Body: body}, nil
+}
+
+// lowerMethod lowers a method declaration to a Python instance method attached to
+// the receiver type's class, and returns that class along with the method. The
+// receiver becomes self, so the receiver name is recorded for the body lowering
+// and dropped from the parameter list. A value receiver and a pointer receiver
+// lower the same way here, an instance method over self, because the copy a value
+// receiver needs is passed by the caller, not taken inside the method. A method on
+// a non-struct named type, which has no class, waits on its own slice.
+func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, error) {
+	if fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0 {
+		return nil, nil, l.errf(fd.Pos(), "type parameters are not supported yet")
+	}
+	if fd.Body == nil {
+		return nil, nil, l.errf(fd.Pos(), "method %s has no body", fd.Name.Name)
+	}
+	recvField := fd.Recv.List[0]
+	typeName, err := l.receiverTypeName(recvField.Type)
+	if err != nil {
+		return nil, nil, err
+	}
+	owner, ok := l.structs[typeName]
+	if !ok {
+		return nil, nil, l.errf(fd.Pos(), "a method on non-struct type %s is not supported yet", typeName)
+	}
+	if len(recvField.Names) == 1 && recvField.Names[0].Name != "_" {
+		l.recv = l.pkg.Info.Defs[recvField.Names[0]]
+	}
+	defer func() { l.recv = nil }()
+	params, err := l.lowerParams(fd.Type.Params)
+	if err != nil {
+		return nil, nil, err
+	}
+	prelude, err := l.beginResults(fd.Type.Results)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { l.resultNames = nil }()
+	l.boxed = l.computeBoxed(fd)
+	l.aliased = l.computeAliased(fd)
+	l.instancePtr = l.computeInstancePtrs(fd, l.aliased)
+	defer func() { l.boxed = nil; l.aliased = nil; l.instancePtr = nil }()
+	boxInit := l.boxParamInits(fd.Type.Params)
+	body, err := l.lowerBlock(fd.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	body = append(append(boxInit, prelude...), body...)
+	body = resolveLabeledJumps(body)
+	return owner, &ir.Method{Name: fd.Name.Name, Params: params, Body: body}, nil
+}
+
+// receiverTypeName returns the named type a method receiver binds to, seeing
+// through a pointer receiver. A parenthesized or otherwise shaped receiver waits
+// on its own slice.
+func (l *lowerer) receiverTypeName(t ast.Expr) (string, error) {
+	switch rt := t.(type) {
+	case *ast.Ident:
+		return rt.Name, nil
+	case *ast.StarExpr:
+		if id, ok := rt.X.(*ast.Ident); ok {
+			return id.Name, nil
+		}
+	}
+	return "", l.errf(t.Pos(), "receiver type %T is not supported yet", t)
 }
 
 // lowerParams flattens a function's parameter list to the ordered names the
@@ -666,6 +757,99 @@ func (l *lowerer) computeBoxed(fd *ast.FuncDecl) map[types.Object]bool {
 	return boxed
 }
 
+// computeAliased finds the struct and array locals of a function whose address is
+// taken with &x. Unlike a scalar, a struct or array is a reference object in
+// Python, so its address is the instance itself and no cell is needed; the pointer
+// and the local share the one instance, and a field or element write through
+// either is seen by both. The same exclusions as boxing apply, so a loop variable,
+// a named result, a package-level variable, or a field still reaches the diagnosis
+// in lowerAddr rather than being modeled here.
+func (l *lowerer) computeAliased(fd *ast.FuncDecl) map[types.Object]bool {
+	loopVars := l.loopVarObjects(fd.Body)
+	results := l.resultObjects(fd.Type.Results)
+	aliased := map[types.Object]bool{}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		u, ok := n.(*ast.UnaryExpr)
+		if !ok || u.Op != token.AND {
+			return true
+		}
+		id, ok := astUnparen(u.X).(*ast.Ident)
+		if !ok {
+			return true
+		}
+		v, ok := l.pkg.Info.ObjectOf(id).(*types.Var)
+		if !ok || v.IsField() {
+			return true
+		}
+		if loopVars[v] || results[v] || l.isPackageScope(v) {
+			return true
+		}
+		if !isStructValue(v.Type()) && !isArrayValue(v.Type()) {
+			return true
+		}
+		aliased[v] = true
+		return true
+	})
+	if len(aliased) == 0 {
+		return nil
+	}
+	return aliased
+}
+
+// computeInstancePtrs finds the pointer locals bound to the address of a struct or
+// array local, meaning name := &alias where alias is in the aliased set. Such a
+// pointer is the instance itself, not a cell, so a whole write through it, *name =
+// v, cannot go through a cell set and is diagnosed in lowerAssign. A pointer to a
+// field or an element is a cell instead, so it is not collected here.
+func (l *lowerer) computeInstancePtrs(fd *ast.FuncDecl, aliased map[types.Object]bool) map[types.Object]bool {
+	if len(aliased) == 0 {
+		return nil
+	}
+	ptrs := map[types.Object]bool{}
+	record := func(lhs ast.Expr, rhs ast.Expr) {
+		u, ok := astUnparen(rhs).(*ast.UnaryExpr)
+		if !ok || u.Op != token.AND {
+			return
+		}
+		src, ok := astUnparen(u.X).(*ast.Ident)
+		if !ok || !aliased[l.pkg.Info.ObjectOf(src)] {
+			return
+		}
+		if name, ok := lhs.(*ast.Ident); ok && name.Name != "_" {
+			if obj := l.pkg.Info.ObjectOf(name); obj != nil {
+				ptrs[obj] = true
+			}
+		}
+	}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			if len(s.Lhs) == len(s.Rhs) {
+				for i := range s.Lhs {
+					record(s.Lhs[i], s.Rhs[i])
+				}
+			}
+		case *ast.ValueSpec:
+			if len(s.Names) == len(s.Values) {
+				for i := range s.Names {
+					record(s.Names[i], s.Values[i])
+				}
+			}
+		}
+		return true
+	})
+	if len(ptrs) == 0 {
+		return nil
+	}
+	return ptrs
+}
+
 // loopVarObjects collects the variables a for or range loop declares in the body,
 // which are excluded from boxing because a pointer to a loop variable has its own
 // per-iteration lifetime this slice does not model yet.
@@ -751,9 +935,19 @@ func (l *lowerer) isBoxedIdent(id *ast.Ident) bool {
 	return l.boxed[l.pkg.Info.ObjectOf(id)]
 }
 
-// identRead lowers a read of an identifier, going through the cell with a deref
-// when the local is boxed and naming it directly otherwise.
+// isReceiver reports whether an identifier names the receiver of the method being
+// lowered, which reads as self.
+func (l *lowerer) isReceiver(id *ast.Ident) bool {
+	return l.recv != nil && l.pkg.Info.ObjectOf(id) == l.recv
+}
+
+// identRead lowers a read of an identifier, naming the receiver self, going
+// through the cell with a deref when the local is boxed, and naming it directly
+// otherwise.
 func (l *lowerer) identRead(id *ast.Ident) ir.Expr {
+	if l.isReceiver(id) {
+		return &ir.Ident{Name: "self"}
+	}
 	if l.isBoxedIdent(id) {
 		return &ir.Deref{X: &ir.Ident{Name: id.Name}}
 	}
@@ -1185,6 +1379,13 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	// not clone.
 	switch lhs := s.Lhs[0].(type) {
 	case *ast.Ident:
+		if s.Tok == token.ASSIGN && l.aliased[l.pkg.Info.ObjectOf(lhs)] {
+			// The local's address is taken and a pointer shares its instance, so
+			// rebinding it wholesale would leave the pointer on the old instance. A
+			// field or element write keeps the instance, so only this whole-value
+			// rebind is held back, for the slice that models pointer storage fully.
+			return nil, l.errf(lhs.Pos(), "reassigning the address-taken value %s is not supported yet", lhs.Name)
+		}
 		if lhs.Name != "_" {
 			value = l.copyIfValueRead(s.Rhs[0], value)
 		}
@@ -1238,7 +1439,14 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	case *ast.StarExpr:
 		// A write through a pointer, *p = v, reaches the pointed-at slot through the
 		// pointer object's set, so a struct value is cloned first exactly as a write
-		// to any other location copies.
+		// to any other location copies. A field or element pointer is a cell that
+		// carries that set, so the write works. A pointer bound to a struct or array
+		// local is the instance itself, not a cell, so overwriting the whole value
+		// would have to copy field by field into the shared instance; that one write
+		// waits on the slice that models pointer storage fully.
+		if id, ok := astUnparen(lhs.X).(*ast.Ident); ok && l.instancePtr[l.pkg.Info.ObjectOf(id)] {
+			return nil, l.errf(lhs.Pos(), "writing through a pointer to a struct or array local is not supported yet")
+		}
 		ptr, err := l.lowerExpr(lhs.X)
 		if err != nil {
 			return nil, err
@@ -2792,6 +3000,12 @@ func (l *lowerer) lowerAddr(e *ast.UnaryExpr) (ir.Expr, error) {
 			// by the same identifier every read and write of the local goes through.
 			return &ir.Ident{Name: operand.Name}, nil
 		}
+		if l.aliased[l.pkg.Info.ObjectOf(operand)] {
+			// A struct or array local is already a reference object, so its address is
+			// the instance itself; a field or element write through the pointer and
+			// through the local both reach that one instance.
+			return l.identRead(operand), nil
+		}
 		return nil, l.errf(e.Pos(), "taking the address of %s is not supported yet", operand.Name)
 	default:
 		return nil, l.errf(e.Pos(), "taking the address of %T is not supported yet", operand)
@@ -2806,6 +3020,14 @@ func (l *lowerer) lowerDeref(e *ast.StarExpr) (ir.Expr, error) {
 	x, err := l.lowerExpr(e.X)
 	if err != nil {
 		return nil, err
+	}
+	// A pointer to a struct or an array is the instance itself, so dereferencing it
+	// yields that instance directly; only a pointer to a scalar lives in a cell and
+	// reads through its get.
+	if p, ok := l.pkg.Info.TypeOf(e.X).Underlying().(*types.Pointer); ok {
+		if isStructValue(p.Elem()) || isArrayValue(p.Elem()) {
+			return x, nil
+		}
 	}
 	return &ir.Deref{X: x}, nil
 }
@@ -2903,6 +3125,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 			}
 			return &ir.Intrinsic{Name: "println", Args: args}, nil
 		}
+		if sel, ok := l.pkg.Info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
+			return l.lowerMethodCall(e, fun, sel)
+		}
 		return nil, l.errf(e.Pos(), "call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
 	case *ast.Ident:
 		if b, ok := l.pkg.Info.Uses[fun].(*types.Builtin); ok {
@@ -2927,6 +3152,49 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 // directly. make builds a slice header over a freshly zeroed backing. The other
 // builtins wait on the slices that bring their types, so an unhandled one fails
 // loudly.
+// lowerMethodCall lowers a method call recv.M(args) to a MethodCall on the lowered
+// receiver. A value-receiver method operates on a copy of the receiver, so the
+// receiver is cloned at the call: a value read of a struct clones through the same
+// ident-or-field discriminator as any value copy, and a call through a pointer
+// clones the pointed-to struct since Go copies it on the implicit dereference. A
+// pointer-receiver method operates on the instance, so the receiver passes through
+// directly, which is also how Go's automatic address-of a value receiver lowers,
+// since the struct instance already is the reference the pointer would name. A
+// promoted method reached through an embedded field waits on the embedding slice.
+func (l *lowerer) lowerMethodCall(e *ast.CallExpr, sel *ast.SelectorExpr, selection *types.Selection) (ir.Expr, error) {
+	if len(selection.Index()) > 1 {
+		return nil, l.errf(e.Pos(), "a promoted method call %s is not supported yet", sel.Sel.Name)
+	}
+	recv, err := l.lowerExpr(sel.X)
+	if err != nil {
+		return nil, err
+	}
+	method, ok := selection.Obj().(*types.Func)
+	if !ok {
+		return nil, l.errf(e.Pos(), "method %s is not supported yet", sel.Sel.Name)
+	}
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return nil, l.errf(e.Pos(), "method %s is not supported yet", sel.Sel.Name)
+	}
+	if _, ptr := sig.Recv().Type().(*types.Pointer); !ptr {
+		// A value receiver takes a copy. When the receiver expression is a pointer,
+		// Go copies the pointed-to struct on the automatic dereference, so the
+		// instance is cloned unconditionally; otherwise the shared value-copy
+		// discriminator clones a named read and leaves a fresh value alone.
+		if _, ptrRecv := l.pkg.Info.TypeOf(sel.X).(*types.Pointer); ptrRecv {
+			recv = &ir.Clone{X: recv}
+		} else {
+			recv = l.copyIfValueRead(sel.X, recv)
+		}
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.MethodCall{Recv: recv, Name: sel.Sel.Name, Args: args}, nil
+}
+
 func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin) (ir.Expr, error) {
 	switch fun.Name {
 	case "len", "cap":

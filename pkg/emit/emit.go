@@ -80,7 +80,9 @@ func Module(m *ir.Module) (string, error) {
 		if wrote {
 			b.WriteString("\n\n")
 		}
-		emitStruct(&b, sd)
+		if err := emitStruct(&b, sd); err != nil {
+			return "", err
+		}
 		wrote = true
 	}
 	hasMain := false
@@ -115,6 +117,11 @@ func usesShim(m *ir.Module) bool {
 			case ir.FieldArray:
 				// An array field always emits the clone and array-key helpers in the
 				// generated copy and hash methods, so it needs the runtime import.
+				return true
+			}
+		}
+		for _, method := range sd.Methods {
+			if blockUsesShim(method.Body) {
 				return true
 			}
 		}
@@ -199,6 +206,8 @@ func exprUsesShim(e ir.Expr) bool {
 		return exprUsesShim(e.X) || exprUsesShim(e.Index)
 	case *ir.CallExpr:
 		return argsUseShim(e.Args)
+	case *ir.MethodCall:
+		return exprUsesShim(e.Recv) || argsUseShim(e.Args)
 	case *ir.FieldAccess:
 		return exprUsesShim(e.X)
 	case *ir.AddrField:
@@ -275,7 +284,7 @@ func emitFunc(b *strings.Builder, fn *ir.Func) error {
 // sharing; a value-struct field defaults to None and builds a fresh zero instance
 // in the constructor body, so a keyword literal that omits it still gets an
 // independent value, and copies by calling that field's own copy.
-func emitStruct(b *strings.Builder, sd *ir.StructDef) {
+func emitStruct(b *strings.Builder, sd *ir.StructDef) error {
 	fmt.Fprintf(b, "class %s:\n", sd.Name)
 	writeIndent(b, 1)
 	b.WriteString("__slots__ = (")
@@ -347,6 +356,16 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) {
 	if sd.Comparable {
 		emitStructEq(b, sd)
 	}
+
+	for _, method := range sd.Methods {
+		b.WriteString("\n")
+		writeIndent(b, 1)
+		fmt.Fprintf(b, "def %s(%s):\n", method.Name, strings.Join(append([]string{"self"}, method.Params...), ", "))
+		if err := emitBlock(b, method.Body, 2); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // emitStructEq writes the field-wise __eq__ and matching __hash__ a comparable Go
@@ -753,6 +772,16 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s(%s)", e.Name, args), nil
+	case *ir.MethodCall:
+		recv, err := emitExpr(e.Recv)
+		if err != nil {
+			return "", err
+		}
+		args, err := emitArgs(e.Args)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s.%s(%s)", recv, e.Name, args), nil
 	case *ir.Intrinsic:
 		args, err := emitArgs(e.Args)
 		if err != nil {
