@@ -70,3 +70,68 @@ func TestErrorEmit(t *testing.T) {
 		}
 	}
 }
+
+// TestErrorWrapValues checks the wrapping surface against go run. fmt.Errorf with
+// a %w renders the message the fmt way and records the operand, errors.Unwrap
+// walks one level to it and reads nil for a plain error, errors.Is finds a
+// sentinel down a chain and through a join and reports a miss, and errors.Join
+// combines the non-nil messages by newlines. Sentinels are locals since the
+// compiled tier does not yet emit package level vars.
+func TestErrorWrapValues(t *testing.T) {
+	t.Parallel()
+	const head = "package main\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{
+			"a wrapped error prints and unwraps to the wrapped one",
+			head + "func main() {\n\tbase := errors.New(\"not found\")\n\twrapped := fmt.Errorf(\"open config: %w\", base)\n\tfmt.Println(wrapped)\n\tif errors.Is(wrapped, base) {\n\t\tfmt.Println(\"is base\")\n\t}\n\tinner := errors.Unwrap(wrapped)\n\tfmt.Println(inner)\n}\n",
+		},
+		{
+			"errors.Is reports a miss and unwrap of a plain error is nil",
+			head + "func main() {\n\tbase := errors.New(\"boom\")\n\tother := errors.New(\"other\")\n\twrapped := fmt.Errorf(\"wrap: %w\", base)\n\tif !errors.Is(wrapped, other) {\n\t\tfmt.Println(\"not other\")\n\t}\n\tplain := fmt.Errorf(\"code %d: %s\", 42, \"bad\")\n\tfmt.Println(plain)\n\tfmt.Println(errors.Unwrap(plain))\n}\n",
+		},
+		{
+			"a two level chain walks to the root",
+			head + "func main() {\n\ta := errors.New(\"a\")\n\tb := fmt.Errorf(\"b: %w\", a)\n\tc := fmt.Errorf(\"c: %w\", b)\n\tfmt.Println(c)\n\tif errors.Is(c, a) {\n\t\tfmt.Println(\"reaches a\")\n\t}\n}\n",
+		},
+		{
+			"a join combines messages and is finds each branch",
+			head + "func main() {\n\ta := errors.New(\"one\")\n\tb := errors.New(\"two\")\n\tj := errors.Join(a, b)\n\tfmt.Println(j)\n\tfmt.Println(errors.Is(j, a), errors.Is(j, b))\n}\n",
+		},
+		{
+			"the quote verb quotes its operand",
+			head + "func main() {\n\terr := fmt.Errorf(\"key %q: %w\", \"a\\tb\", errors.New(\"missing\"))\n\tfmt.Println(err)\n}\n",
+		},
+		{
+			"a nil join is nil",
+			head + "func main() {\n\tvar a, b error\n\tfmt.Println(errors.Join(a, b))\n}\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestErrorWrapEmit pins the shape of the wrapping surface: fmt.Errorf routes to
+// the errorf intrinsic with the format carried as bytes, and the errors functions
+// route to their own intrinsics over the plainly lowered operands.
+func TestErrorWrapEmit(t *testing.T) {
+	t.Parallel()
+	const src = "package main\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n\nfunc main() {\n\tbase := errors.New(\"base\")\n\twrapped := fmt.Errorf(\"open %s: %w\", \"cfg\", base)\n\tfmt.Println(errors.Is(wrapped, base))\n\tfmt.Println(errors.Unwrap(wrapped))\n\tfmt.Println(errors.Join(base, wrapped))\n}\n"
+	got := emitOf(t, src)
+	for _, want := range []string{
+		"_hebirt.errorf(b\"open %s: %w\", b\"cfg\", base)",
+		"_hebirt.errors_is(wrapped, base)",
+		"_hebirt.errors_unwrap(wrapped)",
+		"_hebirt.errors_join(base, wrapped)",
+	} {
+		if !bytesContains(got, want) {
+			t.Errorf("emit missing %q\n%s", want, got)
+		}
+	}
+}

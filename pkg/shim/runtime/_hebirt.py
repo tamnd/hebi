@@ -511,6 +511,252 @@ def errors_new(msg):
     return _StringError(msg)
 
 
+class _WrapError:
+    """The error fmt.Errorf returns when the format holds one %w verb.
+
+    It carries the combined message and the single wrapped error, and its Unwrap
+    hands that error back so errors.Unwrap, errors.Is, and errors.As can walk to
+    it. The message is a Go string, so it is bytes, the same as every other error.
+    """
+
+    __slots__ = ("_msg", "_err")
+
+    def __init__(self, msg, err):
+        self._msg = msg
+        self._err = err
+
+    def Error(self):
+        return self._msg
+
+    def Unwrap(self):
+        return self._err
+
+    def __str__(self):
+        return go_str(self._msg)
+
+
+class _WrapErrors:
+    """The error fmt.Errorf returns when the format holds more than one %w verb.
+
+    Its Unwrap returns the list of wrapped errors, the multi-error shape Go added
+    in 1.20, so errors.Is and errors.As walk every branch while the single-level
+    errors.Unwrap does not follow it.
+    """
+
+    __slots__ = ("_msg", "_errs")
+
+    def __init__(self, msg, errs):
+        self._msg = msg
+        self._errs = errs
+
+    def Error(self):
+        return self._msg
+
+    def Unwrap(self):
+        return list(self._errs)
+
+    def __str__(self):
+        return go_str(self._msg)
+
+
+class _JoinError:
+    """The error errors.Join returns, wrapping a list of non-nil errors.
+
+    Its message is the wrapped errors' messages joined by newlines, and its Unwrap
+    returns the list, the same multi-error shape _WrapErrors carries, so the chain
+    walk recurses into every branch.
+    """
+
+    __slots__ = ("_errs",)
+
+    def __init__(self, errs):
+        self._errs = errs
+
+    def Error(self):
+        return b"\n".join(_error_bytes(e) for e in self._errs)
+
+    def Unwrap(self):
+        return list(self._errs)
+
+    def __str__(self):
+        return go_str(self.Error())
+
+
+def _error_bytes(err):
+    """Return an error value's Error text as bytes, the Go string it renders to."""
+    m = err.Error()
+    if isinstance(m, str):
+        return m.encode("utf-8")
+    return bytes(m)
+
+
+# fmt.Errorf formatting. The verb set the lowerer admits is v, s, d, t, w, and q;
+# every one but q renders exactly as go_str already does, since go_str is Go's
+# default format, so the formatter routes those through it and handles q, Go's
+# double-quoted string form, on its own. The lowerer has already checked the
+# format is a constant whose verbs are all in this set, so no unknown verb reaches
+# here.
+
+_quote_escapes = {
+    0x07: b"\\a",
+    0x08: b"\\b",
+    0x09: b"\\t",
+    0x0A: b"\\n",
+    0x0B: b"\\v",
+    0x0C: b"\\f",
+    0x0D: b"\\r",
+    0x22: b'\\"',
+    0x5C: b"\\\\",
+}
+
+
+def _go_quote(value):
+    """Render a Go string, carried as bytes, in Go's %q double-quoted form.
+
+    Each byte takes its escape where Go escapes it, a printable ASCII byte prints
+    as itself, and any other byte prints as a \\x hex escape, which matches
+    strconv.Quote over the ASCII strings the error messages use.
+    """
+    out = bytearray(b'"')
+    for b in value:
+        esc = _quote_escapes.get(b)
+        if esc is not None:
+            out += esc
+        elif 0x20 <= b < 0x7F:
+            out.append(b)
+        else:
+            out += b"\\x%02x" % b
+    out += b'"'
+    return bytes(out)
+
+
+def errorf(fmt, *args):
+    """Build the error fmt.Errorf returns, formatting the message and recording %w.
+
+    The format is scanned once: a %w renders its operand like %v and also records
+    the operand as wrapped, and the other verbs render through go_str or the quote
+    helper. No %w yields a plain string error, one yields a single-wrap error, and
+    several yield the multi-error wrap shape.
+    """
+    out = bytearray()
+    wrapped = []
+    i = 0
+    argi = 0
+    n = len(fmt)
+    while i < n:
+        c = fmt[i]
+        if c != 0x25:
+            out.append(c)
+            i += 1
+            continue
+        verb = fmt[i + 1]
+        i += 2
+        if verb == 0x25:
+            out.append(0x25)
+            continue
+        arg = args[argi]
+        argi += 1
+        if verb == 0x71:
+            out += _go_quote(arg)
+            continue
+        if verb == 0x77:
+            wrapped.append(arg)
+        out += go_str(arg).encode("utf-8")
+    msg = bytes(out)
+    if not wrapped:
+        return _StringError(msg)
+    if len(wrapped) == 1:
+        return _WrapError(msg, wrapped[0])
+    return _WrapErrors(msg, wrapped)
+
+
+def errors_unwrap(err):
+    """errors.Unwrap: one level through an Unwrap() error, None for anything else.
+
+    A multi-error Unwrap that returns a list is deliberately not followed, so a
+    joined or multiply wrapped error unwraps to None here, matching Go's single
+    errors.Unwrap.
+    """
+    u = getattr(err, "Unwrap", None)
+    if u is None:
+        return None
+    result = u()
+    if isinstance(result, list):
+        return None
+    return result
+
+
+def _comparable_equal(a, b):
+    """Report Go == equality between two error values, guarded for uncomparable ones."""
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def errors_is(err, target):
+    """errors.Is: whether any error in err's chain matches target.
+
+    At each node it matches on identity or Go == equality, then on an Is(error)
+    method, then unwraps, following both the single Unwrap() error and the multi
+    Unwrap() []error shapes, recursing into every branch of the latter.
+    """
+    if target is None:
+        return err is None
+    while err is not None:
+        if err is target or _comparable_equal(err, target):
+            return True
+        is_method = getattr(err, "Is", None)
+        if is_method is not None and is_method(target):
+            return True
+        nxt = getattr(err, "Unwrap", None)
+        if nxt is None:
+            return False
+        u = nxt()
+        if isinstance(u, list):
+            return any(errors_is(e, target) for e in u)
+        err = u
+    return False
+
+
+def errors_as(err, typ):
+    """errors.As in comma-ok form: the first error in the chain of type typ, and ok.
+
+    Go writes the match through a pointer target and returns a bool; Python has no
+    output pointer, so the match is returned as a (value, ok) pair, the same shape
+    a type assertion takes. It honors an As(type) method and walks the multi-error
+    tree, stopping at the first match as Go does.
+    """
+    while err is not None:
+        if isinstance(err, typ):
+            return err, True
+        as_method = getattr(err, "As", None)
+        if as_method is not None:
+            got, ok = as_method(typ)
+            if ok:
+                return got, True
+        nxt = getattr(err, "Unwrap", None)
+        if nxt is None:
+            return None, False
+        u = nxt()
+        if isinstance(u, list):
+            for e in u:
+                got, ok = errors_as(e, typ)
+                if ok:
+                    return got, True
+            return None, False
+        err = u
+    return None, False
+
+
+def errors_join(*errs):
+    """errors.Join: wrap the non-nil errors, or None when every argument is nil."""
+    kept = [e for e in errs if e is not None]
+    if not kept:
+        return None
+    return _JoinError(kept)
+
+
 def _runtime_error(msg):
     """Return the GoPanic a runtime check raises, carrying a runtime error value.
 

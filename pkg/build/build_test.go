@@ -618,6 +618,11 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"address of a local inside a closure", "package main\n\nfunc main() {\n\tf := func() {\n\t\tx := 1\n\t\tp := &x\n\t\t_ = p\n\t}\n\tf()\n}\n"},
 		{"address of a package level variable", "package main\n\nvar g int\n\nfunc main() {\n\tp := &g\n\t_ = p\n}\n"},
 		{"boxed local in a parallel assignment", "package main\n\nfunc main() {\n\tx := 1\n\ty := 2\n\tp := &x\n\tx, y = y, x\n\t_ = p\n\t_ = y\n}\n"},
+		{"errors.As comma-ok", "package main\n\nimport \"errors\"\n\ntype myErr struct{}\n\nfunc (e *myErr) Error() string { return \"m\" }\n\nfunc main() {\n\tvar err error = &myErr{}\n\tvar target *myErr\n\t_ = errors.As(err, &target)\n}\n"},
+		{"fmt.Errorf with a non-constant format", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tf := \"%d\"\n\terr := fmt.Errorf(f, 1)\n\t_ = err\n}\n"},
+		{"fmt.Errorf with an unsupported verb", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\terr := fmt.Errorf(\"%x\", 255)\n\t_ = err\n}\n"},
+		{"fmt.Errorf with a width", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\terr := fmt.Errorf(\"%3d\", 1)\n\t_ = err\n}\n"},
+		{"errors.Join with a spread", "package main\n\nimport \"errors\"\n\nfunc main() {\n\terrs := []error{errors.New(\"a\")}\n\terr := errors.Join(errs...)\n\t_ = err\n}\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
