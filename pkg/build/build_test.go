@@ -598,6 +598,8 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"promoted method call", "package main\n\ntype Base struct{ N int }\n\nfunc (b Base) Get() int {\n\treturn b.N\n}\n\ntype User struct {\n\tBase\n\tName string\n}\n\nfunc main() {\n\tu := User{}\n\t_ = u.Get()\n}\n"},
 		{"reassigning an address-taken struct", "package main\n\ntype Point struct{ X int }\n\nfunc main() {\n\tp := Point{1}\n\tq := &p\n\tp = Point{2}\n\t_ = q\n}\n"},
 		{"writing through a pointer to a struct", "package main\n\ntype Point struct{ X int }\n\nfunc main() {\n\tp := Point{1}\n\tq := &p\n\t*q = Point{2}\n\t_ = q\n}\n"},
+		{"promoted method value", "package main\n\ntype Base struct{ N int }\n\nfunc (b Base) Get() int {\n\treturn b.N\n}\n\ntype User struct {\n\tBase\n\tName string\n}\n\nfunc main() {\n\tu := User{}\n\tf := u.Get\n\t_ = f\n}\n"},
+		{"promoted method expression", "package main\n\ntype Base struct{ N int }\n\nfunc (b Base) Get() int {\n\treturn b.N\n}\n\ntype User struct {\n\tBase\n\tName string\n}\n\nfunc main() {\n\tf := User.Get\n\t_ = f\n}\n"},
 		{"variadic parameter", "package main\n\nfunc f(xs ...int) {}\n\nfunc main() { f() }\n"},
 		{"embedded pointer field", "package main\n\ntype Inner struct{ N int }\n\ntype Outer struct {\n\t*Inner\n\tM int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"},
 		{"division compound assign", "package main\n\nfunc main() {\n\tx := 8\n\tx /= 2\n\t_ = x\n}\n"},

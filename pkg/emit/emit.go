@@ -208,6 +208,12 @@ func exprUsesShim(e ir.Expr) bool {
 		return argsUseShim(e.Args)
 	case *ir.MethodCall:
 		return exprUsesShim(e.Recv) || argsUseShim(e.Args)
+	case *ir.MethodValue:
+		return exprUsesShim(e.Recv)
+	case *ir.MethodExpr:
+		// The receiver is a class name and the copy is a method on the value, so no
+		// runtime shim is reached.
+		return false
 	case *ir.FieldAccess:
 		return exprUsesShim(e.X)
 	case *ir.AddrField:
@@ -782,6 +788,20 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.%s(%s)", recv, e.Name, args), nil
+	case *ir.MethodValue:
+		recv, err := emitExpr(e.Recv)
+		if err != nil {
+			return "", err
+		}
+		if e.Copy {
+			return fmt.Sprintf("%s.copy().%s", recv, e.Name), nil
+		}
+		return fmt.Sprintf("%s.%s", recv, e.Name), nil
+	case *ir.MethodExpr:
+		if e.ValueCopy {
+			return fmt.Sprintf("lambda _s, *_a: %s.%s(_s.copy(), *_a)", e.Recv, e.Name), nil
+		}
+		return fmt.Sprintf("%s.%s", e.Recv, e.Name), nil
 	case *ir.Intrinsic:
 		args, err := emitArgs(e.Args)
 		if err != nil {

@@ -750,6 +750,58 @@ func TestVerifyMethodSurface(t *testing.T) {
 	}
 }
 
+// TestVerifyMethodBindingSurface accepts a method value bound to a receiver and an
+// unbound method expression, and rejects a method value with no name, a method
+// value with a nil receiver, a method expression with no type, and a method
+// expression with no name.
+func TestVerifyMethodBindingSurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&AssignStmt{Name: "f", Define: true, Value: &MethodValue{Recv: &Ident{Name: "p"}, Name: "Sum", Copy: true}},
+				&AssignStmt{Name: "g", Define: true, Value: &MethodExpr{Recv: "Point", Name: "Sum"}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed method binding surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"method value empty name", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*MethodValue).Name = ""
+		}, "binds a method with no name"},
+		{"method value nil receiver", func(m *Module) {
+			m.Funcs[0].Body[0].(*AssignStmt).Value.(*MethodValue).Recv = nil
+		}, "nil expression"},
+		{"method expression empty type", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*MethodExpr).Recv = ""
+		}, "method expression with no type"},
+		{"method expression empty name", func(m *Module) {
+			m.Funcs[0].Body[1].(*AssignStmt).Value.(*MethodExpr).Name = ""
+		}, "method expression with no name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {

@@ -2513,28 +2513,109 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 	}
 }
 
-// lowerSelector lowers a selector used as a value. Only a field read is supported
-// in this slice, s.field, which becomes a Python attribute access; a method value
-// and a promoted field wait on the embedding slice, and a package member such as
-// a constant waits on its own slice. The copy a struct-valued field read owes is
-// injected by the caller through copyIfValueRead, not here, so a field read that
-// is only addressed or compared is not needlessly cloned.
+// lowerSelector lowers a selector used as a value. A field read s.field becomes a
+// Python attribute access, a method value recv.M binds the receiver, and a method
+// expression T.M yields the unbound class function. A promoted field or method
+// waits on the embedding slice, and a package member such as a constant waits on
+// its own slice. The copy a struct-valued field read owes is injected by the
+// caller through copyIfValueRead, not here, so a field read that is only addressed
+// or compared is not needlessly cloned.
 func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 	selection, ok := l.pkg.Info.Selections[e]
 	if !ok {
 		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
 	}
-	if selection.Kind() != types.FieldVal {
+	switch selection.Kind() {
+	case types.FieldVal:
+		x, err := l.lowerExpr(e.X)
+		if err != nil {
+			return nil, err
+		}
+		// A direct field is a single-step path; a promoted field steps through the
+		// embedded slots go/types resolved, so u.ID reads u.Base.ID at emit time with
+		// no runtime delegation, matching the type checker's selection.
+		return l.fieldChain(x, l.pkg.Info.TypeOf(e.X), selection.Index()), nil
+	case types.MethodVal:
+		return l.lowerMethodValue(e, selection)
+	case types.MethodExpr:
+		return l.lowerMethodExpr(e, selection)
+	default:
+		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
+	}
+}
+
+// lowerMethodValue lowers a method value recv.M to a bound method. A value receiver
+// is snapshotted with a copy at the point the value is taken, matching Go's copy of
+// the receiver into the value, so a later mutation of the original is not observed;
+// a pointer receiver keeps the shared instance. A promoted method value through an
+// embedded field waits on the embedding slice.
+func (l *lowerer) lowerMethodValue(e *ast.SelectorExpr, selection *types.Selection) (ir.Expr, error) {
+	if len(selection.Index()) > 1 {
+		return nil, l.errf(e.Pos(), "a promoted method value %s is not supported yet", e.Sel.Name)
+	}
+	sig, ok := methodSig(selection)
+	if !ok {
 		return nil, l.errf(e.Pos(), "method value %s is not supported yet", e.Sel.Name)
 	}
-	x, err := l.lowerExpr(e.X)
+	recv, err := l.lowerExpr(e.X)
 	if err != nil {
 		return nil, err
 	}
-	// A direct field is a single-step path; a promoted field steps through the
-	// embedded slots go/types resolved, so u.ID reads u.Base.ID at emit time with
-	// no runtime delegation, matching the type checker's selection.
-	return l.fieldChain(x, l.pkg.Info.TypeOf(e.X), selection.Index()), nil
+	_, ptr := sig.Recv().Type().(*types.Pointer)
+	return &ir.MethodValue{Recv: recv, Name: e.Sel.Name, Copy: !ptr}, nil
+}
+
+// lowerMethodExpr lowers a method expression T.M to the unbound class function
+// whose first argument is the receiver. A value receiver carries a copy obligation
+// on that first argument, so the emitter wraps the call in a lambda that snapshots
+// it; a pointer receiver takes the instance directly. Only a method on a struct is
+// modeled, so a method expression on another named type is diagnosed.
+func (l *lowerer) lowerMethodExpr(e *ast.SelectorExpr, selection *types.Selection) (ir.Expr, error) {
+	if len(selection.Index()) > 1 {
+		return nil, l.errf(e.Pos(), "a promoted method expression %s is not supported yet", e.Sel.Name)
+	}
+	sig, ok := methodSig(selection)
+	if !ok {
+		return nil, l.errf(e.Pos(), "method expression %s is not supported yet", e.Sel.Name)
+	}
+	name, ok := receiverClassName(sig)
+	if !ok {
+		return nil, l.errf(e.Pos(), "a method expression on non-struct type %s is not supported yet", e.Sel.Name)
+	}
+	_, ptr := sig.Recv().Type().(*types.Pointer)
+	return &ir.MethodExpr{Recv: name, Name: e.Sel.Name, ValueCopy: !ptr}, nil
+}
+
+// methodSig returns the signature of the method a selection resolves to, with its
+// receiver, or false when the selection is not a method with a receiver.
+func methodSig(selection *types.Selection) (*types.Signature, bool) {
+	method, ok := selection.Obj().(*types.Func)
+	if !ok {
+		return nil, false
+	}
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return nil, false
+	}
+	return sig, true
+}
+
+// receiverClassName returns the generated class name for a method's receiver, which
+// is the struct type's name seen through a pointer receiver, or false when the
+// receiver is not a struct and so has no generated class.
+func receiverClassName(sig *types.Signature) (string, bool) {
+	t := sig.Recv().Type()
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok {
+		return "", false
+	}
+	if _, ok := named.Underlying().(*types.Struct); !ok {
+		return "", false
+	}
+	return named.Obj().Name(), true
 }
 
 // fieldChain builds the nested field access a selection resolves to, following
@@ -3125,8 +3206,13 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 			}
 			return &ir.Intrinsic{Name: "println", Args: args}, nil
 		}
-		if sel, ok := l.pkg.Info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
-			return l.lowerMethodCall(e, fun, sel)
+		if sel, ok := l.pkg.Info.Selections[fun]; ok {
+			switch sel.Kind() {
+			case types.MethodVal:
+				return l.lowerMethodCall(e, fun, sel)
+			case types.MethodExpr:
+				return l.lowerMethodExprCall(e, fun, sel)
+			}
 		}
 		return nil, l.errf(e.Pos(), "call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
 	case *ast.Ident:
@@ -3189,6 +3275,38 @@ func (l *lowerer) lowerMethodCall(e *ast.CallExpr, sel *ast.SelectorExpr, select
 		}
 	}
 	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.MethodCall{Recv: recv, Name: sel.Sel.Name, Args: args}, nil
+}
+
+// lowerMethodExprCall lowers an immediately called method expression T.M(recv,
+// args) to the same MethodCall as recv.M(args), since a method expression is a
+// method call with the receiver passed as the first argument. A value receiver
+// copies that first argument exactly as a value-receiver method call copies its
+// receiver, and a pointer receiver passes the instance. A promoted method
+// expression waits on the embedding slice.
+func (l *lowerer) lowerMethodExprCall(e *ast.CallExpr, sel *ast.SelectorExpr, selection *types.Selection) (ir.Expr, error) {
+	if len(selection.Index()) > 1 {
+		return nil, l.errf(e.Pos(), "a promoted method expression %s is not supported yet", sel.Sel.Name)
+	}
+	sig, ok := methodSig(selection)
+	if !ok || len(e.Args) == 0 {
+		return nil, l.errf(e.Pos(), "method expression %s is not supported yet", sel.Sel.Name)
+	}
+	recv, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if _, ptr := sig.Recv().Type().(*types.Pointer); !ptr {
+		if _, ptrRecv := l.pkg.Info.TypeOf(e.Args[0]).(*types.Pointer); ptrRecv {
+			recv = &ir.Clone{X: recv}
+		} else {
+			recv = l.copyIfValueRead(e.Args[0], recv)
+		}
+	}
+	args, err := l.lowerCallArgs(e.Args[1:])
 	if err != nil {
 		return nil, err
 	}

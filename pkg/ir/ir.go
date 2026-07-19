@@ -369,6 +369,28 @@ type MethodCall struct {
 	Args []Expr
 }
 
+// MethodValue binds a method to a receiver, recv.Name, yielding a Python bound
+// method that carries the receiver. When Copy is set the method has a value
+// receiver, so the receiver is snapshotted with a copy at the point the value is
+// taken, recv.copy().Name, matching Go's copy of the receiver into the value; a
+// pointer receiver keeps the shared instance, so Copy is clear.
+type MethodValue struct {
+	Recv Expr
+	Name string
+	Copy bool
+}
+
+// MethodExpr is an unbound method expression, T.Name, yielding the class function
+// whose first argument is the receiver. When ValueCopy is set the method has a
+// value receiver, so a lambda wraps the call to snapshot that first argument with
+// a copy before the method runs, matching Go's copy of a value receiver; a pointer
+// receiver takes the instance directly, so the bare class function is emitted.
+type MethodExpr struct {
+	Recv      string
+	Name      string
+	ValueCopy bool
+}
+
 // FieldAccess reads a field of a struct value, obj.Name. The read alone does not
 // copy; the copy at a value read is a separate Clone the lowering wraps around
 // this node where Go's value semantics demand an independent value.
@@ -576,6 +598,8 @@ func (*Convert) isExpr()     {}
 func (*IndexExpr) isExpr()   {}
 func (*CallExpr) isExpr()    {}
 func (*MethodCall) isExpr()  {}
+func (*MethodValue) isExpr() {}
+func (*MethodExpr) isExpr()  {}
 func (*Intrinsic) isExpr()   {}
 func (*AddrField) isExpr()   {}
 func (*AddrIndex) isExpr()   {}
