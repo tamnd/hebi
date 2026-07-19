@@ -4749,6 +4749,14 @@ func (l *lowerer) lowerBasicLit(e *ast.BasicLit) (ir.Expr, error) {
 			return nil, l.errf(e.Pos(), "malformed string literal: %v", err)
 		}
 		return &ir.StringLit{Value: value}, nil
+	case token.CHAR:
+		// A rune literal is an integer, its Unicode code point, since a rune is
+		// int32 on this tier, so 'w' lowers to 119 the way Go treats it.
+		value, _, tail, err := strconv.UnquoteChar(strings.Trim(e.Value, "'"), '\'')
+		if err != nil || tail != "" {
+			return nil, l.errf(e.Pos(), "malformed rune literal: %s", e.Value)
+		}
+		return &ir.IntLit{Text: strconv.Itoa(int(value))}, nil
 	default:
 		return nil, l.errf(e.Pos(), "%s literal is not supported yet", e.Kind)
 	}
@@ -4821,6 +4829,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		}
 		if name, ok := l.pkgFunc(fun, "fmt"); ok {
 			return l.lowerFmtFunc(e, name)
+		}
+		if name, ok := l.pkgFunc(fun, "strings"); ok {
+			return l.lowerStringsFunc(e, name)
 		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
@@ -5337,6 +5348,58 @@ func (l *lowerer) lowerErrorsFunc(e *ast.CallExpr, name string) (ir.Expr, error)
 	default:
 		return nil, l.errf(e.Pos(), "errors.%s is not supported yet", name)
 	}
+}
+
+// stringsIntrinsics maps a strings package function to the runtime shim that
+// carries its Go semantics over a byte-string. Every entry here renders exactly
+// the way strings does, since the shim decodes and re-encodes utf-8 where a
+// case fold or a rune split needs it, so the lowering is a plain name lookup.
+// strings.Builder and the reader types are value structs with methods and wait
+// for their own slice, and a function outside this table fails loudly.
+var stringsIntrinsics = map[string]string{
+	"Contains":     "str_contains",
+	"ContainsRune": "str_contains_rune",
+	"HasPrefix":    "str_has_prefix",
+	"HasSuffix":    "str_has_suffix",
+	"Index":        "str_index",
+	"LastIndex":    "str_last_index",
+	"IndexByte":    "str_index_byte",
+	"Count":        "str_count",
+	"Split":        "str_split",
+	"SplitN":       "str_split_n",
+	"Fields":       "str_fields",
+	"Join":         "str_join",
+	"ToUpper":      "str_to_upper",
+	"ToLower":      "str_to_lower",
+	"TrimSpace":    "str_trim_space",
+	"Trim":         "str_trim",
+	"TrimLeft":     "str_trim_left",
+	"TrimRight":    "str_trim_right",
+	"TrimPrefix":   "str_trim_prefix",
+	"TrimSuffix":   "str_trim_suffix",
+	"Repeat":       "str_repeat",
+	"Replace":      "str_replace",
+	"ReplaceAll":   "str_replace_all",
+	"EqualFold":    "str_equal_fold",
+}
+
+// lowerStringsFunc lowers a call to the standard strings package by mapping the
+// function to its runtime shim through stringsIntrinsics. A spread argument has
+// no strings function that takes one, so it fails loudly, and so does a function
+// the table does not carry.
+func (l *lowerer) lowerStringsFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "strings.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := stringsIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "strings.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
 }
 
 // errorsAsCall reports whether an expression is a call to errors.As, and returns
