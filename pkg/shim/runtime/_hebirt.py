@@ -2396,6 +2396,138 @@ def go(fn, *args):
     threading.Thread(target=_run, daemon=True).start()
 
 
+class Duration(int):
+    """Go's time.Duration, an int64 nanosecond count that carries the duration
+    methods.
+
+    A Duration is-a int, so it adds, subtracts, scales, and compares as its
+    nanosecond count with no unwrapping, and the arithmetic result reboxes at
+    the lowering so it keeps the type. The value is the same one time.Second and
+    the other unit constants fold to, so 2 * time.Second is Duration(2000000000)
+    and prints through String the way Go's fmt does.
+    """
+
+    _hebi_type = "time.Duration"
+
+    def Nanoseconds(self):
+        return _i64(int(self))
+
+    def Microseconds(self):
+        return _idiv(int(self), 1000)
+
+    def Milliseconds(self):
+        return _idiv(int(self), 1000000)
+
+    def Seconds(self):
+        sec = _idiv(int(self), 1000000000)
+        nsec = _imod(int(self), 1000000000)
+        return float(sec) + float(nsec) / 1e9
+
+    def Minutes(self):
+        minute = _idiv(int(self), 60000000000)
+        nsec = _imod(int(self), 60000000000)
+        return float(minute) + float(nsec) / (60 * 1e9)
+
+    def Hours(self):
+        hour = _idiv(int(self), 3600000000000)
+        nsec = _imod(int(self), 3600000000000)
+        return float(hour) + float(nsec) / (60 * 60 * 1e9)
+
+    def Truncate(self, m):
+        m = int(m)
+        if m <= 0:
+            return self
+        return Duration(_i64(int(self) - _imod(int(self), m)))
+
+    def Round(self, m):
+        m = int(m)
+        if m <= 0:
+            return self
+        r = _imod(int(self), m)
+        if int(self) < 0:
+            r = -r
+            if r + r < m:
+                return Duration(_i64(int(self) + r))
+            return Duration(_i64(int(self) + r - m))
+        if r + r < m:
+            return Duration(_i64(int(self) - r))
+        return Duration(_i64(int(self) - r + m))
+
+    def String(self):
+        return _duration_string(int(self)).encode("utf-8")
+
+
+def _duration_fmt_int(digits, v):
+    """Prepend v's decimal digits to the digit list, building the Go
+    fmtInt: a zero writes a single '0'."""
+    if v == 0:
+        digits.append("0")
+        return
+    out = []
+    while v > 0:
+        out.append(chr(ord("0") + v % 10))
+        v //= 10
+    out.reverse()
+    digits.extend(out)
+
+
+def _duration_fmt_frac(v, prec):
+    """Format the fraction v / 10**prec into digits, omitting trailing zeros and
+    the point when the fraction is zero, Go's fmtFrac. Returns the text and the
+    reduced integer v / 10**prec."""
+    frac = []
+    printing = False
+    for _ in range(prec):
+        digit = v % 10
+        printing = printing or digit != 0
+        if printing:
+            frac.append(chr(ord("0") + digit))
+        v //= 10
+    frac.reverse()
+    if printing:
+        return "." + "".join(frac), v
+    return "", v
+
+
+def _duration_string(d):
+    """Render a nanosecond count the way Go's time.Duration.String does: a
+    duration under a second uses the largest fitting sub-second unit, ns, us, or
+    ms, and one at or above a second reads as hours, minutes, and seconds with a
+    trimmed fractional part. The micro sign is U+00B5."""
+    if d == 0:
+        return "0s"
+    neg = d < 0
+    u = -d if neg else d
+    if u < 1000000000:
+        if u < 1000:
+            prec, unit = 0, "ns"
+        elif u < 1000000:
+            prec, unit = 3, "µs"
+        else:
+            prec, unit = 6, "ms"
+        frac, u = _duration_fmt_frac(u, prec)
+        digits = []
+        _duration_fmt_int(digits, u)
+        out = "".join(digits) + frac + unit
+    else:
+        frac, u = _duration_fmt_frac(u, 9)
+        digits = []
+        _duration_fmt_int(digits, u % 60)
+        parts = "".join(digits) + frac + "s"
+        u //= 60
+        if u > 0:
+            digits = []
+            _duration_fmt_int(digits, u % 60)
+            parts = "".join(digits) + "m" + parts
+            u //= 60
+            if u > 0:
+                digits = []
+                _duration_fmt_int(digits, u)
+                parts = "".join(digits) + "h" + parts
+        out = parts
+    return "-" + out if neg else out
+
+
 def _sleep(ns):
     """Pause the current goroutine for a Duration, Go's time.Sleep.
 

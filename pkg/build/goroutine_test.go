@@ -50,7 +50,7 @@ func TestGoroutinePanicCrashes(t *testing.T) {
 // after, a go on fmt.Println passes the shim's println reference, an immediately
 // spawned function literal hoists to a def the helper then names, time.Sleep
 // lowers to the sleep intrinsic, and a Duration constant folds to its exact
-// nanosecond value with no package lookup.
+// nanosecond value in one boxed Duration with no package lookup.
 func TestGoroutineEmit(t *testing.T) {
 	t.Parallel()
 	named := emitOf(t, "package main\n\nfunc worker(n int) {}\n\nfunc main() {\n\tgo worker(3)\n}\n")
@@ -66,7 +66,7 @@ func TestGoroutineEmit(t *testing.T) {
 		t.Errorf("goroutine closure emit missing hoisted def call:\n%s", closure)
 	}
 	sleep := emitOf(t, "package main\n\nimport \"time\"\n\nfunc main() {\n\ttime.Sleep(50 * time.Millisecond)\n}\n")
-	if !bytesContains(sleep, "_hebirt._sleep((50 * 1000000))") {
+	if !bytesContains(sleep, "_hebirt._sleep(_hebirt.Duration(50000000))") {
 		t.Errorf("time.Sleep emit missing folded Duration:\n%s", sleep)
 	}
 }

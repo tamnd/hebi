@@ -225,13 +225,49 @@ func (l *lowerer) namedBoxOf(t types.Type) *ir.NamedDef {
 	return l.named[named.Obj().Name()]
 }
 
+// stdBoxClass names the runtime class a standard-library named type boxes into,
+// or the empty string when the type is not a boxed standard type. time.Duration is
+// the first: its value is an int64 nanosecond count that carries the duration
+// methods, so it boxes into the runtime Duration class the same way a local named
+// int does, except the class lives in the shim rather than being emitted here.
+func stdBoxClass(t types.Type) string {
+	named, ok := t.(*types.Named)
+	if !ok {
+		return ""
+	}
+	obj := named.Obj()
+	if obj.Pkg() == nil {
+		return ""
+	}
+	switch obj.Pkg().Path() + "." + obj.Name() {
+	case "time.Duration":
+		return "Duration"
+	}
+	return ""
+}
+
+// boxCtor returns the function that wraps a lowered base value in its named type's
+// class, or nil when the type is not boxed. A local named type calls the class the
+// emitter generates; a standard-library named type calls the class the shim carries
+// through a runtime intrinsic. Both subclass the base value, so the constructor is
+// a plain one-argument call.
+func (l *lowerer) boxCtor(t types.Type) func(ir.Expr) ir.Expr {
+	if nd := l.namedBoxOf(t); nd != nil {
+		return func(x ir.Expr) ir.Expr { return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}} }
+	}
+	if cls := stdBoxClass(t); cls != "" {
+		return func(x ir.Expr) ir.Expr { return &ir.Intrinsic{Name: cls, Args: []ir.Expr{x}} }
+	}
+	return nil
+}
+
 // boxNamed wraps a lowered base value in its named type's class when the type is a
 // boxed named type, so the value carries the type's methods. A call to the class
 // name over the base value builds the instance, since the class subclasses the base
 // and needs no constructor of its own. A type that is not boxed passes through.
 func (l *lowerer) boxNamed(t types.Type, x ir.Expr) ir.Expr {
-	if nd := l.namedBoxOf(t); nd != nil {
-		return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}}
+	if ctor := l.boxCtor(t); ctor != nil {
+		return ctor(x)
 	}
 	return x
 }
@@ -243,18 +279,18 @@ func (l *lowerer) boxNamed(t types.Type, x ir.Expr) ir.Expr {
 // from being re-applied on every read. A conversion boxes at its own lowering, and
 // a call returns whatever its callee already boxed, so both are skipped here.
 func (l *lowerer) boxNamedExpr(e ast.Expr, x ir.Expr) ir.Expr {
-	nd := l.namedBoxOf(l.pkg.Info.TypeOf(e))
-	if nd == nil {
+	ctor := l.boxCtor(l.pkg.Info.TypeOf(e))
+	if ctor == nil {
 		return x
 	}
 	switch e.(type) {
 	case *ast.BasicLit, *ast.BinaryExpr, *ast.UnaryExpr:
-		return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}}
+		return ctor(x)
 	case *ast.Ident, *ast.SelectorExpr:
 		// A named constant folds to a bare literal and needs the box; a variable or
 		// field read is already an instance, so only the constant case wraps.
 		if l.pkg.Info.Types[e].Value != nil {
-			return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}}
+			return ctor(x)
 		}
 	}
 	return x
@@ -2764,7 +2800,10 @@ func (l *lowerer) lowerCompoundAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		return nil, err
 	}
 	inner := &ir.BinaryExpr{Op: spec.op, X: l.identRead(name), Y: y}
-	value := l.narrow(s.Lhs[0], spec.tok, inner)
+	// The arithmetic reads through the box to a bare base value, so a boxed named
+	// target reboxes the result to keep its type, the same wrap a plain x = x op y
+	// takes through boxNamedExpr.
+	value := l.boxNamed(l.pkg.Info.TypeOf(s.Lhs[0]), l.narrow(s.Lhs[0], spec.tok, inner))
 	if l.isBoxedIdent(name) {
 		return []ir.Stmt{&ir.DerefSet{Ptr: &ir.Ident{Name: name.Name}, Value: value}}, nil
 	}
@@ -2784,7 +2823,7 @@ func (l *lowerer) lowerIncDec(s *ast.IncDecStmt) ([]ir.Stmt, error) {
 		op, tok = "-", token.SUB
 	}
 	inner := &ir.BinaryExpr{Op: op, X: l.identRead(name), Y: &ir.IntLit{Text: "1"}}
-	value := l.narrow(s.X, tok, inner)
+	value := l.boxNamed(l.pkg.Info.TypeOf(s.X), l.narrow(s.X, tok, inner))
 	if l.isBoxedIdent(name) {
 		return []ir.Stmt{&ir.DerefSet{Ptr: &ir.Ident{Name: name.Name}, Value: value}}, nil
 	}
@@ -4054,6 +4093,18 @@ func (l *lowerer) constMember(e ast.Expr) (ir.Expr, bool) {
 	}
 }
 
+// foldNamedConst folds a compile-time constant whose static type is a boxed named
+// type to its literal, so an expression like 50 * time.Millisecond lowers to one
+// boxed literal rather than a tree of boxed operands the arithmetic would otherwise
+// build. It reports false for a non-constant or an unboxed type, leaving the caller
+// to lower the operands. The single box is applied by boxNamedExpr on the way out.
+func (l *lowerer) foldNamedConst(e ast.Expr) (ir.Expr, bool) {
+	if l.boxCtor(l.pkg.Info.TypeOf(e)) == nil {
+		return nil, false
+	}
+	return l.constMember(e)
+}
+
 // lowerMethodValue lowers a method value recv.M to a bound method. A value receiver
 // is snapshotted with a copy at the point the value is taken, matching Go's copy of
 // the receiver into the value, so a later mutation of the original is not observed;
@@ -4432,6 +4483,9 @@ func isStructValue(t types.Type) bool {
 }
 
 func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
+	if lit, ok := l.foldNamedConst(e); ok {
+		return lit, nil
+	}
 	x, err := l.lowerOperand(e.X, e.Y)
 	if err != nil {
 		return nil, err
@@ -4585,6 +4639,9 @@ func (l *lowerer) lowerSliceExpr(e *ast.SliceExpr) (ir.Expr, error) {
 }
 
 func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
+	if lit, ok := l.foldNamedConst(e); ok {
+		return lit, nil
+	}
 	switch e.Op {
 	case token.ADD, token.SUB:
 		x, err := l.lowerExpr(e.X)
