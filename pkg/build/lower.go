@@ -4859,6 +4859,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "bytes"); ok {
 			return l.lowerBytesFunc(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "unicode/utf8"); ok {
+			return l.lowerUTF8Func(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "math"); ok {
 			return l.lowerMathFunc(e, name)
 		}
@@ -5602,6 +5605,42 @@ func (l *lowerer) lowerStrconvFunc(e *ast.CallExpr, name string) (ir.Expr, error
 	intrinsic, ok := strconvIntrinsics[name]
 	if !ok {
 		return nil, l.errf(e.Pos(), "strconv.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
+}
+
+// utf8Intrinsics maps a unicode/utf8 function to the runtime shim. The whole
+// package is pure UTF-8 mechanics, independent of the Unicode version, so the
+// shim decodes with Go's own rune state machine and matches bit for bit,
+// including the RuneError-with-width-one an invalid byte decodes to. EncodeRune
+// and AppendRune write into a caller buffer and wait for their own slice, and
+// the package constants fold through the constant path, not this table.
+var utf8Intrinsics = map[string]string{
+	"RuneCountInString":      "utf8_rune_count_in_string",
+	"RuneCount":              "utf8_rune_count",
+	"RuneLen":                "utf8_rune_len",
+	"ValidString":            "utf8_valid_string",
+	"Valid":                  "utf8_valid",
+	"ValidRune":              "utf8_valid_rune",
+	"DecodeRuneInString":     "utf8_decode_rune_in_string",
+	"DecodeRune":             "utf8_decode_rune",
+	"DecodeLastRuneInString": "utf8_decode_last_rune_in_string",
+}
+
+// lowerUTF8Func lowers a call to the standard unicode/utf8 package through
+// utf8Intrinsics. A spread argument has no utf8 function that takes one, so it
+// fails loudly, as does a function the table does not carry.
+func (l *lowerer) lowerUTF8Func(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "utf8.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := utf8Intrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "utf8.%s is not supported yet", name)
 	}
 	args, err := l.lowerCallArgs(e.Args)
 	if err != nil {
