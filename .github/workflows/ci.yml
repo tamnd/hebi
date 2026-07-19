@@ -14,10 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build and test on Linux and macOS with the race detector on. gofmt and vet
-  # run here too so a formatting slip fails fast on both platforms. The Go
-  # version is pinned by go.mod and GOTOOLCHAIN is pinned from versions.env, so
-  # no runner silently upgrades the toolchain.
+  # Build and test on Linux and macOS with the race detector on. This is the
+  # corpus race check: the whole fixture band runs under the Go detector, and the
+  # concurrency correctness bar rides along with it. The no-deadlock smoke gate
+  # fails a stuck fixture in a minute instead of eating the outer timeout, and the
+  # shim thread-stress test guards the Python runtime the Go detector cannot see.
+  # gofmt and vet run here too so a formatting slip fails fast on both platforms.
+  # The Go version is pinned by go.mod and GOTOOLCHAIN is pinned from
+  # versions.env, so no runner silently upgrades the toolchain.
   test:
     strategy:
       fail-fast: false
@@ -47,7 +51,7 @@ jobs:
         run: go vet ./...
       - name: build
         run: go build ./...
-      - name: test with the race detector
+      - name: race the whole corpus, no-deadlock gate and shim stress included
         run: go test -race -shuffle=on -count=1 -timeout 45m -coverprofile=coverage.out ./...
       - name: coverage summary
         if: matrix.os == 'ubuntu-latest'
