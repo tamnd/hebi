@@ -183,3 +183,115 @@ func main() {
 		})
 	}
 }
+
+// TestTimeParse checks time.Parse against go run. Parse reads a value against a
+// reference-time layout and returns the instant it names, reading through UTC when
+// the layout carries no zone and landing exactly on a numeric or Z zone. A bad value
+// returns the zero Time and a ParseError whose text matches Go's, and Format then
+// Parse round-trips.
+func TestTimeParse(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{
+			"reference layouts read back",
+			`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func show(layout, value string) {
+	t, err := time.Parse(layout, value)
+	if err != nil {
+		fmt.Println("ERR", err)
+		return
+	}
+	fmt.Println(t.Format(time.RFC3339Nano), "|", t.Location())
+}
+
+func main() {
+	show("2006-01-02", "2026-07-20")
+	show("2006-01-02 15:04:05", "2026-07-20 14:30:15")
+	show(time.RFC3339, "2026-07-20T14:30:15Z")
+	show(time.RFC3339, "2026-07-20T14:30:15+09:30")
+	show(time.RFC3339Nano, "2026-07-20T14:30:15.123456789Z")
+	show("Jan 2, 2006", "Jul 20, 2026")
+	show("January 2, 2006", "July 20, 2026")
+	show("Mon Jan 2 15:04:05 2006", "Mon Jul 20 14:30:15 2026")
+	show("3:04 PM", "2:30 PM")
+	show("03:04:05 pm", "02:30:15 pm")
+	show("2006-01-02T15:04:05.000", "2026-07-20T14:30:15.250")
+	show("06/1/2", "26/7/20")
+	show("_2 Jan 2006", "20 Jul 2026")
+	show("2006-01-02 15:04:05 -0700", "2026-01-05 09:08:07 +0530")
+	show("15:04:05.999999999", "14:30:15.5")
+}
+`,
+		},
+		{
+			"bad values report Go's ParseError",
+			`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func showErr(layout, value string) {
+	_, err := time.Parse(layout, value)
+	fmt.Println(err)
+}
+
+func main() {
+	showErr("2006-01-02", "2026-13-20")
+	showErr("2006-01-02", "2026-07-40")
+	showErr("2006-01-02 15:04:05", "2026-07-20 25:00:00")
+	showErr("2006-01-02 15:04:05", "2026-07-20 14:61:00")
+	showErr("2006-01-02", "notadate")
+	showErr("2006-01-02", "2026-07-20 extra")
+	showErr("3:04 PM", "2:30 ZZ")
+	showErr("2006-01-02", "2021-02-29")
+}
+`,
+		},
+		{
+			"format then parse round-trips",
+			`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func roundTrip(orig time.Time, layout string) {
+	s := orig.Format(layout)
+	back, err := time.Parse(layout, s)
+	fmt.Println(err == nil, back.Format(time.RFC3339))
+}
+
+func main() {
+	orig := time.Date(2026, 3, 14, 9, 26, 53, 0, time.UTC)
+	roundTrip(orig, time.RFC3339)
+	roundTrip(orig, "2006-01-02 15:04:05")
+	roundTrip(orig, "Jan 2, 2006 3:04:05 PM")
+
+	jst := time.FixedZone("JST", 9*3600)
+	zoned := time.Date(2026, 1, 5, 9, 8, 7, 0, jst)
+	s := zoned.Format(time.RFC3339)
+	back, _ := time.Parse(time.RFC3339, s)
+	fmt.Println(zoned.Equal(back), back.Format(time.RFC3339))
+}
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
