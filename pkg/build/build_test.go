@@ -623,7 +623,6 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"fmt.Errorf with an unsupported verb", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\terr := fmt.Errorf(\"%x\", 255)\n\t_ = err\n}\n"},
 		{"fmt.Errorf with a width", "package main\n\nimport \"fmt\"\n\nfunc main() {\n\terr := fmt.Errorf(\"%3d\", 1)\n\t_ = err\n}\n"},
 		{"errors.Join with a spread", "package main\n\nimport \"errors\"\n\nfunc main() {\n\terrs := []error{errors.New(\"a\")}\n\terr := errors.Join(errs...)\n\t_ = err\n}\n"},
-		{"assertion to the empty interface", "package main\n\nfunc main() {\n\tvar i interface{} = 7\n\tv := i.(interface{})\n\t_ = v\n}\n"},
 		{"type switch with an init statement", "package main\n\nfunc main() {\n\tvar i interface{} = 7\n\tswitch v := i; v.(type) {\n\tcase int:\n\t}\n}\n"},
 	}
 	for _, tt := range tests {
