@@ -3867,10 +3867,11 @@ func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 	selection, ok := l.pkg.Info.Selections[e]
 	if !ok {
 		// A package-qualified name that is not a field or method selection is a
-		// package member, and the only ones modeled so far are integer constants
-		// like time.Millisecond, which the type checker has already reduced to a
-		// value, so the value emits directly with no runtime lookup.
-		if lit, folded := l.constInt(e); folded {
+		// package member, and the ones modeled so far are the untyped constants a
+		// package exports, an integer like time.Millisecond or a float like
+		// math.Pi, which the type checker has already reduced to a value, so the
+		// value emits directly with no runtime lookup.
+		if lit, folded := l.constMember(e); folded {
 			return lit, nil
 		}
 		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
@@ -3894,21 +3895,34 @@ func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 	}
 }
 
-// constInt returns the integer literal for an expression the type checker
-// resolved to an integer constant, so a typed constant such as time.Millisecond
-// emits its exact value. It reports false for a non-integer or inexact constant,
-// leaving the caller to diagnose an unsupported form rather than emit a wrong
-// value.
-func (l *lowerer) constInt(e ast.Expr) (ir.Expr, bool) {
+// constMember returns the literal for a package member the type checker resolved
+// to a constant, so a constant such as time.Millisecond or math.Pi emits its
+// exact value with no runtime lookup. An integer emits its exact digits, a float
+// its shortest round-tripping decimal, and a string or bool its literal. It
+// reports false for an inexact integer or any other kind, leaving the caller to
+// diagnose an unsupported form rather than emit a wrong value.
+func (l *lowerer) constMember(e ast.Expr) (ir.Expr, bool) {
 	tv, ok := l.pkg.Info.Types[e]
-	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+	if !ok || tv.Value == nil {
 		return nil, false
 	}
-	n, exact := constant.Int64Val(tv.Value)
-	if !exact {
+	switch tv.Value.Kind() {
+	case constant.Int:
+		n, exact := constant.Int64Val(tv.Value)
+		if !exact {
+			return nil, false
+		}
+		return &ir.IntLit{Text: strconv.FormatInt(n, 10)}, true
+	case constant.Float:
+		f, _ := constant.Float64Val(tv.Value)
+		return &ir.FloatLit{Text: strconv.FormatFloat(f, 'g', -1, 64)}, true
+	case constant.String:
+		return &ir.StringLit{Value: constant.StringVal(tv.Value)}, true
+	case constant.Bool:
+		return &ir.BoolLit{Value: constant.BoolVal(tv.Value)}, true
+	default:
 		return nil, false
 	}
-	return &ir.IntLit{Text: strconv.FormatInt(n, 10)}, true
 }
 
 // lowerMethodValue lowers a method value recv.M to a bound method. A value receiver
@@ -4842,6 +4856,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "slices"); ok {
 			return l.lowerSlicesFunc(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "math"); ok {
+			return l.lowerMathFunc(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
 		}
@@ -5390,6 +5407,51 @@ var stringsIntrinsics = map[string]string{
 	"Replace":      "str_replace",
 	"ReplaceAll":   "str_replace_all",
 	"EqualFold":    "str_equal_fold",
+}
+
+// mathIntrinsics maps a math package function to the runtime shim that carries
+// its Go semantics over a float64. The rounding, sign, remainder, comparison,
+// and classification functions are exact, matching Go bit for bit because they
+// are integer or hardware operations. The transcendental functions, Pow, Exp,
+// the logarithms, and the trigonometry, wait for their own slice, since Go's
+// pure-Go implementations can differ from a platform libm in the last bit, so a
+// function outside this table fails loudly.
+var mathIntrinsics = map[string]string{
+	"Abs":      "math_abs",
+	"Ceil":     "math_ceil",
+	"Floor":    "math_floor",
+	"Round":    "math_round",
+	"Trunc":    "math_trunc",
+	"Sqrt":     "math_sqrt",
+	"Mod":      "math_mod",
+	"Max":      "math_max",
+	"Min":      "math_min",
+	"Dim":      "math_dim",
+	"Copysign": "math_copysign",
+	"Signbit":  "math_signbit",
+	"IsNaN":    "math_is_nan",
+	"IsInf":    "math_is_inf",
+	"NaN":      "math_nan",
+	"Inf":      "math_inf",
+}
+
+// lowerMathFunc lowers a call to the standard math package by mapping the
+// function to its runtime shim through mathIntrinsics. No mapped function takes
+// a spread argument, so one fails loudly, as does a function the table does not
+// carry.
+func (l *lowerer) lowerMathFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "math.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := mathIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "math.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
 }
 
 // slicesIntrinsics maps a slices package function to the runtime shim that

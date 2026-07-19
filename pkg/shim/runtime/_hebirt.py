@@ -1708,6 +1708,115 @@ def slices_binary_search(sl, target):
     return lo, (lo < n and sl.array[b + lo] == target)
 
 
+_INF = float("inf")
+_NEG_INF = float("-inf")
+
+
+def math_abs(x):
+    return math.fabs(x)
+
+
+def math_ceil(x):
+    return x if not math.isfinite(x) else float(math.ceil(x))
+
+
+def math_floor(x):
+    return x if not math.isfinite(x) else float(math.floor(x))
+
+
+def math_trunc(x):
+    return x if not math.isfinite(x) else float(math.trunc(x))
+
+
+def math_round(x):
+    # Go rounds a half away from zero, where Python's round rounds to even, so
+    # nudge by a half toward the sign and take the floor or ceiling.
+    if not math.isfinite(x):
+        return x
+    if x >= 0:
+        return float(math.floor(x + 0.5))
+    return float(math.ceil(x - 0.5))
+
+
+def math_sqrt(x):
+    # Go's Sqrt returns NaN for a negative operand where Python would raise.
+    if x < 0:
+        return float("nan")
+    return math.sqrt(x)
+
+
+def math_mod(x, y):
+    # Go's Mod is the C fmod, the remainder with the sign of x. It is NaN when x
+    # is infinite or y is zero, and x when y is infinite.
+    if x != x or y != y or y == 0.0 or x in (_INF, _NEG_INF):
+        return float("nan")
+    if y in (_INF, _NEG_INF):
+        return x
+    return math.fmod(x, y)
+
+
+def math_max(x, y):
+    # Go's Max propagates NaN, lets a positive infinity dominate, and prefers a
+    # positive zero over a negative one.
+    if x != x or y != y:
+        return float("nan")
+    if x == _INF or y == _INF:
+        return _INF
+    if x == 0.0 and y == 0.0:
+        if math.copysign(1.0, x) < 0 and math.copysign(1.0, y) < 0:
+            return -0.0
+        return 0.0
+    return x if x > y else y
+
+
+def math_min(x, y):
+    if x != x or y != y:
+        return float("nan")
+    if x == _NEG_INF or y == _NEG_INF:
+        return _NEG_INF
+    if x == 0.0 and y == 0.0:
+        if math.copysign(1.0, x) > 0 and math.copysign(1.0, y) > 0:
+            return 0.0
+        return -0.0
+    return x if x < y else y
+
+
+def math_dim(x, y):
+    # Go's Dim is the positive difference, max(x-y, 0), and passes a NaN through.
+    d = x - y
+    if d != d:
+        return d
+    return d if d > 0 else 0.0
+
+
+def math_copysign(x, y):
+    return math.copysign(x, y)
+
+
+def math_signbit(x):
+    return math.copysign(1.0, x) < 0
+
+
+def math_is_nan(x):
+    return x != x
+
+
+def math_is_inf(x, sign):
+    if sign > 0:
+        return x == _INF
+    if sign < 0:
+        return x == _NEG_INF
+    return x == _INF or x == _NEG_INF
+
+
+def math_nan():
+    return float("nan")
+
+
+def math_inf(sign):
+    return _INF if sign >= 0 else _NEG_INF
+
+
 def errors_unwrap(err):
     """errors.Unwrap: one level through an Unwrap() error, None for anything else.
 
