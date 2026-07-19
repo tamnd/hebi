@@ -26,6 +26,10 @@ def go_str(value):
         return "true"
     if value is False:
         return "false"
+    if value is None:
+        # A nil interface, the one nil that lowers to Python None, prints as <nil>,
+        # the same text Go's fmt writes for a nil error or a nil interface value.
+        return "<nil>"
     if isinstance(value, float):
         return _gofloat(value)
     if isinstance(value, bytes):
@@ -58,6 +62,17 @@ def go_str(value):
         except TypeError:
             items = list(value.items())
         return "map[" + " ".join(go_str(k) + ":" + go_str(v) for k, v in items) + "]"
+    err = getattr(value, "Error", None)
+    if callable(err):
+        # An error value prints as its Error text, so fmt.Println(err) writes the
+        # message the way Go does; the result is a Go string, so it decodes through
+        # go_str the same as any other string.
+        return go_str(err())
+    s = getattr(value, "String", None)
+    if callable(s):
+        # A Stringer prints through String, which fmt uses when a value carries no
+        # Error, so a type that defines String reads as its own text.
+        return go_str(s())
     return str(value)
 
 
@@ -468,6 +483,34 @@ class PanicNilError:
         return self.Error()
 
 
+class _StringError:
+    """The error value errors.New returns, a string wrapped as an error.
+
+    Go's errors.New builds an *errorString whose Error returns the string it was
+    given, and each call yields a distinct pointer so two errors built from the
+    same text are never equal. This mirrors that: the message is a Go string, so
+    it is carried as bytes and Error hands it back unchanged, and equality is the
+    default identity Python gives an object, so two _StringError values compare
+    equal only when they are the same instance, matching Go's pointer errors.
+    """
+
+    __slots__ = ("_msg",)
+
+    def __init__(self, msg):
+        self._msg = msg
+
+    def Error(self):
+        return self._msg
+
+    def __str__(self):
+        return go_str(self._msg)
+
+
+def errors_new(msg):
+    """Build the error value errors.New returns from a Go string."""
+    return _StringError(msg)
+
+
 def _runtime_error(msg):
     """Return the GoPanic a runtime check raises, carrying a runtime error value.
 
@@ -526,14 +569,16 @@ def panic_message(value):
         return "panic called with nil argument"
     err = getattr(value, "Error", None)
     if callable(err):
-        return err()
+        # Error hands back a Go string, which is bytes for a user error and a plain
+        # str for a runtime error, so go_str decodes either into the banner text.
+        return go_str(err())
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
     if isinstance(value, str):
         return value
     s = getattr(value, "String", None)
     if callable(s):
-        return s()
+        return go_str(s())
     return go_str(value)
 
 

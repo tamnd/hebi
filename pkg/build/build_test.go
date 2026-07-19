@@ -614,7 +614,7 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		{"append spread", "package main\n\nfunc main() {\n\ta := []int{1, 2}\n\tb := []int{3, 4}\n\ta = append(a, b...)\n\t_ = a\n}\n"},
 		{"closure writes package level var", "package main\n\nvar count int\n\nfunc main() {\n\tf := func() { count = 5 }\n\tf()\n}\n"},
 		{"address of a loop variable", "package main\n\nfunc main() {\n\tfor i := 0; i < 3; i++ {\n\t\tp := &i\n\t\t_ = p\n\t}\n}\n"},
-		{"address of a composite literal", "package main\n\ntype Point struct{ X int }\n\nfunc main() {\n\tp := &Point{X: 1}\n\t_ = p\n}\n"},
+		{"address of a slice literal", "package main\n\nfunc main() {\n\tp := &[]int{1, 2}\n\t_ = p\n}\n"},
 		{"address of a local inside a closure", "package main\n\nfunc main() {\n\tf := func() {\n\t\tx := 1\n\t\tp := &x\n\t\t_ = p\n\t}\n\tf()\n}\n"},
 		{"address of a package level variable", "package main\n\nvar g int\n\nfunc main() {\n\tp := &g\n\t_ = p\n}\n"},
 		{"boxed local in a parallel assignment", "package main\n\nfunc main() {\n\tx := 1\n\ty := 2\n\tp := &x\n\tx, y = y, x\n\t_ = p\n\t_ = y\n}\n"},

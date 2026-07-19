@@ -564,6 +564,13 @@ type NilMap struct{}
 // through it stops the Go way rather than as a Python AttributeError.
 type NilPtr struct{}
 
+// NilInterface is the nil interface value, the zero value an interface variable
+// such as an error takes and the value a bare nil returns into an interface
+// result. It lowers to Python None, so a nil check reads as err is None and a
+// success return reads as return v, None, which is why an interface compared to
+// nil uses identity rather than the sentinel equality a pointer or slice uses.
+type NilInterface struct{}
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -643,37 +650,38 @@ type FuncDef struct {
 	Body      []Stmt
 }
 
-func (*IntLit) isExpr()      {}
-func (*FloatLit) isExpr()    {}
-func (*StringLit) isExpr()   {}
-func (*BoolLit) isExpr()     {}
-func (*Ident) isExpr()       {}
-func (*BinaryExpr) isExpr()  {}
-func (*UnaryExpr) isExpr()   {}
-func (*Mask) isExpr()        {}
-func (*Convert) isExpr()     {}
-func (*IndexExpr) isExpr()   {}
-func (*CallExpr) isExpr()    {}
-func (*MethodCall) isExpr()  {}
-func (*MethodValue) isExpr() {}
-func (*MethodExpr) isExpr()  {}
-func (*Intrinsic) isExpr()   {}
-func (*ShimFunc) isExpr()    {}
-func (*AddrField) isExpr()   {}
-func (*AddrIndex) isExpr()   {}
-func (*Deref) isExpr()       {}
-func (*Tuple) isExpr()       {}
-func (*Lambda) isExpr()      {}
-func (*FieldAccess) isExpr() {}
-func (*StructLit) isExpr()   {}
-func (*Clone) isExpr()       {}
-func (*ArrayZero) isExpr()   {}
-func (*ArrayLit) isExpr()    {}
-func (*ArrayClone) isExpr()  {}
-func (*SliceLit) isExpr()    {}
-func (*SliceMake) isExpr()   {}
-func (*SliceExpr) isExpr()   {}
-func (*NilSlice) isExpr()    {}
-func (*MapLit) isExpr()      {}
-func (*NilMap) isExpr()      {}
-func (*NilPtr) isExpr()      {}
+func (*IntLit) isExpr()       {}
+func (*FloatLit) isExpr()     {}
+func (*StringLit) isExpr()    {}
+func (*BoolLit) isExpr()      {}
+func (*Ident) isExpr()        {}
+func (*BinaryExpr) isExpr()   {}
+func (*UnaryExpr) isExpr()    {}
+func (*Mask) isExpr()         {}
+func (*Convert) isExpr()      {}
+func (*IndexExpr) isExpr()    {}
+func (*CallExpr) isExpr()     {}
+func (*MethodCall) isExpr()   {}
+func (*MethodValue) isExpr()  {}
+func (*MethodExpr) isExpr()   {}
+func (*Intrinsic) isExpr()    {}
+func (*ShimFunc) isExpr()     {}
+func (*AddrField) isExpr()    {}
+func (*AddrIndex) isExpr()    {}
+func (*Deref) isExpr()        {}
+func (*Tuple) isExpr()        {}
+func (*Lambda) isExpr()       {}
+func (*FieldAccess) isExpr()  {}
+func (*StructLit) isExpr()    {}
+func (*Clone) isExpr()        {}
+func (*ArrayZero) isExpr()    {}
+func (*ArrayLit) isExpr()     {}
+func (*ArrayClone) isExpr()   {}
+func (*SliceLit) isExpr()     {}
+func (*SliceMake) isExpr()    {}
+func (*SliceExpr) isExpr()    {}
+func (*NilSlice) isExpr()     {}
+func (*MapLit) isExpr()       {}
+func (*NilMap) isExpr()       {}
+func (*NilPtr) isExpr()       {}
+func (*NilInterface) isExpr() {}

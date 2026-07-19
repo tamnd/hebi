@@ -158,6 +158,12 @@ type lowerer struct {
 	// return in a function with named results returns these, so the lowerer needs
 	// them in hand while it walks the body.
 	resultNames []string
+	// resultTypes holds the declared type of each result of the function being
+	// lowered, one per result value position, so a bare nil returned into a result
+	// slot can read its sentinel from the destination type the way a compared nil
+	// reads it from the other operand. It is set for named and unnamed results
+	// alike and cleared when the function is done.
+	resultTypes []types.Type
 	// deferReshape is set while lowering a deferring function whose deferred calls
 	// read or change a named result or call recover, so its body needs the try and
 	// except reshape rather than the plain finally. A return in such a body lowers to
@@ -292,7 +298,7 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { l.resultNames = nil }()
+	defer func() { l.resultNames = nil; l.resultTypes = nil }()
 	if fd.Body == nil {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
 	}
@@ -353,7 +359,7 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 	if err != nil {
 		return nil, nil, err
 	}
-	defer func() { l.resultNames = nil }()
+	defer func() { l.resultNames = nil; l.resultTypes = nil }()
 	if err := l.beginDefer(fd); err != nil {
 		return nil, nil, err
 	}
@@ -429,8 +435,21 @@ func (l *lowerer) lowerParams(fields *ast.FieldList) ([]string, error) {
 // body cannot write yet a bare return would still have to return.
 func (l *lowerer) beginResults(fields *ast.FieldList) ([]ir.Stmt, error) {
 	l.resultNames = nil
+	l.resultTypes = nil
 	if fields == nil {
 		return nil, nil
+	}
+	// Record the type of each result position, named or not, so a returned bare nil
+	// can resolve its sentinel from the destination type.
+	for _, field := range fields.List {
+		t := l.pkg.Info.TypeOf(field.Type)
+		count := len(field.Names)
+		if count == 0 {
+			count = 1
+		}
+		for range count {
+			l.resultTypes = append(l.resultTypes, t)
+		}
 	}
 	named := false
 	for _, field := range fields.List {
@@ -487,7 +506,7 @@ func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
 		return []ir.Stmt{&ir.ReturnStmt{Value: &ir.Tuple{Elems: elems}}}, nil
 	}
 	if len(s.Results) == 1 {
-		value, err := l.lowerExpr(s.Results[0])
+		value, err := l.lowerTyped(s.Results[0], l.resultTypeAt(0))
 		if err != nil {
 			return nil, err
 		}
@@ -496,7 +515,7 @@ func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
 	}
 	elems := make([]ir.Expr, len(s.Results))
 	for i, r := range s.Results {
-		value, err := l.lowerExpr(r)
+		value, err := l.lowerTyped(r, l.resultTypeAt(i))
 		if err != nil {
 			return nil, err
 		}
@@ -518,7 +537,7 @@ func (l *lowerer) lowerReshapedReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
 			return nil, l.errf(s.Pos(), "return with %d values in a deferring function with %d results is not supported yet", len(s.Results), len(l.deferResults))
 		}
 		for i, r := range s.Results {
-			value, err := l.lowerExpr(r)
+			value, err := l.lowerTyped(r, l.resultTypeAt(i))
 			if err != nil {
 				return nil, err
 			}
@@ -1124,6 +1143,10 @@ func (l *lowerer) nilSentinel(t types.Type, pos token.Pos) (ir.Expr, error) {
 		return &ir.NilSlice{}, nil
 	case *types.Map:
 		return &ir.NilMap{}, nil
+	case *types.Interface:
+		// A nil interface, an error among them, is None, so a nil check is identity
+		// against None rather than the sentinel equality a pointer or slice uses.
+		return &ir.NilInterface{}, nil
 	default:
 		return nil, l.errf(pos, "nil of type %s is not supported yet", t)
 	}
@@ -1158,6 +1181,26 @@ func (l *lowerer) isNilExpr(e ast.Expr) bool {
 	}
 	t := l.pkg.Info.TypeOf(id)
 	return t != nil && isUntypedNil(t)
+}
+
+// lowerTyped lowers an expression that flows into a known destination type, so a
+// bare nil in a return, an assignment, or a declaration reads its sentinel from
+// that type the way a compared nil reads it from the other operand. Anything but
+// a bare untyped nil, and a nil with no destination type in hand, lowers plainly.
+func (l *lowerer) lowerTyped(e ast.Expr, want types.Type) (ir.Expr, error) {
+	if want != nil && l.isNilExpr(e) {
+		return l.nilSentinel(want, e.Pos())
+	}
+	return l.lowerExpr(e)
+}
+
+// resultTypeAt returns the declared type of the result at position i, or nil when
+// the position is out of range, so a returned nil can find its destination type.
+func (l *lowerer) resultTypeAt(i int) types.Type {
+	if i < 0 || i >= len(l.resultTypes) {
+		return nil
+	}
+	return l.resultTypes[i]
 }
 
 // snapshotLoopVars registers the given loop variables as per-iteration snapshots
@@ -1446,7 +1489,7 @@ func (l *lowerer) lowerDecl(s *ast.DeclStmt) ([]ir.Stmt, error) {
 			return nil, l.errf(vs.Pos(), "multiple assignment is not supported yet")
 		}
 		for i, name := range vs.Names {
-			value, err := l.lowerExpr(vs.Values[i])
+			value, err := l.lowerTyped(vs.Values[i], l.pkg.Info.TypeOf(name))
 			if err != nil {
 				return nil, err
 			}
@@ -1498,6 +1541,11 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		// A pointer's zero value is nil, the sentinel that compares equal only to
 		// itself and panics the Go way when a program reads through it.
 		return &ir.NilPtr{}, nil
+	}
+	if _, ok := t.Underlying().(*types.Interface); ok {
+		// An interface's zero value is the nil interface, None, so var err error
+		// starts as None and reads equal to nil until the body writes it.
+		return &ir.NilInterface{}, nil
 	}
 	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
@@ -1576,6 +1624,17 @@ func isMapValue(t types.Type) bool {
 	return ok
 }
 
+// isInterfaceValue reports whether a type's underlying type is an interface,
+// such as the error interface, so a comparison against nil can pick the identity
+// spelling rather than the sentinel equality a pointer or slice uses.
+func isInterfaceValue(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Interface)
+	return ok
+}
+
 // checkMapKey rejects the map key types this slice does not carry. A basic key
 // such as an int or a string is hashable in Python as it is, and a comparable
 // struct key carries the generated hash and equality, so both pass. An array key
@@ -1642,7 +1701,7 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if len(s.Rhs) != 1 {
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
 	}
-	value, err := l.lowerExpr(s.Rhs[0])
+	value, err := l.lowerTyped(s.Rhs[0], l.pkg.Info.TypeOf(s.Lhs[0]))
 	if err != nil {
 		return nil, err
 	}
@@ -3173,8 +3232,37 @@ func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	inner := &ir.BinaryExpr{Op: e.Op.String(), X: x, Y: y}
+	op := e.Op.String()
+	if l.isInterfaceNilCompare(e) {
+		// An interface value is None when it is the nil interface, so the check is
+		// identity against None, is or is not, not the sentinel equality a pointer or
+		// slice nil uses.
+		if e.Op == token.EQL {
+			op = "is"
+		} else {
+			op = "is not"
+		}
+	}
+	inner := &ir.BinaryExpr{Op: op, X: x, Y: y}
 	return l.narrow(e, e.Op, inner), nil
+}
+
+// isInterfaceNilCompare reports whether a binary expression compares an interface
+// value against nil with == or !=, the check that lowers to an identity test
+// against None. One operand is the bare nil and the other has an interface type,
+// which is how an error compared to nil reaches the is and is not spelling.
+func (l *lowerer) isInterfaceNilCompare(e *ast.BinaryExpr) bool {
+	if e.Op != token.EQL && e.Op != token.NEQ {
+		return false
+	}
+	switch {
+	case l.isNilExpr(e.X):
+		return isInterfaceValue(l.pkg.Info.TypeOf(e.Y))
+	case l.isNilExpr(e.Y):
+		return isInterfaceValue(l.pkg.Info.TypeOf(e.X))
+	default:
+		return false
+	}
 }
 
 // lowerOperand lowers one side of a binary expression, resolving a bare nil to the
@@ -3348,6 +3436,15 @@ func (l *lowerer) lowerAddr(e *ast.UnaryExpr) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.AddrIndex{Seq: seq, Index: index}, nil
+	case *ast.CompositeLit:
+		// A struct composite literal is already a reference object, so the address of
+		// &T{...} is that fresh instance itself; a deref reads and writes reach it the
+		// same way they would through a struct local the code took the address of.
+		t := l.pkg.Info.TypeOf(operand)
+		if !isStructValue(t) {
+			return nil, l.errf(e.Pos(), "taking the address of a composite literal of %s is not supported yet", t)
+		}
+		return l.lowerCompositeLit(operand)
 	case *ast.Ident:
 		if l.isBoxedIdent(operand) {
 			// The local is boxed into a cell, so its address is just the cell, named
@@ -3478,6 +3575,13 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 				return nil, err
 			}
 			return &ir.Intrinsic{Name: "println", Args: args}, nil
+		}
+		if l.isErrorsNew(fun) {
+			args, err := l.lowerCallArgs(e.Args)
+			if err != nil {
+				return nil, err
+			}
+			return &ir.Intrinsic{Name: "errors_new", Args: args}, nil
 		}
 		if sel, ok := l.pkg.Info.Selections[fun]; ok {
 			switch sel.Kind() {
@@ -3843,6 +3947,25 @@ func (l *lowerer) isFmtPrintln(sel *ast.SelectorExpr) bool {
 		return false
 	}
 	return pkgName.Imported().Path() == "fmt"
+}
+
+// isErrorsNew reports whether a selector names errors.New from the standard
+// errors package, so a call to it lowers to the errors_new intrinsic that builds
+// a string-backed error value rather than a method call the compiled tier has no
+// definition for.
+func (l *lowerer) isErrorsNew(sel *ast.SelectorExpr) bool {
+	if sel.Sel.Name != "New" {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	pkgName, ok := l.pkg.Info.Uses[ident].(*types.PkgName)
+	if !ok {
+		return false
+	}
+	return pkgName.Imported().Path() == "errors"
 }
 
 // lowerCallArgs lowers the arguments of a call to a named function, cloning a

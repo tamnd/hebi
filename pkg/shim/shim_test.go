@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "class Cell", "class _NilPtr", "NIL_PTR", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "class Cell", "class _NilPtr", "NIL_PTR", "class _StringError", "def errors_new", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -480,5 +480,44 @@ func TestCellAndNilHelpers(t *testing.T) {
 		"runtime error: invalid memory address or nil pointer dereference\n"
 	if got := string(out); got != want {
 		t.Errorf("cell helper output = %q, want %q", got, want)
+	}
+}
+
+// TestErrorHelpers runs the error surface under CPython: errors_new builds a
+// value whose Error hands back the Go string it was given, two such values built
+// from the same text are distinct the way Go's pointer errors are, go_str renders
+// an error through Error and a nil error as <nil>, and a type that defines String
+// renders through it.
+func TestErrorHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"e = r.errors_new(b'not found')\n" +
+		"print(e.Error(), r.go_str(e), str(e))\n" +
+		"print(e == e, r.errors_new(b'x') == r.errors_new(b'x'))\n" +
+		"print(r.go_str(None))\n" +
+		"class S:\n" +
+		"    def String(self):\n" +
+		"        return b'stringer'\n" +
+		"print(r.go_str(S()))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run error helpers: %v\n%s", err, out)
+	}
+	want := "b'not found' not found not found\n" +
+		"True False\n" +
+		"<nil>\n" +
+		"stringer\n"
+	if got := string(out); got != want {
+		t.Errorf("error helper output = %q, want %q", got, want)
 	}
 }
