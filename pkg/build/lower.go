@@ -3576,12 +3576,11 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 			}
 			return &ir.Intrinsic{Name: "println", Args: args}, nil
 		}
-		if l.isErrorsNew(fun) {
-			args, err := l.lowerCallArgs(e.Args)
-			if err != nil {
-				return nil, err
-			}
-			return &ir.Intrinsic{Name: "errors_new", Args: args}, nil
+		if name, ok := l.pkgFunc(fun, "errors"); ok {
+			return l.lowerErrorsFunc(e, name)
+		}
+		if name, ok := l.pkgFunc(fun, "fmt"); ok && name == "Errorf" {
+			return l.lowerErrorf(e)
 		}
 		if sel, ok := l.pkg.Info.Selections[fun]; ok {
 			switch sel.Kind() {
@@ -3949,23 +3948,114 @@ func (l *lowerer) isFmtPrintln(sel *ast.SelectorExpr) bool {
 	return pkgName.Imported().Path() == "fmt"
 }
 
-// isErrorsNew reports whether a selector names errors.New from the standard
-// errors package, so a call to it lowers to the errors_new intrinsic that builds
-// a string-backed error value rather than a method call the compiled tier has no
-// definition for.
-func (l *lowerer) isErrorsNew(sel *ast.SelectorExpr) bool {
-	if sel.Sel.Name != "New" {
-		return false
-	}
+// pkgFunc reports whether a selector names a function from the standard package
+// at the given import path, checked through the type information rather than by
+// name so a local value named like the package cannot masquerade as it, and
+// returns the selected function name when it does.
+func (l *lowerer) pkgFunc(sel *ast.SelectorExpr, path string) (string, bool) {
 	ident, ok := sel.X.(*ast.Ident)
 	if !ok {
-		return false
+		return "", false
 	}
 	pkgName, ok := l.pkg.Info.Uses[ident].(*types.PkgName)
 	if !ok {
-		return false
+		return "", false
 	}
-	return pkgName.Imported().Path() == "errors"
+	if pkgName.Imported().Path() != path {
+		return "", false
+	}
+	return sel.Sel.Name, true
+}
+
+// lowerErrorsFunc lowers a call to the standard errors package. New builds a
+// string-backed value, Unwrap and Is walk the error chain, and Join wraps the
+// non-nil arguments, each routing to the runtime intrinsic that carries the
+// value-world semantics doc 10 fixes. As is comma-ok over a pointer target and
+// waits on the next slice, and any other errors function fails loudly.
+func (l *lowerer) lowerErrorsFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	switch name {
+	case "New":
+		return l.lowerErrorsCall(e, "errors_new")
+	case "Unwrap":
+		return l.lowerErrorsCall(e, "errors_unwrap")
+	case "Is":
+		return l.lowerErrorsCall(e, "errors_is")
+	case "Join":
+		if e.Ellipsis != token.NoPos {
+			return nil, l.errf(e.Pos(), "errors.Join with a spread argument is not supported yet")
+		}
+		return l.lowerErrorsCall(e, "errors_join")
+	default:
+		return nil, l.errf(e.Pos(), "errors.%s is not supported yet", name)
+	}
+}
+
+// lowerErrorsCall lowers an errors package call to its runtime intrinsic over the
+// plainly lowered arguments. An error is a reference value, not a struct read, so
+// no value copy is injected and the argument passes straight through.
+func (l *lowerer) lowerErrorsCall(e *ast.CallExpr, intrinsic string) (ir.Expr, error) {
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
+}
+
+// errorfVerbs is the set of format verbs fmt.Errorf may carry in the compiled
+// tier. Every one but w and q renders exactly as go_str already does, w records
+// its operand as wrapped, and q quotes its operand, so the runtime formatter
+// needs no other verb. A verb outside this set, or a flag or width the set does
+// not cover, fails loudly rather than formatting the Go way by luck.
+const errorfVerbs = "vsdtwq"
+
+// lowerErrorf lowers a call to fmt.Errorf. The format must be a constant string,
+// checked here so the verb scan runs at compile time, and every verb must be one
+// the runtime formatter admits. The lowered call carries the format as bytes and
+// the plainly lowered operands, and the errorf intrinsic scans the format again
+// at run time to build the message and record the %w operands.
+func (l *lowerer) lowerErrorf(e *ast.CallExpr) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "fmt.Errorf with a spread argument is not supported yet")
+	}
+	if len(e.Args) == 0 {
+		return nil, l.errf(e.Pos(), "fmt.Errorf needs a format argument")
+	}
+	tv := l.pkg.Info.Types[e.Args[0]]
+	if tv.Value == nil || tv.Value.Kind() != constant.String {
+		return nil, l.errf(e.Args[0].Pos(), "fmt.Errorf needs a constant format string")
+	}
+	if err := l.checkErrorfFormat(e.Args[0].Pos(), constant.StringVal(tv.Value)); err != nil {
+		return nil, err
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "errorf", Args: args}, nil
+}
+
+// checkErrorfFormat scans an Errorf format string and rejects any directive the
+// runtime formatter does not carry. A doubled percent is a literal, a bare verb
+// from the admitted set is fine, and anything else, a flag, a width, an unknown
+// verb, or a trailing percent, fails loudly so an unsupported format never
+// reaches the runtime to be mangled.
+func (l *lowerer) checkErrorfFormat(pos token.Pos, format string) error {
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		i++
+		if i >= len(format) {
+			return l.errf(pos, "fmt.Errorf format ends with a lone %%")
+		}
+		if format[i] == '%' {
+			continue
+		}
+		if !strings.ContainsRune(errorfVerbs, rune(format[i])) {
+			return l.errf(pos, "fmt.Errorf format directive %%%c is not supported yet", format[i])
+		}
+	}
+	return nil
 }
 
 // lowerCallArgs lowers the arguments of a call to a named function, cloning a

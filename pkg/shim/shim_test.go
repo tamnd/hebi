@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "class Cell", "class _NilPtr", "NIL_PTR", "class _StringError", "def errors_new", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "class Cell", "class _NilPtr", "NIL_PTR", "class _StringError", "def errors_new", "class _WrapError", "class _JoinError", "def errorf", "def errors_unwrap", "def errors_is", "def errors_as", "def errors_join", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -519,5 +519,49 @@ func TestErrorHelpers(t *testing.T) {
 		"stringer\n"
 	if got := string(out); got != want {
 		t.Errorf("error helper output = %q, want %q", got, want)
+	}
+}
+
+// TestErrorWrapHelpers runs the wrapping surface under CPython: errorf with a %w
+// renders like %v and records the operand so errors_unwrap walks to it, errorf
+// without a %w is a plain string error whose unwrap is None, %q quotes its operand
+// the Go way, errors_is finds a sentinel down the chain and reports a miss, and
+// errors_join joins the non-nil messages by newlines while dropping the nils and
+// yielding None when all are nil.
+func TestErrorWrapHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"base = r.errors_new(b'not found')\n" +
+		"w = r.errorf(b'open %s: %w', b'file', base)\n" +
+		"print(r.go_str(w), r.errors_unwrap(w) is base)\n" +
+		"plain = r.errorf(b'code %d', 42)\n" +
+		"print(r.go_str(plain), r.errors_unwrap(plain))\n" +
+		"print(r.go_str(r.errorf(b'key %q', b'a\\tb')))\n" +
+		"print(r.errors_is(w, base), r.errors_is(w, r.errors_new(b'x')))\n" +
+		"j = r.errors_join(r.errors_new(b'one'), None, r.errors_new(b'two'))\n" +
+		"print(r.go_str(j), r.errors_is(j, r.errors_new(b'x')))\n" +
+		"print(r.errors_join(None, None))"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run wrap helpers: %v\n%s", err, out)
+	}
+	want := "open file: not found True\n" +
+		"code 42 None\n" +
+		"key \"a\\tb\"\n" +
+		"True False\n" +
+		"one\ntwo False\n" +
+		"None\n"
+	if got := string(out); got != want {
+		t.Errorf("wrap helper output = %q, want %q", got, want)
 	}
 }
