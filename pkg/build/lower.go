@@ -20,7 +20,7 @@ import (
 // error for any surface it does not yet handle, so an unsupported construct
 // fails loudly rather than emitting something wrong.
 func lower(pkg *frontend.Package) (*ir.Module, error) {
-	l := &lowerer{pkg: pkg, structs: map[string]*ir.StructDef{}}
+	l := &lowerer{pkg: pkg, structs: map[string]*ir.StructDef{}, structTypes: map[string]*types.TypeName{}}
 	m := &ir.Module{Package: pkg.Name}
 	// Collect struct type declarations first so the emitter has every class
 	// before the functions that construct or read one, and so a value-struct
@@ -69,7 +69,85 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 			m.Funcs = append(m.Funcs, fn)
 		}
 	}
+	// Generate a forwarder for each method a struct promotes through an embedded
+	// field, after the directly declared methods are in place so a directly
+	// declared method that shadows a promoted one wins and no forwarder is added
+	// for it. The forwarder is what lets a promoted call and an interface value
+	// holding the struct both dispatch to the embedded method.
+	for _, sd := range m.Structs {
+		if err := l.addPromotedMethods(sd); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
+}
+
+// addPromotedMethods appends a forwarder method to a struct for each method it
+// promotes through an embedded field. The pointer method set is the superset,
+// carrying both value- and pointer-receiver promoted methods, so a value stored
+// in an interface and a pointer stored in one both find the forwarder. A method
+// whose selection path is a single step is declared directly on the struct and
+// is already lowered, so it is skipped, as is a promoted name a directly
+// declared method already shadows.
+func (l *lowerer) addPromotedMethods(sd *ir.StructDef) error {
+	obj := l.structTypes[sd.Name]
+	if obj == nil {
+		return nil
+	}
+	existing := make(map[string]bool, len(sd.Methods))
+	for _, method := range sd.Methods {
+		existing[method.Name] = true
+	}
+	mset := types.NewMethodSet(types.NewPointer(obj.Type()))
+	for i := range mset.Len() {
+		sel := mset.At(i)
+		if len(sel.Index()) < 2 {
+			continue
+		}
+		name := sel.Obj().Name()
+		if existing[name] {
+			continue
+		}
+		forwarder, err := l.promotedForwarder(obj, sel)
+		if err != nil {
+			return err
+		}
+		sd.Methods = append(sd.Methods, forwarder)
+		existing[name] = true
+	}
+	return nil
+}
+
+// promotedForwarder builds the forwarder method for one promoted selection. The
+// body reaches the embedded value that owns the method by walking the field
+// steps go/types resolved, dropping the final index which names the method
+// itself, and calls the method there. A value receiver operates on a copy, so
+// the embedded value is cloned before the call exactly as a direct
+// value-receiver call copies at the call site; a pointer receiver operates on
+// the live embedded value so it is passed through. The parameters take synthetic
+// positional names threaded straight into the call.
+func (l *lowerer) promotedForwarder(obj *types.TypeName, sel *types.Selection) (*ir.Method, error) {
+	method, ok := sel.Obj().(*types.Func)
+	if !ok {
+		return nil, l.errf(obj.Pos(), "promoted member %s is not a method", sel.Obj().Name())
+	}
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return nil, l.errf(obj.Pos(), "promoted method %s has no receiver", method.Name())
+	}
+	index := sel.Index()
+	recv := l.fieldChain(&ir.Ident{Name: "self"}, obj.Type(), index[:len(index)-1])
+	if _, ptr := sig.Recv().Type().(*types.Pointer); !ptr {
+		recv = &ir.Clone{X: recv}
+	}
+	params := make([]string, sig.Params().Len())
+	args := make([]ir.Expr, len(params))
+	for i := range params {
+		params[i] = fmt.Sprintf("p%d", i)
+		args[i] = &ir.Ident{Name: params[i]}
+	}
+	call := &ir.MethodCall{Recv: recv, Name: method.Name(), Args: args}
+	return &ir.Method{Name: method.Name(), Params: params, Body: []ir.Stmt{&ir.ReturnStmt{Value: call}}}, nil
 }
 
 // lowerTypeSpec lowers a single type declaration. A struct type becomes an IR
@@ -100,6 +178,7 @@ func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, *ir.InterfaceD
 // per struct field in declaration order, and the comparability flag that decides
 // whether the class earns a field-wise __eq__.
 func (l *lowerer) lowerStructSpec(ts *ast.TypeSpec, obj *types.TypeName, st *types.Struct) (*ir.StructDef, error) {
+	l.structTypes[ts.Name.Name] = obj
 	sd := &ir.StructDef{Name: ts.Name.Name, Comparable: types.Comparable(obj.Type())}
 	for i := range st.NumFields() {
 		fv := st.Field(i)
@@ -183,6 +262,10 @@ type lowerer struct {
 	// literal can look up the target struct to translate a field key into the
 	// constructor parameter name, which differs for an embedded value struct.
 	structs map[string]*ir.StructDef
+	// structTypes indexes each struct's type-checker type name by the struct name,
+	// so the promoted-method pass can read a struct's method set and walk the
+	// embedded field path a promoted method reaches through.
+	structTypes map[string]*types.TypeName
 	// rangeSeq numbers the internal names a range over a string allocates, so a
 	// nested or repeated range gets distinct cursor and width names. It counts
 	// across the whole module in source order, which keeps the emit deterministic.
@@ -3692,7 +3775,20 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 // promoted method reached through an embedded field waits on the embedding slice.
 func (l *lowerer) lowerMethodCall(e *ast.CallExpr, sel *ast.SelectorExpr, selection *types.Selection) (ir.Expr, error) {
 	if len(selection.Index()) > 1 {
-		return nil, l.errf(e.Pos(), "a promoted method call %s is not supported yet", sel.Sel.Name)
+		// A promoted method dispatches through the forwarder the outer struct's
+		// class carries, so the call is a plain method call on the receiver and the
+		// forwarder holds the embedded copy. This path is also what an interface
+		// value uses when its concrete type satisfies the interface through a
+		// promoted method, since the object answers the method name directly.
+		recv, err := l.lowerExpr(sel.X)
+		if err != nil {
+			return nil, err
+		}
+		args, err := l.lowerCallArgs(e.Args)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.MethodCall{Recv: recv, Name: sel.Sel.Name, Args: args}, nil
 	}
 	recv, err := l.lowerExpr(sel.X)
 	if err != nil {
