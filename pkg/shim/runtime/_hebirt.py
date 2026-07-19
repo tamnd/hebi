@@ -1048,6 +1048,146 @@ def sprintln(*args):
     return (" ".join(go_str(a) for a in args) + "\n").encode("utf-8")
 
 
+# strings package. A Go string is bytes on this tier, so each function takes and
+# returns bytes and a rune it names is an int. The byte-oriented searches map
+# straight onto Python's bytes methods, which share Go's semantics for a byte
+# index, while the case, space, and field functions decode to text so Unicode
+# folds and splits the way Go's do. A function that returns []string builds a
+# slice header over a fresh list, the shape a Go slice takes on this tier.
+
+
+def _rune_list(s):
+    """Split a Go string into a list of its UTF-8 runes, each as bytes."""
+    return [c.encode("utf-8") for c in s.decode("utf-8", "replace")]
+
+
+def _slice_iter(sl):
+    """Yield the elements a Go slice header spans, in order."""
+    if sl is NIL_SLICE:
+        return
+    for k in range(sl.length):
+        yield sl.array[sl.offset + k]
+
+
+def str_contains(s, sub):
+    return sub in s
+
+
+def str_contains_rune(s, r):
+    return chr(r).encode("utf-8") in s
+
+
+def str_has_prefix(s, prefix):
+    return s.startswith(prefix)
+
+
+def str_has_suffix(s, suffix):
+    return s.endswith(suffix)
+
+
+def str_index(s, sub):
+    return s.find(sub)
+
+
+def str_last_index(s, sub):
+    return s.rfind(sub)
+
+
+def str_index_byte(s, b):
+    return s.find(bytes((b,)))
+
+
+def str_count(s, sub):
+    if len(sub) == 0:
+        # Go counts an empty separator once before each rune and once at the end,
+        # which is the rune count plus one.
+        return len(s.decode("utf-8", "replace")) + 1
+    return s.count(sub)
+
+
+def str_split(s, sep):
+    if len(sep) == 0:
+        parts = _rune_list(s)
+    else:
+        parts = s.split(sep)
+    return _slice_lit(list(parts))
+
+
+def str_split_n(s, sep, n):
+    if n == 0:
+        return NIL_SLICE
+    if len(sep) == 0:
+        parts = _rune_list(s)
+        if n > 0 and n < len(parts):
+            parts = parts[: n - 1] + [b"".join(parts[n - 1 :])]
+    elif n < 0:
+        parts = s.split(sep)
+    else:
+        parts = s.split(sep, n - 1)
+    return _slice_lit(list(parts))
+
+
+def str_fields(s):
+    return _slice_lit([p.encode("utf-8") for p in s.decode("utf-8", "replace").split()])
+
+
+def str_join(elems, sep):
+    return sep.join(_slice_iter(elems))
+
+
+def str_to_upper(s):
+    return s.decode("utf-8", "replace").upper().encode("utf-8")
+
+
+def str_to_lower(s):
+    return s.decode("utf-8", "replace").lower().encode("utf-8")
+
+
+def str_trim_space(s):
+    return s.decode("utf-8", "replace").strip().encode("utf-8")
+
+
+def str_trim(s, cutset):
+    cs = cutset.decode("utf-8", "replace")
+    return s.decode("utf-8", "replace").strip(cs).encode("utf-8")
+
+
+def str_trim_left(s, cutset):
+    cs = cutset.decode("utf-8", "replace")
+    return s.decode("utf-8", "replace").lstrip(cs).encode("utf-8")
+
+
+def str_trim_right(s, cutset):
+    cs = cutset.decode("utf-8", "replace")
+    return s.decode("utf-8", "replace").rstrip(cs).encode("utf-8")
+
+
+def str_trim_prefix(s, prefix):
+    return s[len(prefix):] if s.startswith(prefix) else s
+
+
+def str_trim_suffix(s, suffix):
+    return s[: len(s) - len(suffix)] if suffix and s.endswith(suffix) else s
+
+
+def str_repeat(s, count):
+    return s * count
+
+
+def str_replace(s, old, new, n):
+    if n < 0:
+        return s.replace(old, new)
+    return s.replace(old, new, n)
+
+
+def str_replace_all(s, old, new):
+    return s.replace(old, new)
+
+
+def str_equal_fold(s, t):
+    return s.decode("utf-8", "replace").casefold() == t.decode("utf-8", "replace").casefold()
+
+
 def errors_unwrap(err):
     """errors.Unwrap: one level through an Unwrap() error, None for anything else.
 
