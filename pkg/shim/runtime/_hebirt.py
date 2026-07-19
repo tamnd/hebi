@@ -1189,6 +1189,133 @@ def str_equal_fold(s, t):
     return s.decode("utf-8", "replace").casefold() == t.decode("utf-8", "replace").casefold()
 
 
+# string, []byte, and []rune conversions bridge the byte-string world and the
+# slice world. A Go string is a bytes object, and a []byte or []rune is a Slice
+# header of ints, so a conversion walks one representation into the other.
+
+
+def _str_to_bytes(s):
+    """[]byte(string): a fresh byte slice over the string's bytes as ints."""
+    return _slice_lit(list(s))
+
+
+def _bytes_to_str(sl):
+    """string([]byte): the bytes the slice header spans, as a Go string."""
+    return bytes(bytearray(_slice_iter(sl)))
+
+
+def _encode_rune(r):
+    """The UTF-8 of a code point, U+FFFD when the value is not a valid one, which
+    is how Go encodes an out-of-range or surrogate code point in a conversion."""
+    if r < 0 or r > 0x10FFFF or 0xD800 <= r <= 0xDFFF:
+        return b"\xef\xbf\xbd"
+    return chr(r).encode("utf-8")
+
+
+def _rune_to_str(r):
+    """string(rune): the UTF-8 encoding of a single code point."""
+    return _encode_rune(r)
+
+
+def _str_to_runes(s):
+    """[]rune(string): the decoded code points, each as an int."""
+    return _slice_lit([ord(c) for c in s.decode("utf-8", "replace")])
+
+
+def _runes_to_str(sl):
+    """string([]rune): the UTF-8 of each code point joined into a string."""
+    out = bytearray()
+    for r in _slice_iter(sl):
+        out += _encode_rune(r)
+    return bytes(out)
+
+
+# bytes package. A []byte is a Slice header of ints, so each function reads the
+# window into a Python byte string, runs the same operation strings does, and
+# returns a []byte result as a fresh header.
+
+
+def _bytes_of(sl):
+    """The bytes a []byte slice header spans, as an immutable byte string."""
+    return bytes(bytearray(_slice_iter(sl)))
+
+
+def _bytes_slice(b):
+    """A fresh []byte header over the bytes of b."""
+    return _slice_lit(list(b))
+
+
+def bytes_contains(sl, sub):
+    return _bytes_of(sub) in _bytes_of(sl)
+
+
+def bytes_equal(a, b):
+    return _bytes_of(a) == _bytes_of(b)
+
+
+def bytes_compare(a, b):
+    x, y = _bytes_of(a), _bytes_of(b)
+    return (x > y) - (x < y)
+
+
+def bytes_has_prefix(sl, prefix):
+    return _bytes_of(sl).startswith(_bytes_of(prefix))
+
+
+def bytes_has_suffix(sl, suffix):
+    return _bytes_of(sl).endswith(_bytes_of(suffix))
+
+
+def bytes_index(sl, sub):
+    return _bytes_of(sl).find(_bytes_of(sub))
+
+
+def bytes_last_index(sl, sub):
+    return _bytes_of(sl).rfind(_bytes_of(sub))
+
+
+def bytes_index_byte(sl, b):
+    return _bytes_of(sl).find(bytes((b,)))
+
+
+def bytes_count(sl, sub):
+    s, sub = _bytes_of(sl), _bytes_of(sub)
+    if len(sub) == 0:
+        # Go counts an empty separator once before each rune and once at the end.
+        return len(s.decode("utf-8", "replace")) + 1
+    return s.count(sub)
+
+
+def bytes_repeat(sl, count):
+    return _bytes_slice(_bytes_of(sl) * count)
+
+
+def bytes_join(elems, sep):
+    s = _bytes_of(sep)
+    return _bytes_slice(s.join(_bytes_of(e) for e in _slice_iter(elems)))
+
+
+def bytes_split(sl, sep):
+    s, sep = _bytes_of(sl), _bytes_of(sep)
+    if len(sep) == 0:
+        parts = _rune_list(s)
+    else:
+        parts = s.split(sep)
+    return _slice_lit([_bytes_slice(p) for p in parts])
+
+
+def bytes_to_upper(sl):
+    return _bytes_slice(_bytes_of(sl).decode("utf-8", "replace").upper().encode("utf-8"))
+
+
+def bytes_to_lower(sl):
+    return _bytes_slice(_bytes_of(sl).decode("utf-8", "replace").lower().encode("utf-8"))
+
+
+def bytes_trim_space(sl):
+    return _bytes_slice(_bytes_of(sl).decode("utf-8", "replace").strip().encode("utf-8"))
+
+
 # strconv error sentinels. Go's strconv.ErrSyntax and ErrRange are the base
 # errors a NumError wraps, and their Error text is what a parse failure prints.
 _STRCONV_ERR_SYNTAX = _StringError(b"invalid syntax")

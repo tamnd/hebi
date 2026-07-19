@@ -4856,6 +4856,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "slices"); ok {
 			return l.lowerSlicesFunc(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "bytes"); ok {
+			return l.lowerBytesFunc(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "math"); ok {
 			return l.lowerMathFunc(e, name)
 		}
@@ -5294,6 +5297,38 @@ func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
 		return &ir.Mask{Bits: bits, Signed: signed, X: x}, nil
 	}
 
+	src := l.pkg.Info.TypeOf(e.Args[0])
+	if isStringType(dest) {
+		// string(x) bridges the slice world back to the byte-string world. A byte
+		// slice becomes the string over its bytes, a rune slice joins each code
+		// point's UTF-8, and a lone integer is the UTF-8 of that code point, the
+		// way Go reads string(65) as "A". A string source is the identity.
+		if slice, ok := src.Underlying().(*types.Slice); ok {
+			if isByteType(slice.Elem()) {
+				return &ir.Intrinsic{Name: "_bytes_to_str", Args: []ir.Expr{x}}, nil
+			}
+			if isRuneType(slice.Elem()) {
+				return &ir.Intrinsic{Name: "_runes_to_str", Args: []ir.Expr{x}}, nil
+			}
+		}
+		if isStringType(src) {
+			return x, nil
+		}
+		if _, _, ok := intWidth(src); ok {
+			return &ir.Intrinsic{Name: "_rune_to_str", Args: []ir.Expr{x}}, nil
+		}
+	}
+	if slice, ok := dest.Underlying().(*types.Slice); ok && isStringType(src) {
+		// []byte(s) and []rune(s) open a string into the slice world, a fresh
+		// header over its bytes or its decoded code points.
+		if isByteType(slice.Elem()) {
+			return &ir.Intrinsic{Name: "_str_to_bytes", Args: []ir.Expr{x}}, nil
+		}
+		if isRuneType(slice.Elem()) {
+			return &ir.Intrinsic{Name: "_str_to_runes", Args: []ir.Expr{x}}, nil
+		}
+	}
+
 	return nil, l.errf(e.Pos(), "conversion to %s is not supported yet", dest)
 }
 
@@ -5567,6 +5602,48 @@ func (l *lowerer) lowerStrconvFunc(e *ast.CallExpr, name string) (ir.Expr, error
 	intrinsic, ok := strconvIntrinsics[name]
 	if !ok {
 		return nil, l.errf(e.Pos(), "strconv.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
+}
+
+// bytesIntrinsics maps a bytes package function to the runtime shim that carries
+// its Go semantics over a byte slice. A byte slice is a Slice header of ints on
+// this tier, so each shim reads the window into a Python byte string, runs the
+// same operation strings does, and hands a []byte result back as a fresh header.
+// The Buffer and Reader value types wait for their own slice, and a function
+// outside this table fails loudly.
+var bytesIntrinsics = map[string]string{
+	"Contains":  "bytes_contains",
+	"Equal":     "bytes_equal",
+	"Compare":   "bytes_compare",
+	"HasPrefix": "bytes_has_prefix",
+	"HasSuffix": "bytes_has_suffix",
+	"Index":     "bytes_index",
+	"LastIndex": "bytes_last_index",
+	"IndexByte": "bytes_index_byte",
+	"Count":     "bytes_count",
+	"Repeat":    "bytes_repeat",
+	"Join":      "bytes_join",
+	"Split":     "bytes_split",
+	"ToUpper":   "bytes_to_upper",
+	"ToLower":   "bytes_to_lower",
+	"TrimSpace": "bytes_trim_space",
+}
+
+// lowerBytesFunc lowers a call to the standard bytes package through
+// bytesIntrinsics. A spread argument has no bytes function that takes one, so it
+// fails loudly, as does a function the table does not carry.
+func (l *lowerer) lowerBytesFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "bytes.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := bytesIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "bytes.%s is not supported yet", name)
 	}
 	args, err := l.lowerCallArgs(e.Args)
 	if err != nil {
@@ -6010,6 +6087,24 @@ func floatWidth(t types.Type) (bits int, ok bool) {
 	default:
 		return 0, false
 	}
+}
+
+// isStringType reports whether a type's underlying type is the string kind.
+func isStringType(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+	return ok && basic.Info()&types.IsString != 0
+}
+
+// isByteType reports whether a type is byte, the uint8 a []byte element carries.
+func isByteType(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+	return ok && basic.Kind() == types.Uint8
+}
+
+// isRuneType reports whether a type is rune, the int32 a []rune element carries.
+func isRuneType(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+	return ok && basic.Kind() == types.Int32
 }
 
 func exprName(e ast.Expr) string {
