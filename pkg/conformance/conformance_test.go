@@ -14,8 +14,11 @@ import (
 // and arrays and slices and maps and composite literals and addressable element
 // access, and the M3 band 0601 onward, the function and error world, multiple
 // and named returns, closures, pointers as cells, method sets, defer, panic and
-// recover, and the errors package. It skips where the go tool or python3 is not
-// on the path.
+// recover, and the errors package, and the M4 band 0851 onward, the interface and
+// generics world, interface values and method dispatch, embedding promotion, type
+// assertions and type switches, the typed-nil trap, the empty interface, generics
+// erasure, and constraint-directed division and remainder. It skips where the go
+// tool or python3 is not on the path.
 func TestFixtures(t *testing.T) {
 	t.Parallel()
 	requireTools(t)
