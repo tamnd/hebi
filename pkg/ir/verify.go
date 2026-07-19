@@ -73,6 +73,44 @@ func Verify(m *Module) error {
 			}
 		}
 	}
+	for i, nd := range m.Named {
+		if nd == nil {
+			return fmt.Errorf("ir: named type %d is nil", i)
+		}
+		if nd.Name == "" {
+			return fmt.Errorf("ir: named type %d has no name", i)
+		}
+		if structs[nd.Name] {
+			return fmt.Errorf("ir: named type %s is defined more than once", nd.Name)
+		}
+		structs[nd.Name] = true
+		switch nd.Base {
+		case "int", "float", "bytes":
+		default:
+			return fmt.Errorf("ir: named type %s has an unknown base %q", nd.Name, nd.Base)
+		}
+		methods := make(map[string]bool, len(nd.Methods))
+		for j, method := range nd.Methods {
+			if method == nil {
+				return fmt.Errorf("ir: named type %s: method %d is nil", nd.Name, j)
+			}
+			if method.Name == "" {
+				return fmt.Errorf("ir: named type %s: method %d has no name", nd.Name, j)
+			}
+			if methods[method.Name] {
+				return fmt.Errorf("ir: named type %s: method %s is defined more than once", nd.Name, method.Name)
+			}
+			methods[method.Name] = true
+			for k, p := range method.Params {
+				if p == "" {
+					return fmt.Errorf("ir: named type %s: method %s: parameter %d has no name", nd.Name, method.Name, k)
+				}
+			}
+			if err := verifyBlock(fmt.Sprintf("named type %s: method %s", nd.Name, method.Name), method.Body); err != nil {
+				return err
+			}
+		}
+	}
 	ifaces := make(map[string]bool, len(m.Interfaces))
 	for i, id := range m.Interfaces {
 		if id == nil {

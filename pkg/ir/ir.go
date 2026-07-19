@@ -19,8 +19,33 @@ type Module struct {
 	// Interfaces are the package's interface types in source order, each emitted
 	// as a runtime-checkable Protocol class ahead of the structs and functions.
 	Interfaces []*InterfaceDef
+	// Named are the package's named non-struct types that carry methods, in source
+	// order, each emitted as a Python subclass of the base its underlying basic type
+	// takes so a value carries the type's methods and its Stringer.
+	Named []*NamedDef
 	// Funcs are the package's functions in source order.
 	Funcs []*Func
+}
+
+// NamedDef is a named non-struct type with methods, such as type Duration int64,
+// lowered to a Python class that subclasses the base its underlying basic type
+// takes: int for an integer, float for a floating type, bytes for a string. A
+// value of the type is boxed into an instance of this class so recv.M(args)
+// dispatches the method and go_str finds a String or Error the type defines. The
+// value still is-a its base, so arithmetic, comparison, and integer formatting
+// read straight through, and the lowerer re-boxes a fresh arithmetic result whose
+// static type is the named type so the method stays reachable.
+type NamedDef struct {
+	// Name is the named type's name, which becomes the class name.
+	Name string
+	// Base is the Python base class the values subclass: int, float, or bytes.
+	Base string
+	// Type is the package-qualified Go type name fmt's %T prints, such as
+	// main.Duration, held on the class the way a struct carries _hebi_type.
+	Type string
+	// Methods are the type's methods in source order, each emitted as an instance
+	// method the same way a struct method is.
+	Methods []*Method
 }
 
 // InterfaceDef is a Go interface type lowered to a runtime-checkable Protocol.

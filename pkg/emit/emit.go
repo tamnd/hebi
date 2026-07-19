@@ -108,6 +108,15 @@ func Module(m *ir.Module) (string, error) {
 		emitInterface(&b, id)
 		wrote = true
 	}
+	for _, nd := range m.Named {
+		if wrote {
+			b.WriteString("\n\n")
+		}
+		if err := emitNamed(&b, nd); err != nil {
+			return "", err
+		}
+		wrote = true
+	}
 	for _, sd := range m.Structs {
 		if wrote {
 			b.WriteString("\n\n")
@@ -153,6 +162,13 @@ func Module(m *ir.Module) (string, error) {
 func moduleUnwinds(m *ir.Module) bool {
 	for _, sd := range m.Structs {
 		for _, method := range sd.Methods {
+			if blockUnwinds(method.Body) {
+				return true
+			}
+		}
+	}
+	for _, nd := range m.Named {
+		for _, method := range nd.Methods {
 			if blockUnwinds(method.Body) {
 				return true
 			}
@@ -313,6 +329,13 @@ func usesShim(m *ir.Module) bool {
 			}
 		}
 		for _, method := range sd.Methods {
+			if blockUsesShim(method.Body) {
+				return true
+			}
+		}
+	}
+	for _, nd := range m.Named {
+		for _, method := range nd.Methods {
 			if blockUsesShim(method.Body) {
 				return true
 			}
@@ -612,6 +635,27 @@ func emitStruct(b *strings.Builder, pkg string, sd *ir.StructDef) error {
 	}
 
 	for _, method := range sd.Methods {
+		b.WriteString("\n")
+		writeIndent(b, 1)
+		fmt.Fprintf(b, "def %s(%s):\n", method.Name, strings.Join(append([]string{"self"}, method.Params...), ", "))
+		if err := emitBlock(b, method.Body, 2); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// emitNamed writes the Python class for a named non-struct type with methods. The
+// class subclasses the base its underlying basic type takes, so a value is-a int,
+// float, or bytes and reads straight through arithmetic and integer formatting,
+// while the class carries the type's methods and _hebi_type. It needs no __init__:
+// the base's constructor already builds an instance from a value, which is how the
+// lowerer boxes a fresh value by calling the class.
+func emitNamed(b *strings.Builder, nd *ir.NamedDef) error {
+	fmt.Fprintf(b, "class %s(%s):\n", nd.Name, nd.Base)
+	writeIndent(b, 1)
+	fmt.Fprintf(b, "_hebi_type = %q\n", nd.Type)
+	for _, method := range nd.Methods {
 		b.WriteString("\n")
 		writeIndent(b, 1)
 		fmt.Fprintf(b, "def %s(%s):\n", method.Name, strings.Join(append([]string{"self"}, method.Params...), ", "))
