@@ -10,9 +10,12 @@ import (
 // TestFixtures is the differential band: every fixture under testdata must
 // produce the same stdout and exit code through go run and through the compiled
 // Python tier. It covers the M0 band 0001-0050 and the M1 band 0051 onward,
-// scalars and control flow, and the M2 band 0301 onward, the aggregates,
-// structs and arrays and slices and maps and composite literals and addressable
-// element access, and skips where the go tool or python3 is not on the path.
+// scalars and control flow, the M2 band 0301 onward, the aggregates, structs
+// and arrays and slices and maps and composite literals and addressable element
+// access, and the M3 band 0601 onward, the function and error world, multiple
+// and named returns, closures, pointers as cells, method sets, defer, panic and
+// recover, and the errors package. It skips where the go tool or python3 is not
+// on the path.
 func TestFixtures(t *testing.T) {
 	t.Parallel()
 	requireTools(t)
