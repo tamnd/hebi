@@ -1316,6 +1316,147 @@ def bytes_trim_space(sl):
     return _bytes_slice(_bytes_of(sl).decode("utf-8", "replace").strip().encode("utf-8"))
 
 
+# unicode/utf8 package. Pure UTF-8 mechanics, independent of the Unicode
+# version, so a Go-faithful decoder reads one rune at a time and every function
+# matches Go bit for bit, including the RuneError with width one an invalid byte
+# decodes to and the legitimately encoded U+FFFD that decodes to width three.
+
+
+def _utf8_decode(b, i):
+    """Decode the rune at b[i:], returning (rune, size) the way Go's
+    utf8.DecodeRune does. An empty input is (RuneError, 0), and any malformed
+    sequence is (RuneError, 1), following Go's first-byte accept ranges that
+    reject an overlong form, a surrogate, and an out-of-range code point."""
+    n = len(b)
+    if i >= n:
+        return 0xFFFD, 0
+    c0 = b[i]
+    if c0 < 0x80:
+        return c0, 1
+    if c0 < 0xC2:
+        # A continuation byte or an overlong two-byte lead is invalid.
+        return 0xFFFD, 1
+    if c0 < 0xE0:
+        size, lo, hi, cp = 2, 0x80, 0xBF, c0 & 0x1F
+    elif c0 < 0xF0:
+        size, cp = 3, c0 & 0x0F
+        lo, hi = 0x80, 0xBF
+        if c0 == 0xE0:
+            lo = 0xA0
+        elif c0 == 0xED:
+            hi = 0x9F
+    elif c0 < 0xF5:
+        size, cp = 4, c0 & 0x07
+        lo, hi = 0x80, 0xBF
+        if c0 == 0xF0:
+            lo = 0x90
+        elif c0 == 0xF4:
+            hi = 0x8F
+    else:
+        return 0xFFFD, 1
+    if i + 1 >= n:
+        return 0xFFFD, 1
+    c1 = b[i + 1]
+    if c1 < lo or c1 > hi:
+        return 0xFFFD, 1
+    cp = (cp << 6) | (c1 & 0x3F)
+    for k in range(2, size):
+        if i + k >= n:
+            return 0xFFFD, 1
+        ck = b[i + k]
+        if ck < 0x80 or ck > 0xBF:
+            return 0xFFFD, 1
+        cp = (cp << 6) | (ck & 0x3F)
+    return cp, size
+
+
+def _utf8_count(b):
+    i, n, count = 0, len(b), 0
+    while i < n:
+        _, size = _utf8_decode(b, i)
+        i += size
+        count += 1
+    return count
+
+
+def _utf8_valid(b):
+    i, n = 0, len(b)
+    while i < n:
+        r, size = _utf8_decode(b, i)
+        if r == 0xFFFD and size == 1:
+            return False
+        i += size
+    return True
+
+
+def utf8_rune_count_in_string(s):
+    return _utf8_count(s)
+
+
+def utf8_rune_count(sl):
+    return _utf8_count(_bytes_of(sl))
+
+
+def utf8_valid_string(s):
+    return _utf8_valid(s)
+
+
+def utf8_valid(sl):
+    return _utf8_valid(_bytes_of(sl))
+
+
+def utf8_rune_len(r):
+    if r < 0 or 0xD800 <= r <= 0xDFFF or r > 0x10FFFF:
+        return -1
+    if r < 0x80:
+        return 1
+    if r < 0x800:
+        return 2
+    if r < 0x10000:
+        return 3
+    return 4
+
+
+def utf8_valid_rune(r):
+    if 0xD800 <= r <= 0xDFFF:
+        return False
+    return 0 <= r <= 0x10FFFF
+
+
+def utf8_decode_rune_in_string(s):
+    return _utf8_decode(s, 0)
+
+
+def utf8_decode_rune(sl):
+    return _utf8_decode(_bytes_of(sl), 0)
+
+
+def utf8_decode_last_rune_in_string(s):
+    """The last rune of s and its size, matching Go's utf8.DecodeLastRuneInString.
+    Go walks back up to UTFMax continuation bytes to find the lead, decodes
+    forward, and falls back to a width-one RuneError when that does not line up."""
+    n = len(s)
+    if n == 0:
+        return 0xFFFD, 0
+    start = n - 1
+    if s[start] < 0x80:
+        return s[start], 1
+    lim = n - 4
+    if lim < 0:
+        lim = 0
+    start = n - 1
+    while start >= lim:
+        if s[start] < 0x80 or s[start] >= 0xC0:
+            break
+        start -= 1
+    if start < lim:
+        start = n - 1
+    r, size = _utf8_decode(s, start)
+    if start + size != n:
+        return 0xFFFD, 1
+    return r, size
+
+
 # strconv error sentinels. Go's strconv.ErrSyntax and ErrRange are the base
 # errors a NumError wraps, and their Error text is what a parse failure prints.
 _STRCONV_ERR_SYNTAX = _StringError(b"invalid syntax")
