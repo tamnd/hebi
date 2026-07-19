@@ -910,6 +910,22 @@ def _crash(p):
     os._exit(2)
 
 
+def _fatal(msg):
+    """Print Go's fatal-error banner to stderr and exit with status 2.
+
+    A fatal error, unlike a panic, cannot be recovered and runs no deferred calls,
+    so it exits directly rather than raising: the banner reads "fatal error: " and
+    the message, a goroutine header follows, and the process exits with status 2.
+    The sync package raises one for an unlock of an unheld lock, which Go reports as
+    a fatal error rather than a catchable panic.
+    """
+    sys.stdout.flush()
+    sys.stderr.write("fatal error: " + msg + "\n\n")
+    sys.stderr.write("goroutine 1 [running]:\n")
+    sys.stderr.flush()
+    os._exit(2)
+
+
 # Goroutines. A Go goroutine is an independently scheduled call, and the compiled
 # tier runs each on its own OS thread so a real stack backs local escapes and a
 # blocking call blocks only its own thread. The thread is a daemon, so it is
@@ -1189,6 +1205,157 @@ def _block_forever():
     with cond:
         while True:
             cond.wait()
+
+
+# The sync package. Most of Go's sync primitives map onto threading, but a
+# read-write lock and a join-group have no threading equivalent, so the shim
+# builds them on a Condition. Every sync value is a reference object the compiler
+# constructs once and shares through a pointer, never copied, which matches Go
+# where copying a used sync value is a vet error. The free functions below carry
+# each operation so the crash guard can list the ones that panic the Go way.
+
+
+class Mutex:
+    """A mutual-exclusion lock, threading.Lock with Go's unlock-of-unlocked panic.
+
+    threading.Lock is not owned by a thread, so a goroutine may unlock a mutex a
+    different goroutine locked, which Go allows and threading.RLock would not.
+    """
+
+    __slots__ = ("_lock",)
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+
+def mutex_lock(m):
+    m._lock.acquire()
+
+
+def mutex_unlock(m):
+    try:
+        m._lock.release()
+    except RuntimeError:
+        _fatal("sync: unlock of unlocked mutex")
+
+
+def mutex_try_lock(m):
+    return m._lock.acquire(blocking=False)
+
+
+class RWMutex:
+    """A writer-preferring read-write lock, built on a Condition since threading
+    has none. A waiting writer blocks new readers, which is Go's no-writer-
+    starvation behavior."""
+
+    __slots__ = ("_cond", "_readers", "_writer", "_waiting_writers")
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+
+def rwmutex_rlock(m):
+    with m._cond:
+        while m._writer or m._waiting_writers > 0:
+            m._cond.wait()
+        m._readers += 1
+
+
+def rwmutex_runlock(m):
+    with m._cond:
+        if m._readers == 0:
+            _fatal("sync: RUnlock of unlocked RWMutex")
+        m._readers -= 1
+        if m._readers == 0:
+            m._cond.notify_all()
+
+
+def rwmutex_lock(m):
+    with m._cond:
+        m._waiting_writers += 1
+        while m._writer or m._readers > 0:
+            m._cond.wait()
+        m._waiting_writers -= 1
+        m._writer = True
+
+
+def rwmutex_unlock(m):
+    with m._cond:
+        if not m._writer:
+            _fatal("sync: Unlock of unlocked RWMutex")
+        m._writer = False
+        m._cond.notify_all()
+
+
+def rwmutex_try_lock(m):
+    with m._cond:
+        if m._writer or m._readers > 0 or m._waiting_writers > 0:
+            return False
+        m._writer = True
+        return True
+
+
+def rwmutex_try_rlock(m):
+    with m._cond:
+        if m._writer or m._waiting_writers > 0:
+            return False
+        m._readers += 1
+        return True
+
+
+class WaitGroup:
+    """A join-group counter, a count plus a Condition since threading has no
+    join-group. Wait parks until the count reaches zero."""
+
+    __slots__ = ("_cond", "_count")
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._count = 0
+
+
+def waitgroup_add(wg, delta):
+    with wg._cond:
+        wg._count += delta
+        if wg._count < 0:
+            raise GoPanic("sync: negative WaitGroup counter")
+        if wg._count == 0:
+            wg._cond.notify_all()
+
+
+def waitgroup_done(wg):
+    waitgroup_add(wg, -1)
+
+
+def waitgroup_wait(wg):
+    with wg._cond:
+        while wg._count > 0:
+            wg._cond.wait()
+
+
+class Once:
+    """A do-once guard, a flag double-checked under a lock so the fast path after
+    the first call is a plain flag read."""
+
+    __slots__ = ("_done", "_lock")
+
+    def __init__(self):
+        self._done = False
+        self._lock = threading.Lock()
+
+
+def once_do(o, fn):
+    if o._done:
+        return
+    with o._lock:
+        if not o._done:
+            try:
+                fn()
+            finally:
+                o._done = True
 
 
 # String helpers. A Go string is Python bytes, so byte indexing, length, and

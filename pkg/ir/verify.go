@@ -43,6 +43,10 @@ func Verify(m *Module) error {
 				if err := verifyExpr(where+": zero", f.Zero); err != nil {
 					return err
 				}
+			case FieldSync:
+				if err := verifyExpr(where+": zero", f.Zero); err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("ir: %s has an unknown kind %d", where, f.Kind)
 			}

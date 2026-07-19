@@ -213,15 +213,22 @@ func stmtUnwinds(s ir.Stmt) bool {
 // type, and integer division and remainder panic on a zero divisor; the comma-ok
 // _type_assert_ok and the float _fdiv never panic. A send on a closed channel and a
 // close of a closed or nil channel panic, so chan_send and chan_close carry the
-// crash the guard must account for; a receive never panics.
+// crash the guard must account for; a receive never panics. Among the sync
+// operations, driving a WaitGroup counter negative raises a recoverable panic and a
+// once function may panic, so waitgroup_add, waitgroup_done, and once_do join the
+// set; an unlock of an unheld lock is a Go fatal error, not a panic, so it exits on
+// its own and needs no guard, and the pure lock, wait, and try operations never panic.
 var panicIntrinsics = map[string]bool{
-	"_type_assert": true,
-	"_idiv":        true,
-	"_imod":        true,
-	"_quo":         true,
-	"chan_send":    true,
-	"chan_close":   true,
-	"select":       true,
+	"_type_assert":   true,
+	"_idiv":          true,
+	"_imod":          true,
+	"_quo":           true,
+	"chan_send":      true,
+	"chan_close":     true,
+	"select":         true,
+	"waitgroup_add":  true,
+	"waitgroup_done": true,
+	"once_do":        true,
 }
 
 // exprUnwinds reports whether evaluating an expression can raise a GoPanic. A
@@ -298,6 +305,10 @@ func usesShim(m *ir.Module) bool {
 			case ir.FieldArray:
 				// An array field always emits the clone and array-key helpers in the
 				// generated copy and hash methods, so it needs the runtime import.
+				return true
+			case ir.FieldSync:
+				// A sync field builds its runtime object in the constructor, so the
+				// module imports the shim.
 				return true
 			}
 		}
@@ -557,6 +568,12 @@ func emitStruct(b *strings.Builder, sd *ir.StructDef) error {
 			// An array field is a value, so like a struct field it defaults to None
 			// and builds a fresh zero array in the body, since a mutable default
 			// argument would be shared across every instance of the class.
+			zero, _ := emitExpr(f.Zero)
+			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s\n", f.Name, param, param, zero)
+		case ir.FieldSync:
+			// A sync field builds its own runtime object in the body so each instance
+			// owns one, defaulting to None like an array field, since a shared default
+			// argument would give every instance the same lock.
 			zero, _ := emitExpr(f.Zero)
 			fmt.Fprintf(b, "self.%s = %s if %s is not None else %s\n", f.Name, param, param, zero)
 		default:
