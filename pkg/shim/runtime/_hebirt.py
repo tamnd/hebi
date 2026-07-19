@@ -1227,6 +1227,18 @@ class Mutex:
     def __init__(self):
         self._lock = threading.Lock()
 
+    # Lock, Unlock, and TryLock are also carried as methods so a Mutex used through
+    # the sync.Locker interface, the way sync.NewCond takes it, answers the call; a
+    # direct mu.Lock() still lowers to the free function so the crash guard names it.
+    def Lock(self):
+        mutex_lock(self)
+
+    def Unlock(self):
+        mutex_unlock(self)
+
+    def TryLock(self):
+        return mutex_try_lock(self)
+
 
 def mutex_lock(m):
     m._lock.acquire()
@@ -1255,6 +1267,27 @@ class RWMutex:
         self._readers = 0
         self._writer = False
         self._waiting_writers = 0
+
+    # As with Mutex, the operations are also methods so an RWMutex passed as a
+    # sync.Locker, whose Lock and Unlock are the write lock, answers through the
+    # interface; a direct call still lowers to the free function.
+    def Lock(self):
+        rwmutex_lock(self)
+
+    def Unlock(self):
+        rwmutex_unlock(self)
+
+    def RLock(self):
+        rwmutex_rlock(self)
+
+    def RUnlock(self):
+        rwmutex_runlock(self)
+
+    def TryLock(self):
+        return rwmutex_try_lock(self)
+
+    def TryRLock(self):
+        return rwmutex_try_rlock(self)
 
 
 def rwmutex_rlock(m):
@@ -1356,6 +1389,254 @@ def once_do(o, fn):
                 fn()
             finally:
                 o._done = True
+
+
+class Cond:
+    """A condition variable over a caller-held Locker, sync.Cond.
+
+    Go's Cond hands Wait a Locker the caller already holds, releases it while the
+    goroutine sleeps, and re-takes it on wake. The runtime keeps its own internal
+    Condition, distinct from the user Locker, so a Signal that races a Wait cannot
+    slip in during the gap between releasing the user lock and starting to sleep,
+    which is the lost wakeup Go's Cond does not have. L is the Locker, reached the
+    Go way as c.L.
+    """
+
+    __slots__ = ("L", "_cond")
+
+    def __init__(self, locker):
+        self.L = locker
+        self._cond = threading.Condition(threading.Lock())
+
+
+def NewCond(locker):
+    """Build the Cond sync.NewCond returns over a Locker, in practice a Mutex."""
+    return Cond(locker)
+
+
+def cond_wait(c):
+    """Wait for a signal, Go's Cond.Wait, called with c.L held.
+
+    The internal lock is taken before c.L is released, so a Signal or Broadcast,
+    which must take that same internal lock to notify, cannot run between the
+    release and the sleep, and no wakeup is lost. On wake the internal lock is
+    dropped and c.L is re-acquired, leaving the caller holding c.L again as Go
+    promises.
+    """
+    c._cond.acquire()
+    c.L.Unlock()
+    try:
+        c._cond.wait()
+    finally:
+        c._cond.release()
+        c.L.Lock()
+
+
+def cond_signal(c):
+    """Wake one waiter, Go's Cond.Signal. A signal with no waiter is dropped, since
+    Go does not save it, which the notify under the internal lock reproduces."""
+    with c._cond:
+        c._cond.notify()
+
+
+def cond_broadcast(c):
+    """Wake every waiter, Go's Cond.Broadcast."""
+    with c._cond:
+        c._cond.notify_all()
+
+
+class SyncMap:
+    """A concurrent map, sync.Map, a dict behind a lock.
+
+    Go's sync.Map trades a plain map plus a Mutex for less contention on some
+    workloads, but its observable behavior is a locked map, which is what the
+    runtime provides: every operation takes the lock, and Range walks a snapshot so
+    the callback may store or delete without deadlocking or skipping.
+    """
+
+    __slots__ = ("_d", "_lock")
+
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+
+def syncmap_store(m, k, v):
+    with m._lock:
+        m._d[k] = v
+
+
+def syncmap_load(m, k):
+    """Load in comma-ok form, Go's value, ok := m.Load(k): (value, True) on a hit,
+    (None, False) on a miss, so a present nil is told apart from an absent key."""
+    with m._lock:
+        if k in m._d:
+            return m._d[k], True
+        return None, False
+
+
+def syncmap_load_or_store(m, k, v):
+    """Load the existing value or store and return the new one, Go's LoadOrStore:
+    (actual, True) when the key was present, (v, False) when it was just stored."""
+    with m._lock:
+        if k in m._d:
+            return m._d[k], True
+        m._d[k] = v
+        return v, False
+
+
+def syncmap_load_and_delete(m, k):
+    """Load and delete in one step, Go's LoadAndDelete: (value, True) when the key
+    was present and is now removed, (None, False) when it was absent."""
+    with m._lock:
+        if k in m._d:
+            return m._d.pop(k), True
+        return None, False
+
+
+def syncmap_delete(m, k):
+    with m._lock:
+        m._d.pop(k, None)
+
+
+def syncmap_range(m, fn):
+    """Call fn for each entry until it returns False, Go's Range.
+
+    A snapshot is taken under the lock and then walked with the lock released, so
+    the callback may call Store or Delete without deadlocking, and a concurrent
+    change does not raise the way mutating a dict mid-iteration would. Go promises
+    no more than that a Range sees each key present for the whole call at most once.
+    """
+    with m._lock:
+        items = list(m._d.items())
+    for k, v in items:
+        if not fn(k, v):
+            break
+
+
+class Pool:
+    """A free list of reusable values, sync.Pool.
+
+    Go's Pool is a best-effort cache with no liveness promise: Get returns a pooled
+    value or, when the pool is empty, New(), and Put offers a value back. The
+    runtime keeps a plain locked list, which honors that contract without modeling
+    the per-P sharding or GC eviction, neither of which a program may rely on.
+    """
+
+    __slots__ = ("_items", "_lock", "_new")
+
+    def __init__(self, new=None):
+        self._items = []
+        self._lock = threading.Lock()
+        self._new = new
+
+
+def pool_get(p):
+    """Return a pooled value, or New() when the pool is empty, or None when it is
+    empty and New is nil, matching Go's Pool.Get. New runs outside the lock so a
+    slow constructor does not block another Get."""
+    with p._lock:
+        if p._items:
+            return p._items.pop()
+    if p._new is not None:
+        return p._new()
+    return None
+
+
+def pool_put(p, x):
+    with p._lock:
+        p._items.append(x)
+
+
+# The sync/atomic value types. Go's atomic.Int64 and its siblings are structs with
+# atomic Load, Store, Add, Swap, and CompareAndSwap, which the runtime models as a
+# locked cell: even a load takes the lock, since the free-threaded build gives no
+# tear-free read for free, and an Add wraps at the type's width the way the fixed
+# width integer helpers do. The free-function forms, atomic.AddInt64 over a pointer,
+# wait on the pointer-to-scalar slice.
+
+
+class _Atomic:
+    """A locked integer cell, the shared body of the atomic integer types.
+
+    The mask is the width helper for the type, so Int32 sign-extends at 32 bits and
+    Uint64 masks at 64, and every operation runs under the lock so a concurrent Add
+    and Load never interleave a half-updated value.
+    """
+
+    __slots__ = ("_v", "_lock", "_mask")
+
+    def __init__(self, mask):
+        self._mask = mask
+        self._v = mask(0)
+        self._lock = threading.Lock()
+
+
+def AtomicInt32():
+    return _Atomic(_i32)
+
+
+def AtomicInt64():
+    return _Atomic(_i64)
+
+
+def AtomicUint32():
+    return _Atomic(_u32)
+
+
+def AtomicUint64():
+    return _Atomic(_u64)
+
+
+class _AtomicBool:
+    """A locked boolean cell, atomic.Bool. It has no Add, so it carries no width
+    mask, only Load, Store, Swap, and CompareAndSwap under the lock."""
+
+    __slots__ = ("_v", "_lock")
+
+    def __init__(self):
+        self._v = False
+        self._lock = threading.Lock()
+
+
+def AtomicBool():
+    return _AtomicBool()
+
+
+def atomic_load(a):
+    with a._lock:
+        return a._v
+
+
+def atomic_store(a, v):
+    with a._lock:
+        a._v = v
+
+
+def atomic_add(a, delta):
+    """Add delta and return the new value, Go's atomic Add, wrapping at the type's
+    width so an Int32 overflow rolls over exactly as Go's does."""
+    with a._lock:
+        a._v = a._mask(a._v + delta)
+        return a._v
+
+
+def atomic_swap(a, new):
+    """Store new and return the previous value, Go's atomic Swap."""
+    with a._lock:
+        old = a._v
+        a._v = new
+        return old
+
+
+def atomic_cas(a, old, new):
+    """Store new only if the cell still holds old, returning whether it swapped,
+    Go's atomic CompareAndSwap."""
+    with a._lock:
+        if a._v == old:
+            a._v = new
+            return True
+        return False
 
 
 # String helpers. A Go string is Python bytes, so byte indexing, length, and

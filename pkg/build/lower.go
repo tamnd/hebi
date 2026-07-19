@@ -225,12 +225,16 @@ func (l *lowerer) lowerInterfaceSpec(ts *ast.TypeSpec, it *types.Interface) (*ir
 // a pointer, slice, map, or the like, waits on a later slice and fails loudly
 // through zeroValueOfType.
 func (l *lowerer) structField(name string, t types.Type, pos token.Pos) (ir.StructField, error) {
-	if syncName, ok := syncTypeName(t); ok {
-		// A sync field builds its own runtime object per instance and shares it on
+	if key, ok := refTypeKey(t); ok {
+		// A reference field builds its own runtime object per instance and shares it on
 		// copy, so it carries the constructor intrinsic as its zero and takes its own
 		// field kind rather than the value-struct path, which would emit a bare class
 		// name the module never defines.
-		return ir.StructField{Name: name, Kind: ir.FieldSync, Zero: &ir.Intrinsic{Name: syncName}}, nil
+		zero, err := l.refZero(key, pos)
+		if err != nil {
+			return ir.StructField{}, err
+		}
+		return ir.StructField{Name: name, Kind: ir.FieldSync, Zero: zero}, nil
 	}
 	if _, ok := t.Underlying().(*types.Struct); ok {
 		named, ok := t.(*types.Named)
@@ -1722,42 +1726,86 @@ func (l *lowerer) lowerSelectRecvBind(a *ast.AssignStmt, valName, okName string)
 	return &ir.Tuple{Elems: []ir.Expr{&ir.IntLit{Text: "0"}, ch}}, binds, nil
 }
 
-// syncMethods maps each modeled sync type's methods to the runtime free function
-// that carries the operation. The runtime models a sync value as a shared
-// reference object and passes it as the first argument, so a method call lowers to
-// a plain intrinsic rather than a Python method, which also lets the crash guard
-// list the operations that panic the Go way by name.
-var syncMethods = map[string]map[string]string{
-	"Mutex": {
+// refType describes a Go type the runtime models as a shared reference object, one
+// it constructs once and reaches through a pointer, never copying, which matches Go
+// where copying a used sync or atomic value is a vet error. class is the runtime
+// constructor a usable zero value calls, empty for a type with no usable zero value
+// that is built by its own function instead, sync.Cond through sync.NewCond. methods
+// maps each Go method to the runtime free function that carries it, passing the
+// value as the first argument, which also lets the crash guard list by name the
+// operations that panic the Go way.
+type refType struct {
+	class   string
+	methods map[string]string
+}
+
+// atomicIntMethods is the method set the atomic integer types share, the widths
+// differing only in the constructor's mask.
+var atomicIntMethods = map[string]string{
+	"Load":           "atomic_load",
+	"Store":          "atomic_store",
+	"Add":            "atomic_add",
+	"Swap":           "atomic_swap",
+	"CompareAndSwap": "atomic_cas",
+}
+
+// refTypes indexes each modeled reference type by its "importpath.Name".
+var refTypes = map[string]refType{
+	"sync.Mutex": {class: "Mutex", methods: map[string]string{
 		"Lock":    "mutex_lock",
 		"Unlock":  "mutex_unlock",
 		"TryLock": "mutex_try_lock",
-	},
-	"RWMutex": {
+	}},
+	"sync.RWMutex": {class: "RWMutex", methods: map[string]string{
 		"Lock":     "rwmutex_lock",
 		"Unlock":   "rwmutex_unlock",
 		"RLock":    "rwmutex_rlock",
 		"RUnlock":  "rwmutex_runlock",
 		"TryLock":  "rwmutex_try_lock",
 		"TryRLock": "rwmutex_try_rlock",
-	},
-	"WaitGroup": {
+	}},
+	"sync.WaitGroup": {class: "WaitGroup", methods: map[string]string{
 		"Add":  "waitgroup_add",
 		"Done": "waitgroup_done",
 		"Wait": "waitgroup_wait",
-	},
-	"Once": {
+	}},
+	"sync.Once": {class: "Once", methods: map[string]string{
 		"Do": "once_do",
-	},
+	}},
+	"sync.Map": {class: "SyncMap", methods: map[string]string{
+		"Store":         "syncmap_store",
+		"Load":          "syncmap_load",
+		"LoadOrStore":   "syncmap_load_or_store",
+		"LoadAndDelete": "syncmap_load_and_delete",
+		"Delete":        "syncmap_delete",
+		"Range":         "syncmap_range",
+	}},
+	"sync.Pool": {class: "Pool", methods: map[string]string{
+		"Get": "pool_get",
+		"Put": "pool_put",
+	}},
+	"sync.Cond": {class: "", methods: map[string]string{
+		"Wait":      "cond_wait",
+		"Signal":    "cond_signal",
+		"Broadcast": "cond_broadcast",
+	}},
+	"sync/atomic.Int32":  {class: "AtomicInt32", methods: atomicIntMethods},
+	"sync/atomic.Int64":  {class: "AtomicInt64", methods: atomicIntMethods},
+	"sync/atomic.Uint32": {class: "AtomicUint32", methods: atomicIntMethods},
+	"sync/atomic.Uint64": {class: "AtomicUint64", methods: atomicIntMethods},
+	"sync/atomic.Bool": {class: "AtomicBool", methods: map[string]string{
+		"Load":           "atomic_load",
+		"Store":          "atomic_store",
+		"Swap":           "atomic_swap",
+		"CompareAndSwap": "atomic_cas",
+	}},
 }
 
-// syncTypeName reports whether t, ignoring a leading pointer, is one of the sync
-// package types the runtime models as a shared reference object, returning the
-// type's name. A sync value is never copied in Go, where copying a used one is a
-// vet error, so the runtime gives each its own object and shares it through a
-// pointer receiver, which is why the pointer and the value forms map to the same
-// object.
-func syncTypeName(t types.Type) (string, bool) {
+// refTypeKey reports whether t, ignoring a leading pointer, is one of the modeled
+// reference types, returning its registry key. The pointer and value forms map to
+// the same object, since the runtime shares one instance through the pointer the way
+// Go's pointer receiver reaches the single value.
+func refTypeKey(t types.Type) (string, bool) {
 	if t == nil {
 		return "", false
 	}
@@ -1769,25 +1817,37 @@ func syncTypeName(t types.Type) (string, bool) {
 		return "", false
 	}
 	obj := named.Obj()
-	if obj.Pkg() == nil || obj.Pkg().Path() != "sync" {
+	if obj.Pkg() == nil {
 		return "", false
 	}
-	switch obj.Name() {
-	case "Mutex", "RWMutex", "WaitGroup", "Once":
-		return obj.Name(), true
+	key := obj.Pkg().Path() + "." + obj.Name()
+	if _, ok := refTypes[key]; ok {
+		return key, true
 	}
 	return "", false
 }
 
-// lowerSyncMethod lowers a call to a method on a sync value to the runtime free
-// function that carries it, passing the receiver as the first argument. The
-// receiver lowers without a clone, since a sync value is a shared reference object
-// the pointer receiver reaches directly, and the remaining arguments lower plainly,
-// which covers Once.Do's function and WaitGroup.Add's delta.
-func (l *lowerer) lowerSyncMethod(e *ast.CallExpr, sel *ast.SelectorExpr, typ string) (ir.Expr, error) {
-	fn, ok := syncMethods[typ][sel.Sel.Name]
+// refZero returns the constructor intrinsic for a modeled reference type's zero
+// value, diagnosing the one type, sync.Cond, whose zero value is not usable and must
+// be built with sync.NewCond, so a var or a field of it fails loudly rather than
+// emitting an unusable object.
+func (l *lowerer) refZero(key string, pos token.Pos) (ir.Expr, error) {
+	class := refTypes[key].class
+	if class == "" {
+		return nil, l.errf(pos, "the zero value of %s is not usable, build it with sync.NewCond", key)
+	}
+	return &ir.Intrinsic{Name: class}, nil
+}
+
+// lowerRefMethod lowers a call to a method on a reference value to the runtime free
+// function that carries it, passing the receiver as the first argument. The receiver
+// lowers without a clone, since a reference value is a shared object the pointer
+// receiver reaches directly, and the remaining arguments lower plainly, which covers
+// Once.Do's function, WaitGroup.Add's delta, and sync.Map's key and value.
+func (l *lowerer) lowerRefMethod(e *ast.CallExpr, sel *ast.SelectorExpr, key string) (ir.Expr, error) {
+	fn, ok := refTypes[key].methods[sel.Sel.Name]
 	if !ok {
-		return nil, l.errf(e.Pos(), "sync.%s.%s is not supported yet", typ, sel.Sel.Name)
+		return nil, l.errf(e.Pos(), "%s.%s is not supported yet", key, sel.Sel.Name)
 	}
 	recv, err := l.lowerExpr(sel.X)
 	if err != nil {
@@ -1802,6 +1862,52 @@ func (l *lowerer) lowerSyncMethod(e *ast.CallExpr, sel *ast.SelectorExpr, typ st
 		args = append(args, arg)
 	}
 	return &ir.Intrinsic{Name: fn, Args: args}, nil
+}
+
+// lowerSyncFunc lowers a call to a function in the sync package. NewCond builds a
+// Cond over a Locker, in practice the address of a Mutex or RWMutex, and since a
+// sync value is already a shared reference object the address-of names that same
+// object, so the locker lowers with the leading and-operator stripped rather than
+// boxed into a cell. Any other sync function waits on its own slice.
+func (l *lowerer) lowerSyncFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if name != "NewCond" {
+		return nil, l.errf(e.Pos(), "sync.%s is not supported yet", name)
+	}
+	arg := e.Args[0]
+	if u, ok := astUnparen(arg).(*ast.UnaryExpr); ok && u.Op == token.AND {
+		if _, ok := refTypeKey(l.pkg.Info.TypeOf(u.X)); ok {
+			arg = u.X
+		}
+	}
+	locker, err := l.lowerExpr(arg)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "NewCond", Args: []ir.Expr{locker}}, nil
+}
+
+// lowerPoolLit lowers a sync.Pool composite literal, capturing its New field so the
+// runtime pool builds a fresh value when it is empty. The zero-field form and the
+// var form both leave New nil, which the pool reads as no factory, returning the nil
+// interface from Get. The only field a Pool literal admits is New.
+func (l *lowerer) lowerPoolLit(e *ast.CompositeLit) (ir.Expr, error) {
+	var args []ir.Expr
+	for _, elt := range e.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			return nil, l.errf(elt.Pos(), "a sync.Pool literal takes the keyed New field")
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || key.Name != "New" {
+			return nil, l.errf(kv.Key.Pos(), "a sync.Pool literal supports only the New field")
+		}
+		fn, err := l.lowerExpr(kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, fn)
+	}
+	return &ir.Intrinsic{Name: "Pool", Args: args}, nil
 }
 
 // asPanicCall returns the call expression when x is a call to the builtin panic,
@@ -1954,10 +2060,10 @@ func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
 // through the single-precision helper. Any other type waits on a later slice and
 // fails loudly, which is also how an unsupported struct field type is caught.
 func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) {
-	if name, ok := syncTypeName(t); ok {
-		// A sync value's zero value is a fresh runtime object, so var mu sync.Mutex
-		// and a sync-typed struct field each construct their own, never a shared one.
-		return &ir.Intrinsic{Name: name}, nil
+	if key, ok := refTypeKey(t); ok {
+		// A reference value's zero value is a fresh runtime object, so var mu sync.Mutex
+		// or var n atomic.Int64 each construct their own, never a shared one.
+		return l.refZero(key, pos)
 	}
 	if _, ok := t.Underlying().(*types.Struct); ok {
 		named, ok := t.(*types.Named)
@@ -3861,10 +3967,17 @@ func structOf(t types.Type) *types.Struct {
 // aggregate slices.
 func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	t := l.pkg.Info.TypeOf(e)
-	if name, ok := syncTypeName(t); ok {
-		// A sync composite literal, sync.Mutex{} or &sync.Mutex{}, is a fresh runtime
-		// object, the same one var mu sync.Mutex builds.
-		return &ir.Intrinsic{Name: name}, nil
+	if key, ok := refTypeKey(t); ok {
+		// A reference composite literal, sync.Mutex{} or &sync.Pool{New: f}, is a fresh
+		// runtime object, the same one the zero value builds. Pool carries its New
+		// field, and any other reference type takes no fields.
+		if key == "sync.Pool" {
+			return l.lowerPoolLit(e)
+		}
+		if len(e.Elts) != 0 {
+			return nil, l.errf(e.Pos(), "a %s literal takes no fields", key)
+		}
+		return l.refZero(key, e.Pos())
 	}
 	if arr, ok := t.Underlying().(*types.Array); ok {
 		return l.lowerArrayLit(e, arr)
@@ -4643,8 +4756,11 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
 		}
-		if typ, ok := syncTypeName(l.pkg.Info.TypeOf(fun.X)); ok {
-			return l.lowerSyncMethod(e, fun, typ)
+		if name, ok := l.pkgFunc(fun, "sync"); ok {
+			return l.lowerSyncFunc(e, name)
+		}
+		if key, ok := refTypeKey(l.pkg.Info.TypeOf(fun.X)); ok {
+			return l.lowerRefMethod(e, fun, key)
 		}
 		if sel, ok := l.pkg.Info.Selections[fun]; ok {
 			switch sel.Kind() {
