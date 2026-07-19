@@ -117,6 +117,61 @@ func TestErrorWrapValues(t *testing.T) {
 	}
 }
 
+// TestErrorAsValues checks errors.As against go run. It matches a concrete error
+// straight and down a %w chain, binding the target, and it reports a miss while
+// leaving the target alone. The if condition, the boolean binding, and two calls
+// in one function all reach the same spill. Targets are locals since the compiled
+// tier does not yet emit package level vars.
+func TestErrorAsValues(t *testing.T) {
+	t.Parallel()
+	const myErr = "package main\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n)\n\ntype MyErr struct {\n\tCode int\n}\n\nfunc (e *MyErr) Error() string {\n\treturn \"myerr\"\n}\n\n"
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{
+			"a direct match binds the target as an if condition",
+			myErr + "func main() {\n\tvar err error = &MyErr{Code: 7}\n\tvar target *MyErr\n\tif errors.As(err, &target) {\n\t\tfmt.Println(\"matched\", target.Code)\n\t}\n}\n",
+		},
+		{
+			"a match down a wrap chain binds the wrapped error",
+			myErr + "func main() {\n\tbase := &MyErr{Code: 9}\n\twrapped := fmt.Errorf(\"wrap: %w\", base)\n\tvar target *MyErr\n\tif errors.As(wrapped, &target) {\n\t\tfmt.Println(\"found\", target.Code)\n\t}\n}\n",
+		},
+		{
+			"a miss leaves the target and binds the ok flag",
+			myErr + "type Other struct{}\n\nfunc (e *Other) Error() string {\n\treturn \"other\"\n}\n\nfunc main() {\n\tvar err error = &Other{}\n\tvar target *MyErr\n\tok := errors.As(err, &target)\n\tif !ok {\n\t\tfmt.Println(\"no match\")\n\t}\n}\n",
+		},
+		{
+			"two calls in one function keep their own temporaries",
+			myErr + "func main() {\n\tvar e1 error = &MyErr{Code: 1}\n\tvar e2 error = &MyErr{Code: 2}\n\tvar t1, t2 *MyErr\n\tif errors.As(e1, &t1) {\n\t\tfmt.Println(t1.Code)\n\t}\n\tif errors.As(e2, &t2) {\n\t\tfmt.Println(t2.Code)\n\t}\n}\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestErrorAsEmit pins the shape of the errors.As spill: the comma-ok read binds
+// a value temporary and the ok flag from the errors_as intrinsic, and the target
+// is written under the ok so a miss leaves it alone.
+func TestErrorAsEmit(t *testing.T) {
+	t.Parallel()
+	const src = "package main\n\nimport \"errors\"\n\ntype MyErr struct{}\n\nfunc (e *MyErr) Error() string { return \"m\" }\n\nfunc main() {\n\tvar err error = &MyErr{}\n\tvar target *MyErr\n\tif errors.As(err, &target) {\n\t\t_ = target\n\t}\n}\n"
+	got := emitOf(t, src)
+	for _, want := range []string{
+		"_as, _ok = _hebirt.errors_as(err, MyErr)",
+		"if _ok:",
+		"target = _as",
+	} {
+		if !bytesContains(got, want) {
+			t.Errorf("emit missing %q\n%s", want, got)
+		}
+	}
+}
+
 // TestErrorWrapEmit pins the shape of the wrapping surface: fmt.Errorf routes to
 // the errorf intrinsic with the format carried as bytes, and the errors functions
 // route to their own intrinsics over the plainly lowered operands.

@@ -149,6 +149,9 @@ type lowerer struct {
 	// switchSeq numbers the tag temporary an expression switch spills to, so a
 	// nested switch does not reuse an outer switch's tag name.
 	switchSeq int
+	// errorsAsSeq numbers the value and ok temporaries an errors.As call spills to,
+	// so two calls in one function do not reuse a name.
+	errorsAsSeq int
 	// scopes is the stack of enclosing loops and switches, innermost last, which
 	// tells a break whether it leaves a loop or a switch and lets a labeled break
 	// find the loop it names.
@@ -1338,6 +1341,12 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		if panicCall := l.asPanicCall(s.X); panicCall != nil {
 			return l.lowerPanic(panicCall)
 		}
+		// A bare errors.As discards its ok but keeps its target side effect, so it
+		// spills to a temporary ok the same way the condition form does.
+		if call, ok := l.errorsAsCall(s.X); ok {
+			okName := seqName("_ok", l.errorsAsSeq)
+			return l.errorsAsPre(call, okName, true)
+		}
 		x, err := l.lowerExpr(s.X)
 		if err != nil {
 			return nil, err
@@ -1700,6 +1709,11 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	}
 	if len(s.Rhs) != 1 {
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
+	}
+	// ok := errors.As(err, &t) binds the ok flag and sets the target as a side
+	// effect, so it lowers to the spill rather than a plain value assignment.
+	if call, ok := l.errorsAsCall(s.Rhs[0]); ok {
+		return l.lowerErrorsAsBind(s, call)
 	}
 	value, err := l.lowerTyped(s.Rhs[0], l.pkg.Info.TypeOf(s.Lhs[0]))
 	if err != nil {
@@ -2247,12 +2261,24 @@ func (l *lowerer) lowerIf(s *ast.IfStmt) ([]ir.Stmt, error) {
 	if s.Init != nil {
 		return nil, l.errf(s.Pos(), "if with an init statement is not supported yet")
 	}
-	cond, err := l.lowerExpr(s.Cond)
-	if err != nil {
-		return nil, err
+	var cond ir.Expr
+	var pre []ir.Stmt
+	// errors.As is comma-ok with a side effect, so as the sole condition it spills
+	// the value and ok temporaries above the if and the condition reads the ok.
+	if call, ok := l.errorsAsCall(s.Cond); ok {
+		p, okExpr, err := l.lowerErrorsAsCond(call)
+		if err != nil {
+			return nil, err
+		}
+		pre, cond = p, okExpr
+	} else {
+		c, err := l.lowerExpr(s.Cond)
+		if err != nil {
+			return nil, err
+		}
+		// A closure in the condition hoists above the whole if, not into a branch.
+		cond, pre = c, l.flushPendingDefs()
 	}
-	// A closure in the condition hoists above the whole if, not into a branch.
-	pre := l.flushPendingDefs()
 	then, err := l.lowerBlock(s.Body)
 	if err != nil {
 		return nil, err
@@ -3985,9 +4011,129 @@ func (l *lowerer) lowerErrorsFunc(e *ast.CallExpr, name string) (ir.Expr, error)
 			return nil, l.errf(e.Pos(), "errors.Join with a spread argument is not supported yet")
 		}
 		return l.lowerErrorsCall(e, "errors_join")
+	case "As":
+		// errors.As assigns its target, so it is not an ordinary value expression
+		// and is handled where a statement can carry that side effect.
+		return nil, l.errf(e.Pos(), "errors.As is only supported as an if condition, a boolean binding, or a statement")
 	default:
 		return nil, l.errf(e.Pos(), "errors.%s is not supported yet", name)
 	}
+}
+
+// errorsAsCall reports whether an expression is a call to errors.As, and returns
+// the call, so the statement contexts that can carry its target side effect
+// recognize it before it reaches the value-expression path.
+func (l *lowerer) errorsAsCall(e ast.Expr) (*ast.CallExpr, bool) {
+	call, ok := astUnparen(e).(*ast.CallExpr)
+	if !ok {
+		return nil, false
+	}
+	sel, ok := astUnparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return nil, false
+	}
+	name, ok := l.pkgFunc(sel, "errors")
+	if !ok || name != "As" {
+		return nil, false
+	}
+	return call, true
+}
+
+// lowerErrorsAsCond lowers errors.As as the sole condition of an if or for, into
+// the spill statements that run before the loop or branch and the ok temporary
+// the condition then reads.
+func (l *lowerer) lowerErrorsAsCond(call *ast.CallExpr) ([]ir.Stmt, ir.Expr, error) {
+	okName := seqName("_ok", l.errorsAsSeq)
+	pre, err := l.errorsAsPre(call, okName, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pre, &ir.Ident{Name: okName}, nil
+}
+
+// lowerErrorsAsBind lowers ok := errors.As(err, &t) or ok = errors.As(err, &t),
+// binding the ok flag to the named target while the spill sets t on a match.
+func (l *lowerer) lowerErrorsAsBind(s *ast.AssignStmt, call *ast.CallExpr) ([]ir.Stmt, error) {
+	okName, ok := s.Lhs[0].(*ast.Ident)
+	if !ok {
+		return nil, l.errf(s.Lhs[0].Pos(), "the errors.As result binds a plain name")
+	}
+	// A discarded ok, _ = errors.As(...), still needs a readable flag for the
+	// guarded target write, so it spills to a temporary the way the bare form does.
+	if okName.Name == "_" {
+		return l.errorsAsPre(call, seqName("_ok", l.errorsAsSeq), true)
+	}
+	if l.isBoxedIdent(okName) {
+		return nil, l.errf(okName.Pos(), "binding errors.As to the address-taken variable %s is not supported yet", okName.Name)
+	}
+	return l.errorsAsPre(call, okName.Name, s.Tok == token.DEFINE)
+}
+
+// errorsAsPre builds the statements an errors.As call spills to: a comma-ok read
+// from the errors_as intrinsic that binds a value temporary and the ok flag, then
+// a guarded write of the value into the target so the target changes only on a
+// match, the way Go leaves it untouched when As returns false. The target must be
+// the address of a plain variable whose type is a pointer to a named struct, the
+// concrete error the runtime matches with isinstance, so an interface target or a
+// non-addressable second argument fails loudly.
+func (l *lowerer) errorsAsPre(call *ast.CallExpr, okName string, defineOk bool) ([]ir.Stmt, error) {
+	if call.Ellipsis != token.NoPos || len(call.Args) != 2 {
+		return nil, l.errf(call.Pos(), "errors.As takes an error and a pointer to a target")
+	}
+	addr, ok := astUnparen(call.Args[1]).(*ast.UnaryExpr)
+	if !ok || addr.Op != token.AND {
+		return nil, l.errf(call.Args[1].Pos(), "errors.As needs the address of a target variable")
+	}
+	tgt, ok := astUnparen(addr.X).(*ast.Ident)
+	if !ok {
+		return nil, l.errf(addr.X.Pos(), "errors.As needs the address of a target variable")
+	}
+	if l.isBoxedIdent(tgt) {
+		return nil, l.errf(tgt.Pos(), "errors.As into the address-taken variable %s is not supported yet", tgt.Name)
+	}
+	className, err := l.errorTargetClass(tgt)
+	if err != nil {
+		return nil, err
+	}
+	errExpr, err := l.lowerExpr(call.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	valName := seqName("_as", l.errorsAsSeq)
+	l.errorsAsSeq++
+	pre := l.flushPendingDefs()
+	pre = append(pre,
+		&ir.TupleAssign{
+			Names:  []string{valName, okName},
+			Value:  &ir.Intrinsic{Name: "errors_as", Args: []ir.Expr{errExpr, &ir.Ident{Name: className}}},
+			Define: defineOk,
+		},
+		&ir.IfStmt{
+			Cond: &ir.Ident{Name: okName},
+			Then: []ir.Stmt{&ir.AssignStmt{Name: tgt.Name, Value: &ir.Ident{Name: valName}}},
+		},
+	)
+	return pre, nil
+}
+
+// errorTargetClass returns the Python class name errors.As matches the chain
+// against, taken from an errors.As target that is a pointer to a named struct.
+// The compiled tier models a pointer to a struct as the struct instance itself,
+// so the class is the named struct's own class. An interface target or a pointer
+// to anything but a named struct waits on a later slice and fails loudly.
+func (l *lowerer) errorTargetClass(tgt *ast.Ident) (string, error) {
+	ptr, ok := l.pkg.Info.TypeOf(tgt).Underlying().(*types.Pointer)
+	if !ok {
+		return "", l.errf(tgt.Pos(), "errors.As target %s must be a pointer to a concrete error type", tgt.Name)
+	}
+	named, ok := ptr.Elem().(*types.Named)
+	if !ok {
+		return "", l.errf(tgt.Pos(), "errors.As target %s must point to a named type", tgt.Name)
+	}
+	if _, ok := named.Underlying().(*types.Struct); !ok {
+		return "", l.errf(tgt.Pos(), "errors.As target %s must point to a struct type", tgt.Name)
+	}
+	return named.Obj().Name(), nil
 }
 
 // lowerErrorsCall lowers an errors package call to its runtime intrinsic over the
