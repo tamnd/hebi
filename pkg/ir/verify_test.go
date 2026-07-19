@@ -802,6 +802,53 @@ func TestVerifyMethodBindingSurface(t *testing.T) {
 	}
 }
 
+func TestVerifyDeferSurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&DeferBlock{Body: []Stmt{
+					&DeferPush{Func: &ShimFunc{Name: "println"}, Args: []Expr{&StringLit{Value: "end"}}},
+					&DeferPush{Func: &Ident{Name: "cleanup"}},
+				}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed defer surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"defer push nil callable", func(m *Module) {
+			m.Funcs[0].Body[0].(*DeferBlock).Body[0].(*DeferPush).Func = nil
+		}, "nil expression"},
+		{"defer push nil argument", func(m *Module) {
+			m.Funcs[0].Body[0].(*DeferBlock).Body[0].(*DeferPush).Args = []Expr{nil}
+		}, "nil expression"},
+		{"runtime function empty name", func(m *Module) {
+			m.Funcs[0].Body[0].(*DeferBlock).Body[0].(*DeferPush).Func = &ShimFunc{Name: ""}
+		}, "runtime function with no name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {
