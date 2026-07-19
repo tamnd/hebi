@@ -36,6 +36,11 @@ var binOps = map[string]string{
 	"||": "or",
 	"<<": "<<",
 	">>": ">>",
+	// Identity for the interface-to-nil check: an interface value is None when it
+	// is the nil interface, so err == nil lowers to err is None and err != nil to
+	// err is not None, the faithful analogue of Go's nil interface identity test.
+	"is":     "is",
+	"is not": "is not",
 }
 
 // unaryOps maps the Go unary operator text to its Python spelling. Negation and
@@ -1182,6 +1187,8 @@ func emitExpr(e ir.Expr) (string, error) {
 		return shim.Name + ".NIL_MAP", nil
 	case *ir.NilPtr:
 		return shim.Name + ".NIL_PTR", nil
+	case *ir.NilInterface:
+		return "None", nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}
