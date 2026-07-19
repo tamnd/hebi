@@ -4836,6 +4836,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "strconv"); ok {
 			return l.lowerStrconvFunc(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "sort"); ok {
+			return l.lowerSortFunc(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
 		}
@@ -5384,6 +5387,47 @@ var stringsIntrinsics = map[string]string{
 	"Replace":      "str_replace",
 	"ReplaceAll":   "str_replace_all",
 	"EqualFold":    "str_equal_fold",
+}
+
+// sortIntrinsics maps a sort package function to the runtime shim that carries
+// its Go semantics. The typed sorts and searches work over the slice's element
+// order, and Slice and SliceStable sort in place by a less function the caller
+// supplies, which the shim calls on live indices. sort.Sort over a sort.Interface
+// waits for interface method dispatch and its own slice, and a function outside
+// this table fails loudly.
+var sortIntrinsics = map[string]string{
+	"Ints":              "sort_ints",
+	"Float64s":          "sort_float64s",
+	"Strings":           "sort_strings",
+	"IntsAreSorted":     "sort_ints_are_sorted",
+	"Float64sAreSorted": "sort_float64s_are_sorted",
+	"StringsAreSorted":  "sort_strings_are_sorted",
+	"SearchInts":        "sort_search_ints",
+	"SearchStrings":     "sort_search_strings",
+	"SearchFloat64s":    "sort_search_float64s",
+	"Search":            "sort_search",
+	"Slice":             "sort_slice",
+	"SliceStable":       "sort_slice_stable",
+	"SliceIsSorted":     "sort_slice_is_sorted",
+}
+
+// lowerSortFunc lowers a call to the standard sort package by mapping the
+// function to its runtime shim through sortIntrinsics. No mapped function takes
+// a spread argument, so one fails loudly, as does a function the table does not
+// carry.
+func (l *lowerer) lowerSortFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "sort.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := sortIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "sort.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
 }
 
 // strconvIntrinsics maps a strconv package function to the runtime shim that
