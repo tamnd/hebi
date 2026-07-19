@@ -414,9 +414,10 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if fd.Recv != nil {
 		return nil, l.errf(fd.Pos(), "methods are not supported yet")
 	}
-	if fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0 {
-		return nil, l.errf(fd.Pos(), "type parameters are not supported yet")
-	}
+	// A generic function erases on the compiled tier: the type parameters drop and
+	// the body lowers once, since Python dispatches on the runtime value and needs
+	// no per-instantiation copy. go/types has already checked every instantiation
+	// against its constraint during Load, so nothing here re-validates it.
 	params, err := l.lowerParams(fd.Type.Params)
 	if err != nil {
 		return nil, err
@@ -517,9 +518,13 @@ func (l *lowerer) receiverTypeName(t ast.Expr) (string, error) {
 	case *ast.Ident:
 		return rt.Name, nil
 	case *ast.StarExpr:
-		if id, ok := rt.X.(*ast.Ident); ok {
-			return id.Name, nil
-		}
+		return l.receiverTypeName(rt.X)
+	case *ast.IndexExpr:
+		// A generic receiver Box[T] names the generic type Box, whose type parameter
+		// erases, so the class is the base name.
+		return l.receiverTypeName(rt.X)
+	case *ast.IndexListExpr:
+		return l.receiverTypeName(rt.X)
 	}
 	return "", l.errf(t.Pos(), "receiver type %T is not supported yet", t)
 }
@@ -4015,11 +4020,48 @@ func (l *lowerer) lowerBasicLit(e *ast.BasicLit) (ir.Expr, error) {
 	}
 }
 
+// stripTypeArgs erases an explicit generic instantiation's type arguments from a
+// call target, since the compiled tier drops type parameters: Max[int] lowers to a
+// call to Max. It strips only when the index actually instantiates a generic, so an
+// ordinary index into a function-valued slice or map, f[i](x), keeps its index.
+func (l *lowerer) stripTypeArgs(fun ast.Expr) ast.Expr {
+	switch idx := fun.(type) {
+	case *ast.IndexExpr:
+		if l.isGenericInstance(idx.X) {
+			return idx.X
+		}
+	case *ast.IndexListExpr:
+		if l.isGenericInstance(idx.X) {
+			return idx.X
+		}
+	}
+	return fun
+}
+
+// isGenericInstance reports whether an expression that indexes a generic names one,
+// so Max[int] is recognized but a[i] is not. go/types records every generic use in
+// Info.Instances keyed by the identifier that names the generic, the bare ident for
+// a package-level generic or the selected name for a method.
+func (l *lowerer) isGenericInstance(x ast.Expr) bool {
+	var id *ast.Ident
+	switch v := astUnparen(x).(type) {
+	case *ast.Ident:
+		id = v
+	case *ast.SelectorExpr:
+		id = v.Sel
+	}
+	if id == nil {
+		return false
+	}
+	_, ok := l.pkg.Info.Instances[id]
+	return ok
+}
+
 func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 	if l.isConversion(e) {
 		return l.lowerConversion(e)
 	}
-	switch fun := astUnparen(e.Fun).(type) {
+	switch fun := l.stripTypeArgs(astUnparen(e.Fun)).(type) {
 	case *ast.FuncLit:
 		// An immediately invoked function literal has no name to bind, and a def
 		// cannot be an expression, so it hoists to a def that the call then names.
