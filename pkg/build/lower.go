@@ -1487,6 +1487,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerReturn(s)
 	case *ast.DeferStmt:
 		return l.lowerDefer(s)
+	case *ast.GoStmt:
+		return l.lowerGo(s)
 	default:
 		return nil, l.errf(s.Pos(), "statement %T is not supported yet", s)
 	}
@@ -1502,11 +1504,28 @@ func (l *lowerer) lowerDefer(s *ast.DeferStmt) ([]ir.Stmt, error) {
 	if s.Call.Ellipsis != token.NoPos {
 		return nil, l.errf(s.Pos(), "a deferred call with a spread argument is not supported yet")
 	}
-	fn, args, err := l.lowerDeferCallee(s.Call)
+	fn, args, err := l.lowerCallSnapshot(s.Call, "deferred call")
 	if err != nil {
 		return nil, err
 	}
 	return []ir.Stmt{&ir.DeferPush{Func: fn, Args: args}}, nil
+}
+
+// lowerGo lowers a go statement to a call into the runtime's go helper, which
+// runs the function on a new daemon thread. Like a defer, a go statement fixes
+// the function value and its arguments at the point the statement runs, so the
+// same snapshot logic serves both, and the helper receives the callable followed
+// by the already evaluated arguments. A spread argument waits on its own slice.
+func (l *lowerer) lowerGo(s *ast.GoStmt) ([]ir.Stmt, error) {
+	if s.Call.Ellipsis != token.NoPos {
+		return nil, l.errf(s.Pos(), "a goroutine call with a spread argument is not supported yet")
+	}
+	fn, args, err := l.lowerCallSnapshot(s.Call, "goroutine")
+	if err != nil {
+		return nil, err
+	}
+	spawn := &ir.Intrinsic{Name: "go", Args: append([]ir.Expr{fn}, args...)}
+	return []ir.Stmt{&ir.ExprStmt{X: spawn}}, nil
 }
 
 // asPanicCall returns the call expression when x is a call to the builtin panic,
@@ -1549,13 +1568,16 @@ func (l *lowerer) lowerPanic(call *ast.CallExpr) ([]ir.Stmt, error) {
 	return []ir.Stmt{&ir.Panic{Value: value}}, nil
 }
 
-// lowerDeferCallee splits a deferred call into the callable value and the
-// arguments the DeferPush records. A plain function is its name, a method value
-// binds and copies its receiver like any method value, an immediately deferred
-// function literal hoists to a nested def the push then names, and fmt.Println
-// becomes the shim's println function reference so the finally can call it later.
-// A deferred builtin or an otherwise shaped callee waits on its own slice.
-func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, error) {
+// lowerCallSnapshot splits a call whose function value and arguments are fixed at
+// the statement that names it, a defer or a go, into the callable value and the
+// evaluated arguments. A plain function is its name, a method value binds and
+// copies its receiver like any method value, an immediately named function
+// literal hoists to a nested def the caller then names, and fmt.Println becomes
+// the shim's println function reference so the statement can call it later. The
+// noun names the statement in a diagnostic, so a deferred call and a goroutine
+// each read naturally. A builtin or an otherwise shaped callee waits on its own
+// slice.
+func (l *lowerer) lowerCallSnapshot(call *ast.CallExpr, noun string) (ir.Expr, []ir.Expr, error) {
 	switch fun := astUnparen(call.Fun).(type) {
 	case *ast.FuncLit:
 		callee, err := l.lowerFuncLit(fun, true)
@@ -1586,10 +1608,10 @@ func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, erro
 			}
 			return callee, args, nil
 		}
-		return nil, nil, l.errf(call.Pos(), "a deferred call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
+		return nil, nil, l.errf(call.Pos(), "a %s to %s.%s is not supported yet", noun, exprName(fun.X), fun.Sel.Name)
 	case *ast.Ident:
 		if _, ok := l.pkg.Info.Uses[fun].(*types.Builtin); ok {
-			return nil, nil, l.errf(call.Pos(), "a deferred builtin call %s is not supported yet", fun.Name)
+			return nil, nil, l.errf(call.Pos(), "a %s of the builtin %s is not supported yet", noun, fun.Name)
 		}
 		args, err := l.lowerCallArgsTyped(call.Args, l.callParamTypes(call))
 		if err != nil {
@@ -1597,7 +1619,7 @@ func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, erro
 		}
 		return &ir.Ident{Name: fun.Name}, args, nil
 	default:
-		return nil, nil, l.errf(call.Pos(), "a deferred call target %T is not supported yet", call.Fun)
+		return nil, nil, l.errf(call.Pos(), "a %s target %T is not supported yet", noun, call.Fun)
 	}
 }
 
@@ -3324,6 +3346,13 @@ func (l *lowerer) goTypeName(t types.Type) string {
 func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 	selection, ok := l.pkg.Info.Selections[e]
 	if !ok {
+		// A package-qualified name that is not a field or method selection is a
+		// package member, and the only ones modeled so far are integer constants
+		// like time.Millisecond, which the type checker has already reduced to a
+		// value, so the value emits directly with no runtime lookup.
+		if lit, folded := l.constInt(e); folded {
+			return lit, nil
+		}
 		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
 	}
 	switch selection.Kind() {
@@ -3343,6 +3372,23 @@ func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 	default:
 		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
 	}
+}
+
+// constInt returns the integer literal for an expression the type checker
+// resolved to an integer constant, so a typed constant such as time.Millisecond
+// emits its exact value. It reports false for a non-integer or inexact constant,
+// leaving the caller to diagnose an unsupported form rather than emit a wrong
+// value.
+func (l *lowerer) constInt(e ast.Expr) (ir.Expr, bool) {
+	tv, ok := l.pkg.Info.Types[e]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+		return nil, false
+	}
+	n, exact := constant.Int64Val(tv.Value)
+	if !exact {
+		return nil, false
+	}
+	return &ir.IntLit{Text: strconv.FormatInt(n, 10)}, true
 }
 
 // lowerMethodValue lowers a method value recv.M to a bound method. A value receiver
@@ -4226,6 +4272,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "fmt"); ok && name == "Errorf" {
 			return l.lowerErrorf(e)
 		}
+		if name, ok := l.pkgFunc(fun, "time"); ok {
+			return l.lowerTimeFunc(e, name)
+		}
 		if sel, ok := l.pkg.Info.Selections[fun]; ok {
 			switch sel.Kind() {
 			case types.MethodVal:
@@ -4638,6 +4687,21 @@ func (l *lowerer) pkgFunc(sel *ast.SelectorExpr, path string) (string, bool) {
 		return "", false
 	}
 	return sel.Sel.Name, true
+}
+
+// lowerTimeFunc lowers a call to the standard time package. Sleep pauses the
+// current goroutine for its Duration argument, which the type checker has already
+// reduced to a nanosecond count, so it routes to the runtime's sleep intrinsic.
+// The rest of the time package waits on its own slice and fails loudly.
+func (l *lowerer) lowerTimeFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if name != "Sleep" {
+		return nil, l.errf(e.Pos(), "call to time.%s is not supported yet", name)
+	}
+	arg, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "_sleep", Args: []ir.Expr{arg}}, nil
 }
 
 // lowerErrorsFunc lowers a call to the standard errors package. New builds a
