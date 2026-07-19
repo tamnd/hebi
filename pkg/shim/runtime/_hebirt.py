@@ -7,6 +7,7 @@ a time as later milestones add language surface.
 """
 
 import decimal
+import math
 import os
 import struct
 import sys
@@ -124,6 +125,35 @@ def _i64(v):
     return v - 0x10000000000000000 if v >= 0x8000000000000000 else v
 
 
+# Integer division and remainder. Go truncates a quotient toward zero and gives a
+# remainder the sign of the dividend, where Python's // and % floor toward minus
+# infinity, so a signed operand routes through these helpers rather than the bare
+# operators. A zero divisor panics the Go way through _runtime_error so a recover
+# sees "integer divide by zero" instead of Python's ZeroDivisionError.
+
+
+def _idiv(a, b):
+    if b == 0:
+        raise _runtime_error("integer divide by zero")
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
+
+def _imod(a, b):
+    if b == 0:
+        raise _runtime_error("integer divide by zero")
+    return a - _idiv(a, b) * b
+
+
+def _quo(a, b):
+    """Division for an erased type parameter whose constraint mixes integer and
+    float: integer operands truncate the Go way and any float operand divides by
+    IEEE rules, the choice the single erased definition cannot make statically."""
+    if isinstance(a, int) and isinstance(b, int):
+        return _idiv(a, b)
+    return _fdiv(a, b)
+
+
 # Float helpers. Go float64 is Python's float, so float64 arithmetic is native,
 # but Go float32 is single precision and Python has no 32-bit float, so a
 # float32 result is round-tripped back through a 4-byte IEEE single after every
@@ -135,6 +165,16 @@ def _i64(v):
 def _f32(v):
     """Round a value to IEEE single precision, matching Go's float32."""
     return struct.unpack("f", struct.pack("f", v))[0]
+
+
+def _fdiv(a, b):
+    """Go float division, which never raises: a zero divisor yields signed infinity,
+    or NaN when the dividend is also zero or NaN, where Python would raise instead."""
+    if b == 0.0:
+        if a == 0.0 or a != a:
+            return float("nan")
+        return math.copysign(float("inf"), a) * math.copysign(1.0, b)
+    return a / b
 
 
 def _gofloat(v):
