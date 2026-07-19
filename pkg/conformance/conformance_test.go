@@ -17,8 +17,10 @@ import (
 // recover, and the errors package, and the M4 band 0851 onward, the interface and
 // generics world, interface values and method dispatch, embedding promotion, type
 // assertions and type switches, the typed-nil trap, the empty interface, generics
-// erasure, and constraint-directed division and remainder. It skips where the go
-// tool or python3 is not on the path.
+// erasure, and constraint-directed division and remainder. Each fixture runs
+// under the no-deadlock smoke bound, so a compiled program that never finishes
+// fails as a deadlock in a minute rather than hanging the suite. It skips where
+// the go tool or python3 is not on the path.
 func TestFixtures(t *testing.T) {
 	t.Parallel()
 	requireTools(t)
@@ -37,7 +39,7 @@ func TestFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := Differential(t.Context(), string(source)); err != nil {
+			if err := DifferentialSmoke(t.Context(), string(source), SmokeTimeout); err != nil {
 				t.Errorf("%s: %v", name, err)
 			}
 		})
