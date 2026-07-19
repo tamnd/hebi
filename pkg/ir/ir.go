@@ -34,6 +34,25 @@ type StructDef struct {
 	// not comparable, so the emitter leaves such a struct with Python's identity
 	// equality instead.
 	Comparable bool
+	// Methods are the type's methods in source order, emitted onto the class after
+	// the generated constructor, copy, and equality methods. A Go method with a
+	// value receiver operates on a copy, which the caller passes at the call site;
+	// a pointer receiver operates on the instance, so both receiver kinds lower to
+	// the same instance method here and the copy obligation lives at the call.
+	Methods []*Method
+}
+
+// Method is one method of a struct, lowered to an instance method on the class.
+// The Go receiver becomes self, whatever the source named it, so Params holds
+// only the ordinary parameters after the receiver and the emitter prepends self.
+type Method struct {
+	// Name is the method name, which becomes the Python method name.
+	Name string
+	// Params are the ordinary parameter names in declaration order, after the
+	// receiver.
+	Params []string
+	// Body is the ordered list of statements.
+	Body []Stmt
 }
 
 // CtorParamName returns the constructor parameter name for a field of this
@@ -340,6 +359,16 @@ type CallExpr struct {
 	Args []Expr
 }
 
+// MethodCall is a call to a method on a receiver expression, recv.Name(args). The
+// receiver is the struct instance the method binds to; a value-receiver call
+// wraps the receiver in a Clone at the lowering so the method's mutations do not
+// escape, and a pointer-receiver call passes the instance directly.
+type MethodCall struct {
+	Recv Expr
+	Name string
+	Args []Expr
+}
+
 // FieldAccess reads a field of a struct value, obj.Name. The read alone does not
 // copy; the copy at a value read is a separate Clone the lowering wraps around
 // this node where Go's value semantics demand an independent value.
@@ -546,6 +575,7 @@ func (*Mask) isExpr()        {}
 func (*Convert) isExpr()     {}
 func (*IndexExpr) isExpr()   {}
 func (*CallExpr) isExpr()    {}
+func (*MethodCall) isExpr()  {}
 func (*Intrinsic) isExpr()   {}
 func (*AddrField) isExpr()   {}
 func (*AddrIndex) isExpr()   {}

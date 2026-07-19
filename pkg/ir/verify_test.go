@@ -685,6 +685,71 @@ func TestVerifyForRange(t *testing.T) {
 	}
 }
 
+// TestVerifyMethodSurface accepts a struct that carries a well-formed method
+// together with a call through the MethodCall carrier, and rejects a nil method,
+// a method with no name, a duplicate method name, a method parameter with no
+// name, and a MethodCall with no name.
+func TestVerifyMethodSurface(t *testing.T) {
+	t.Parallel()
+	build := func() *Module {
+		return &Module{
+			Package: "main",
+			Structs: []*StructDef{{
+				Name: "Point",
+				Methods: []*Method{{
+					Name:   "Sum",
+					Params: []string{"f"},
+					Body:   []Stmt{&ReturnStmt{Value: &FieldAccess{X: &Ident{Name: "self"}, Name: "X"}}},
+				}},
+			}},
+			Funcs: []*Func{{Name: "main", Body: []Stmt{
+				&ExprStmt{X: &MethodCall{Recv: &Ident{Name: "p"}, Name: "Sum", Args: []Expr{&IntLit{Text: "1"}}}},
+			}}},
+		}
+	}
+	if err := Verify(build()); err != nil {
+		t.Fatalf("Verify rejected a well-formed method surface: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Module)
+		wantSub string
+	}{
+		{"nil method", func(m *Module) {
+			m.Structs[0].Methods[0] = nil
+		}, "method 0 is nil"},
+		{"method empty name", func(m *Module) {
+			m.Structs[0].Methods[0].Name = ""
+		}, "method 0 has no name"},
+		{"duplicate method name", func(m *Module) {
+			m.Structs[0].Methods = append(m.Structs[0].Methods, &Method{Name: "Sum"})
+		}, "method Sum is defined more than once"},
+		{"method param empty name", func(m *Module) {
+			m.Structs[0].Methods[0].Params[0] = ""
+		}, "parameter 0 has no name"},
+		{"method call empty name", func(m *Module) {
+			m.Funcs[0].Body[0].(*ExprStmt).X.(*MethodCall).Name = ""
+		}, "calls a method with no name"},
+		{"method call nil receiver", func(m *Module) {
+			m.Funcs[0].Body[0].(*ExprStmt).X.(*MethodCall).Recv = nil
+		}, "nil expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := build()
+			tt.mutate(m)
+			err := Verify(m)
+			if err == nil {
+				t.Fatal("Verify accepted a malformed module")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
 // TestVerifyDeterministic checks the reported error does not depend on run
 // order: the same malformed tree gives the same message every time.
 func TestVerifyDeterministic(t *testing.T) {
