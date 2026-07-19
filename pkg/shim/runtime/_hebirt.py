@@ -1188,6 +1188,273 @@ def str_equal_fold(s, t):
     return s.decode("utf-8", "replace").casefold() == t.decode("utf-8", "replace").casefold()
 
 
+# strconv error sentinels. Go's strconv.ErrSyntax and ErrRange are the base
+# errors a NumError wraps, and their Error text is what a parse failure prints.
+_STRCONV_ERR_SYNTAX = _StringError(b"invalid syntax")
+_STRCONV_ERR_RANGE = _StringError(b"value out of range")
+
+# _DIGIT_VALS maps a digit byte to its value, both cases for the letter digits,
+# so a base validator can reject a digit the base does not admit.
+_DIGIT_VALS = {}
+for _di, _dc in enumerate(b"0123456789abcdefghijklmnopqrstuvwxyz"):
+    _DIGIT_VALS[_dc] = _di
+    if _di >= 10:
+        _DIGIT_VALS[_dc - 32] = _di
+
+
+class _StrconvRange(Exception):
+    """Raised inside the integer parser when the value overflows its bit size,
+    so the caller can attach ErrRange rather than ErrSyntax."""
+
+
+class _NumError:
+    """The *strconv.NumError a parse function returns on a bad input.
+
+    Go wraps a failed parse in a *NumError whose Error reads strconv.<Func>:
+    parsing <quoted input>: <base error>, and whose Unwrap hands back the base
+    error so errors.Is against ErrSyntax or ErrRange matches. The fields are Go
+    strings, so they are bytes.
+    """
+
+    __slots__ = ("Func", "Num", "Err")
+
+    def __init__(self, fn, num, err):
+        self.Func = fn
+        self.Num = num
+        self.Err = err
+
+    def Error(self):
+        return b"strconv." + self.Func + b": parsing " + _go_quote(self.Num) + b": " + self.Err.Error()
+
+    def Unwrap(self):
+        return self.Err
+
+    def __str__(self):
+        return go_str(self.Error())
+
+
+def _int_bounds(bit_size, signed):
+    """The inclusive low and high bound for an integer of the given bit size, with
+    a zero bit size meaning the 64-bit word Go uses for int and uint."""
+    bits = 64 if bit_size == 0 else bit_size
+    if signed:
+        return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return 0, (1 << bits) - 1
+
+
+def _valid_digits(s, base):
+    """Whether every byte of s is a digit the base admits."""
+    for c in s:
+        v = _DIGIT_VALS.get(c)
+        if v is None or v >= base:
+            return False
+    return True
+
+
+def _parse_int_go(text, base, bit_size, signed):
+    """Parse an integer the way strconv.ParseInt and ParseUint do.
+
+    Raises ValueError on a syntax error and _StrconvRange on an out-of-range
+    value, so the caller can build the right NumError. A base of zero is inferred
+    from a 0x, 0o, 0b, or leading-zero prefix, and only the base-zero forms admit
+    the digit-separating underscore.
+    """
+    s = text
+    if len(s) == 0:
+        raise ValueError
+    neg = False
+    if s[:1] == b"+":
+        s = s[1:]
+    elif s[:1] == b"-":
+        if not signed:
+            raise ValueError
+        neg = True
+        s = s[1:]
+    if len(s) == 0:
+        raise ValueError
+    base0 = base == 0
+    if base0:
+        head = s[:2]
+        if head in (b"0x", b"0X"):
+            base, s = 16, s[2:]
+        elif head in (b"0o", b"0O"):
+            base, s = 8, s[2:]
+        elif head in (b"0b", b"0B"):
+            base, s = 2, s[2:]
+        elif s[:1] == b"0":
+            base = 8
+        else:
+            base = 10
+    if b"_" in s:
+        if not base0 or s[:1] == b"_" or s[-1:] == b"_" or b"__" in s:
+            raise ValueError
+        s = s.replace(b"_", b"")
+    if len(s) == 0 or not _valid_digits(s, base):
+        raise ValueError
+    val = int(s, base)
+    if neg:
+        val = -val
+    lo, hi = _int_bounds(bit_size, signed)
+    if val < lo or val > hi:
+        raise _StrconvRange
+    return val
+
+
+def _format_int(i, base):
+    """Render an integer in the given base with Go's lowercase digits."""
+    if base == 10:
+        return b"%d" % i
+    digs = b"0123456789abcdefghijklmnopqrstuvwxyz"
+    if i == 0:
+        return b"0"
+    neg = i < 0
+    n = -i if neg else i
+    out = bytearray()
+    while n > 0:
+        out.append(digs[n % base])
+        n //= base
+    if neg:
+        out.append(0x2D)
+    out.reverse()
+    return bytes(out)
+
+
+def strconv_atoi(s):
+    text = bytes(s)
+    try:
+        return _parse_int_go(text, 10, 0, True), None
+    except _StrconvRange:
+        return 0, _NumError(b"Atoi", text, _STRCONV_ERR_RANGE)
+    except ValueError:
+        return 0, _NumError(b"Atoi", text, _STRCONV_ERR_SYNTAX)
+
+
+def strconv_parse_int(s, base, bit_size):
+    text = bytes(s)
+    try:
+        return _parse_int_go(text, base, bit_size, True), None
+    except _StrconvRange:
+        return 0, _NumError(b"ParseInt", text, _STRCONV_ERR_RANGE)
+    except ValueError:
+        return 0, _NumError(b"ParseInt", text, _STRCONV_ERR_SYNTAX)
+
+
+def strconv_parse_uint(s, base, bit_size):
+    text = bytes(s)
+    try:
+        return _parse_int_go(text, base, bit_size, False), None
+    except _StrconvRange:
+        return 0, _NumError(b"ParseUint", text, _STRCONV_ERR_RANGE)
+    except ValueError:
+        return 0, _NumError(b"ParseUint", text, _STRCONV_ERR_SYNTAX)
+
+
+def strconv_itoa(i):
+    return b"%d" % i
+
+
+def strconv_format_int(i, base):
+    return _format_int(i, base)
+
+
+def strconv_format_uint(i, base):
+    return _format_int(i, base)
+
+
+def strconv_format_bool(b):
+    return b"true" if b else b"false"
+
+
+def strconv_parse_bool(s):
+    text = bytes(s)
+    if text in (b"1", b"t", b"T", b"TRUE", b"true", b"True"):
+        return True, None
+    if text in (b"0", b"f", b"F", b"FALSE", b"false", b"False"):
+        return False, None
+    return False, _NumError(b"ParseBool", text, _STRCONV_ERR_SYNTAX)
+
+
+def strconv_quote(s):
+    return _go_quote(bytes(s))
+
+
+def strconv_parse_float(s, bit_size):
+    text = bytes(s)
+    low = text.lower()
+    if low in (b"inf", b"+inf", b"infinity", b"+infinity"):
+        return float("inf"), None
+    if low in (b"-inf", b"-infinity"):
+        return float("-inf"), None
+    if low == b"nan":
+        return float("nan"), None
+    body = text
+    if b"_" in body:
+        # Go admits an underscore only between two digits, never leading, trailing,
+        # or doubled, and Python's float would accept a looser placement.
+        if body[:1] == b"_" or body[-1:] == b"_" or b"__" in body:
+            return 0.0, _NumError(b"ParseFloat", text, _STRCONV_ERR_SYNTAX)
+        body = body.replace(b"_", b"")
+    try:
+        value = float(body.decode("ascii"))
+    except (ValueError, UnicodeDecodeError):
+        return 0.0, _NumError(b"ParseFloat", text, _STRCONV_ERR_SYNTAX)
+    # Python parses a whitespace-padded number that Go rejects, so a value whose
+    # round trip does not match the trimmed input is treated as a syntax error.
+    if body.strip() != body:
+        return 0.0, _NumError(b"ParseFloat", text, _STRCONV_ERR_SYNTAX)
+    if value in (float("inf"), float("-inf")):
+        # A finite literal that overflows float64 is a range error, not syntax.
+        return value, _NumError(b"ParseFloat", text, _STRCONV_ERR_RANGE)
+    if bit_size == 32:
+        narrowed = _f32(value)
+        if narrowed in (float("inf"), float("-inf")):
+            return narrowed, _NumError(b"ParseFloat", text, _STRCONV_ERR_RANGE)
+        return narrowed, None
+    return value, None
+
+
+def strconv_format_float(f, verb, prec, bit_size):
+    if bit_size == 32:
+        f = _f32(f)
+    kind = chr(verb)
+    if f != f:
+        return b"NaN"
+    if f in (float("inf"), float("-inf")):
+        return b"+Inf" if f > 0 else b"-Inf"
+    if prec < 0:
+        if kind in ("g", "G"):
+            shortest = _gofloat32(f) if bit_size == 32 else _gofloat(f)
+            return shortest.upper() if kind == "G" else shortest
+        text = repr(f)
+        prec = 0
+        if "." in text:
+            prec = len(text.split(".", 1)[1].rstrip("0").split("e")[0])
+    if kind == "f":
+        return ("%.*f" % (prec, f)).encode("ascii")
+    if kind in ("e", "E"):
+        return _format_float_exp(f, prec, kind).encode("ascii")
+    if kind in ("g", "G"):
+        body = "%.*g" % (prec if prec > 0 else 1, f)
+        if "e" in body or "E" in body:
+            mant, _, exp = body.replace("E", "e").partition("e")
+            body = mant + "e" + _go_exp_sign(int(exp))
+        return body.upper().encode("ascii") if kind == "G" else body.encode("ascii")
+    return ("%g" % f).encode("ascii")
+
+
+def _go_exp_sign(exp):
+    """Render an exponent with Go's sign and at-least-two digits, +07 or -12."""
+    return ("+" if exp >= 0 else "-") + "%02d" % abs(exp)
+
+
+def _format_float_exp(f, prec, kind):
+    """Render f in exponent notation with Go's two-digit-minimum signed exponent."""
+    body = "%.*e" % (prec, f)
+    mant, _, exp = body.partition("e")
+    out = mant + kind.lower() + _go_exp_sign(int(exp))
+    return out.upper() if kind == "E" else out
+
+
 def errors_unwrap(err):
     """errors.Unwrap: one level through an Unwrap() error, None for anything else.
 
