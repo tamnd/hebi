@@ -444,7 +444,7 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if fd.Body == nil {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
 	}
-	if err := l.beginDefer(fd); err != nil {
+	if err := l.beginDefer(fd.Body, fd.Type.Results, fd.Pos()); err != nil {
 		return nil, err
 	}
 	defer func() { l.deferReshape = false; l.deferResults = nil }()
@@ -458,7 +458,7 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 		return nil, err
 	}
 	body = resolveLabeledJumps(body)
-	body, err = l.wrapDefers(fd, body)
+	body, err = l.wrapDefers(body, fd.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -502,7 +502,7 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 		return nil, nil, err
 	}
 	defer func() { l.resultNames = nil; l.resultTypes = nil }()
-	if err := l.beginDefer(fd); err != nil {
+	if err := l.beginDefer(fd.Body, fd.Type.Results, fd.Pos()); err != nil {
 		return nil, nil, err
 	}
 	defer func() { l.deferReshape = false; l.deferResults = nil }()
@@ -516,7 +516,7 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 		return nil, nil, err
 	}
 	body = resolveLabeledJumps(body)
-	body, err = l.wrapDefers(fd, body)
+	body, err = l.wrapDefers(body, fd.Body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -745,13 +745,22 @@ func (l *lowerer) lowerFuncLitDef(e *ast.FuncLit, params []string, captures []ir
 		restore()
 		return nil, err
 	}
+	if err := l.beginDefer(e.Body, e.Type.Results, e.Pos()); err != nil {
+		restore()
+		return nil, err
+	}
 	body, err := l.lowerBlock(e.Body)
+	if err != nil {
+		restore()
+		return nil, err
+	}
+	body = resolveLabeledJumps(body)
+	body, err = l.wrapDefers(body, e.Body)
 	restore()
 	if err != nil {
 		return nil, err
 	}
 	body = append(prelude, body...)
-	body = resolveLabeledJumps(body)
 	name := seqName("_func", l.funcSeq)
 	l.funcSeq++
 	l.pendingDefs = append(l.pendingDefs, &ir.FuncDef{
@@ -1128,8 +1137,8 @@ func (l *lowerer) resultObjects(fields *ast.FieldList) map[types.Object]bool {
 // one with named results or a deferred recover, carries its result names on the
 // block, so the block's emitter can drain the defers and return the results after
 // an unrecovered panic unwinds through them.
-func (l *lowerer) wrapDefers(fd *ast.FuncDecl, body []ir.Stmt) ([]ir.Stmt, error) {
-	if !bodyHasDefer(fd.Body) {
+func (l *lowerer) wrapDefers(body []ir.Stmt, src *ast.BlockStmt) ([]ir.Stmt, error) {
+	if !bodyHasDefer(src) {
 		return body, nil
 	}
 	return []ir.Stmt{&ir.DeferBlock{Body: body, Reshape: l.deferReshape, Results: l.deferResults}}, nil
@@ -1144,10 +1153,10 @@ func (l *lowerer) wrapDefers(fd *ast.FuncDecl, body []ir.Stmt) ([]ir.Stmt, error
 // function with unnamed non-void results has no result variable to return after
 // the unwind, so it is diagnosed rather than lowered to a body that would drop the
 // recovered result.
-func (l *lowerer) beginDefer(fd *ast.FuncDecl) error {
+func (l *lowerer) beginDefer(body *ast.BlockStmt, results *ast.FieldList, pos token.Pos) error {
 	l.deferReshape = false
 	l.deferResults = nil
-	if !bodyHasDefer(fd.Body) {
+	if !bodyHasDefer(body) {
 		return nil
 	}
 	if len(l.resultNames) > 0 {
@@ -1155,9 +1164,9 @@ func (l *lowerer) beginDefer(fd *ast.FuncDecl) error {
 		l.deferResults = append([]string(nil), l.resultNames...)
 		return nil
 	}
-	if l.deferHasRecover(fd) {
-		if !resultsAreVoid(fd.Type.Results) {
-			return l.errf(fd.Pos(), "a deferred recover in a function with unnamed results is not supported yet")
+	if l.deferHasRecover(body) {
+		if !resultsAreVoid(results) {
+			return l.errf(pos, "a deferred recover in a function with unnamed results is not supported yet")
 		}
 		l.deferReshape = true
 	}
@@ -1174,9 +1183,9 @@ func resultsAreVoid(fields *ast.FieldList) bool {
 // the builtin recover, directly or inside the deferred function literal's body. A
 // recover in a nested non-deferred closure belongs to that closure's frame, so the
 // walk does not descend into one.
-func (l *lowerer) deferHasRecover(fd *ast.FuncDecl) bool {
+func (l *lowerer) deferHasRecover(body *ast.BlockStmt) bool {
 	found := false
-	ast.Inspect(fd.Body, func(n ast.Node) bool {
+	ast.Inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -1864,6 +1873,33 @@ func (l *lowerer) lowerRefMethod(e *ast.CallExpr, sel *ast.SelectorExpr, key str
 	return &ir.Intrinsic{Name: fn, Args: args}, nil
 }
 
+// lowerRefMethodSnapshot splits a deferred or go call to a reference-type method
+// into the runtime free function and its evaluated arguments, the receiver first,
+// so the statement can fire the call later. It mirrors lowerRefMethod, which
+// builds the same call in place, but hands the callable and the arguments back
+// separately the way a snapshot needs. Go fixes the receiver and the arguments
+// when the defer or go runs, and a reference value is a shared object, so naming
+// it is the snapshot.
+func (l *lowerer) lowerRefMethodSnapshot(e *ast.CallExpr, sel *ast.SelectorExpr, key string) (ir.Expr, []ir.Expr, error) {
+	fn, ok := refTypes[key].methods[sel.Sel.Name]
+	if !ok {
+		return nil, nil, l.errf(e.Pos(), "%s.%s is not supported yet", key, sel.Sel.Name)
+	}
+	recv, err := l.lowerExpr(sel.X)
+	if err != nil {
+		return nil, nil, err
+	}
+	args := []ir.Expr{recv}
+	for _, a := range e.Args {
+		arg, err := l.lowerExpr(a)
+		if err != nil {
+			return nil, nil, err
+		}
+		args = append(args, arg)
+	}
+	return &ir.ShimFunc{Name: fn}, args, nil
+}
+
 // lowerSyncFunc lowers a call to a function in the sync package. NewCond builds a
 // Cond over a Locker, in practice the address of a Mutex or RWMutex, and since a
 // sync value is already a shared reference object the address-of names that same
@@ -1978,6 +2014,9 @@ func (l *lowerer) lowerCallSnapshot(call *ast.CallExpr, noun string) (ir.Expr, [
 				return nil, nil, err
 			}
 			return &ir.ShimFunc{Name: "println"}, args, nil
+		}
+		if key, ok := refTypeKey(l.pkg.Info.TypeOf(fun.X)); ok {
+			return l.lowerRefMethodSnapshot(call, fun, key)
 		}
 		if sel, ok := l.pkg.Info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
 			callee, err := l.lowerMethodValue(fun, sel)

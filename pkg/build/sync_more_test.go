@@ -276,3 +276,66 @@ func main() {
 		}
 	}
 }
+
+// TestDeferInGoroutine checks that a defer inside a goroutine closure works, the
+// case a plain function's defer already covers but a goroutine's did not: the
+// closure body must open its own defer frame so the deferred call has a stack to
+// push onto. The canonical shutdown idiom, defer wg.Done, joins a batch of
+// goroutines to a deterministic total, and a deferred Unlock releases the lock the
+// goroutine took, so a missing frame would crash the goroutine with an undefined
+// defer stack rather than reach the count.
+func TestDeferInGoroutine(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	total := 0
+	for i := 1; i <= 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			mu.Lock()
+			defer mu.Unlock()
+			total += n
+		}(i)
+	}
+	wg.Wait()
+	fmt.Println(total)
+}
+`
+	assertProgramMatchesGo(t, src)
+}
+
+// TestDeferredRecoverInGoroutine checks that a deferred recover inside a goroutine
+// reshapes the closure's body the same way it reshapes a named function's, so a
+// panic raised in the goroutine is caught by its own deferred recover and the
+// recovered value is handed back out a channel rather than crashing the process.
+func TestDeferredRecoverInGoroutine(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+import "fmt"
+
+func main() {
+	done := make(chan string)
+	go func() {
+		defer func() {
+			r := recover()
+			if r != nil {
+				done <- "recovered " + r.(string)
+			}
+		}()
+		panic("boom")
+	}()
+	fmt.Println(<-done)
+}
+`
+	assertProgramMatchesGo(t, src)
+}
