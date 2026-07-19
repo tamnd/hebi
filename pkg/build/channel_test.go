@@ -152,3 +152,60 @@ func TestSendOnClosedChannelCrashes(t *testing.T) {
 	t.Parallel()
 	assertProgramCrashesLikeGo(t, "package main\n\nfunc main() {\n\tch := make(chan int, 1)\n\tclose(ch)\n\tch <- 1\n}\n")
 }
+
+// TestSignalChannelEmptyStruct checks a chan struct{} signal channel against go
+// run: a worker signals completion by sending the empty struct value, struct{}{},
+// which the empty struct lowers to the empty tuple so a send needs no allocation.
+// The zero value var s struct{} and a literal struct{}{} also compare equal, the
+// property an empty struct carries because it holds no fields.
+func TestSignalChannelEmptyStruct(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+import "fmt"
+
+func main() {
+	done := make(chan struct{})
+	go func() {
+		done <- struct{}{}
+	}()
+	<-done
+	var s struct{}
+	fmt.Println(s == struct{}{})
+	fmt.Println("done")
+}
+`
+	assertProgramMatchesGo(t, src)
+}
+
+// TestRangeOverChannelCallExpr checks a range over a channel produced by a call
+// against go run: the channel expression must be received from once, not
+// re-evaluated each iteration, so ranging over counter() drains the one channel
+// the call returns rather than spawning a fresh one and looping on its zero value.
+func TestRangeOverChannelCallExpr(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+import "fmt"
+
+func counter(n int) <-chan int {
+	out := make(chan int)
+	go func() {
+		for i := 1; i <= n; i++ {
+			out <- i
+		}
+		close(out)
+	}()
+	return out
+}
+
+func main() {
+	total := 0
+	for v := range counter(5) {
+		total += v
+	}
+	fmt.Println(total)
+}
+`
+	assertProgramMatchesGo(t, src)
+}

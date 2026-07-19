@@ -607,6 +607,13 @@ type NilPtr struct{}
 // nil uses identity rather than the sentinel equality a pointer or slice uses.
 type NilInterface struct{}
 
+// EmptyStruct is the value of an empty struct type, struct{}. An empty struct
+// carries no fields, so every value of it is equal and holds nothing, which lets
+// it lower to Python's empty tuple: immutable, hashable, and cheap to share. It
+// is the value make(chan struct{}) sends and struct{}{} constructs, so a signal
+// channel needs no per-send allocation.
+type EmptyStruct struct{}
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -721,3 +728,4 @@ func (*MapLit) isExpr()       {}
 func (*NilMap) isExpr()       {}
 func (*NilPtr) isExpr()       {}
 func (*NilInterface) isExpr() {}
+func (*EmptyStruct) isExpr()  {}

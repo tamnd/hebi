@@ -2104,7 +2104,14 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		// or var n atomic.Int64 each construct their own, never a shared one.
 		return l.refZero(key, pos)
 	}
-	if _, ok := t.Underlying().(*types.Struct); ok {
+	if st, ok := t.Underlying().(*types.Struct); ok {
+		if st.NumFields() == 0 {
+			// An empty struct carries no fields, so its zero value holds nothing and
+			// every value of it is equal. It lowers to the empty tuple regardless of
+			// whether the type is named or the anonymous struct{}, which is what a
+			// signal channel sends and what struct{}{} constructs.
+			return &ir.EmptyStruct{}, nil
+		}
 		named, ok := t.(*types.Named)
 		if !ok {
 			return nil, l.errf(pos, "zero value of an anonymous struct is not supported yet")
@@ -3648,11 +3655,24 @@ func (l *lowerer) lowerRangeChan(s *ast.RangeStmt, label string) ([]ir.Stmt, err
 	if valName == "" {
 		valName = "_"
 	}
-	okName := seqName("_ok", l.rangeSeq)
+	seq := l.rangeSeq
 	l.rangeSeq++
+	okName := seqName("_ok", seq)
 	body, err := l.lowerLoopBlock(s.Body, label)
 	if err != nil {
 		return nil, err
+	}
+	// Go evaluates the range expression once, then ranges over that channel. The
+	// receive lives inside the loop, so a channel named by a call or any other
+	// non-trivial expression must be hoisted to a name assigned before the loop,
+	// or it would be re-evaluated every iteration, spawning a fresh channel each
+	// pass and looping forever. A bare identifier already names the one channel, so
+	// it is left in place to keep the loop readable.
+	var pre []ir.Stmt
+	if _, ok := src.(*ir.Ident); !ok {
+		chName := seqName("_recvchan", seq)
+		pre = []ir.Stmt{&ir.AssignStmt{Name: chName, Value: src, Define: true}}
+		src = &ir.Ident{Name: chName}
 	}
 	recv := &ir.TupleAssign{
 		Names: []string{valName, okName},
@@ -3663,7 +3683,7 @@ func (l *lowerer) lowerRangeChan(s *ast.RangeStmt, label string) ([]ir.Stmt, err
 		Then: []ir.Stmt{&ir.Break{}},
 	}
 	loop := &ir.ForStmt{Body: append([]ir.Stmt{recv, brk}, body...), Label: label}
-	return []ir.Stmt{loop}, nil
+	return append(pre, loop), nil
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
@@ -4026,6 +4046,12 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	}
 	if mp, ok := t.Underlying().(*types.Map); ok {
 		return l.lowerMapLit(e, mp)
+	}
+	if st, ok := t.Underlying().(*types.Struct); ok && st.NumFields() == 0 {
+		// An empty struct literal, struct{}{} or a named empty struct's Type{}, holds
+		// nothing, so it lowers to the empty tuple, the same value its zero takes. This
+		// keeps a zero and a literal of the same empty struct comparing equal.
+		return &ir.EmptyStruct{}, nil
 	}
 	named, ok := t.(*types.Named)
 	if !ok {
