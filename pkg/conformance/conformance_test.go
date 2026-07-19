@@ -39,7 +39,7 @@ func TestFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := DifferentialSmoke(t.Context(), string(source), SmokeTimeout); err != nil {
+			if err := corpusCache.differentialSmoke(t.Context(), string(source), SmokeTimeout); err != nil {
 				t.Errorf("%s: %v", name, err)
 			}
 		})

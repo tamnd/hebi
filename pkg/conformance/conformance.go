@@ -121,6 +121,14 @@ func Differential(ctx context.Context, source string) error {
 	if err != nil {
 		return fmt.Errorf("compiled tier: %w", err)
 	}
+	return compareObservations(oracle, compiled)
+}
+
+// compareObservations reports the first way the compiled tier disagrees with the
+// go oracle, or nil when they match. It is the check both the plain and the
+// cached differential run, so a cached observation is held to the same bar as a
+// freshly run one.
+func compareObservations(oracle, compiled Observation) error {
 	if compiled.Stdout != oracle.Stdout {
 		return fmt.Errorf("stdout mismatch:\n  go run:   %q\n  compiled: %q", oracle.Stdout, compiled.Stdout)
 	}
