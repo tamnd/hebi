@@ -242,6 +242,10 @@ func stdBoxClass(t types.Type) string {
 	switch obj.Pkg().Path() + "." + obj.Name() {
 	case "time.Duration":
 		return "Duration"
+	case "time.Month":
+		return "Month"
+	case "time.Weekday":
+		return "Weekday"
 	}
 	return ""
 }
@@ -2262,6 +2266,15 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 			}
 			return nil, l.errf(pos, "zero value of an anonymous struct is not supported yet")
 		}
+		if named.Obj().Pkg() != l.pkg.Types {
+			// A struct from another package has no class the emitter generated, so its
+			// zero value comes from the shim that models it. time.Time's zero is the
+			// instant January 1, year 1, 00:00:00 UTC, the value IsZero reports true for.
+			if named.Obj().Pkg().Path()+"."+named.Obj().Name() == "time.Time" {
+				return &ir.Intrinsic{Name: "time_zero"}, nil
+			}
+			return nil, l.errf(pos, "zero value of %s is not supported yet", named)
+		}
 		return &ir.StructLit{Type: named.Obj().Name()}, nil
 	}
 	if arr, ok := t.Underlying().(*types.Array); ok {
@@ -4042,6 +4055,9 @@ func (l *lowerer) lowerSelector(e *ast.SelectorExpr) (ir.Expr, error) {
 		if lit, folded := l.constMember(e); folded {
 			return lit, nil
 		}
+		if ref, ok := l.pkgVar(e); ok {
+			return ref, nil
+		}
 		return nil, l.errf(e.Pos(), "selector %s is not supported yet", e.Sel.Name)
 	}
 	switch selection.Kind() {
@@ -4091,6 +4107,23 @@ func (l *lowerer) constMember(e ast.Expr) (ir.Expr, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// pkgVar returns the runtime reference for a package-level variable a program
+// reads, the ones a constant fold cannot cover. time.UTC is the fixed UTC Location
+// the shim carries as a singleton, so a program that passes it to time.Date reads
+// the same zone Go does. time.Local reads the host zone and is not reproducible, so
+// it waits on the quarantine slice, and any other package variable fails loudly.
+func (l *lowerer) pkgVar(e *ast.SelectorExpr) (ir.Expr, bool) {
+	obj, ok := l.pkg.Info.Uses[e.Sel].(*types.Var)
+	if !ok || obj.Pkg() == nil {
+		return nil, false
+	}
+	switch obj.Pkg().Path() + "." + obj.Name() {
+	case "time.UTC":
+		return &ir.ShimFunc{Name: "time_utc"}, true
+	}
+	return nil, false
 }
 
 // foldNamedConst folds a compile-time constant whose static type is a boxed named
@@ -5581,19 +5614,45 @@ func (l *lowerer) pkgFunc(sel *ast.SelectorExpr, path string) (string, bool) {
 	return sel.Sel.Name, true
 }
 
+// timeFuncs maps a time package function to the runtime shim that builds its value.
+// Date reads wall-clock components in a Location and FixedZone builds a
+// fixed-offset Location, both deterministic and so on the golden path. Now, Unix,
+// and the host's local zone read the wall clock or land a value in the local zone,
+// which is not reproducible against go run, so they wait on the quarantine slice.
+var timeFuncs = map[string]string{
+	"Date":      "time_date",
+	"FixedZone": "time_fixed_zone",
+}
+
 // lowerTimeFunc lowers a call to the standard time package. Sleep pauses the
 // current goroutine for its Duration argument, which the type checker has already
-// reduced to a nanosecond count, so it routes to the runtime's sleep intrinsic.
-// The rest of the time package waits on its own slice and fails loudly.
+// reduced to a nanosecond count, so it routes to the runtime's sleep intrinsic. The
+// constructors in timeFuncs route to the shim that builds the Time or Location. The
+// rest of the time package waits on its own slice and fails loudly.
 func (l *lowerer) lowerTimeFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
-	if name != "Sleep" {
+	if name == "Sleep" {
+		arg, err := l.lowerExpr(e.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &ir.Intrinsic{Name: "_sleep", Args: []ir.Expr{arg}}, nil
+	}
+	intrinsic, ok := timeFuncs[name]
+	if !ok {
 		return nil, l.errf(e.Pos(), "call to time.%s is not supported yet", name)
 	}
-	arg, err := l.lowerExpr(e.Args[0])
-	if err != nil {
-		return nil, err
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "time.%s with a spread argument is not supported yet", name)
 	}
-	return &ir.Intrinsic{Name: "_sleep", Args: []ir.Expr{arg}}, nil
+	args := make([]ir.Expr, len(e.Args))
+	for i, a := range e.Args {
+		arg, err := l.lowerExpr(a)
+		if err != nil {
+			return nil, err
+		}
+		args[i] = arg
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
 }
 
 // lowerErrorsFunc lowers a call to the standard errors package. New builds a

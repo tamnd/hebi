@@ -2528,6 +2528,511 @@ def _duration_string(d):
     return "-" + out if neg else out
 
 
+# Calendar math. A civil date maps to a day count since the Unix epoch and back
+# through Howard Hinnant's algorithms, which are the proleptic Gregorian calendar
+# Go's time package also computes, so a year, month, and day round-trip to the same
+# instant Go picks. The day count floors toward minus infinity so a date before
+# 1970 is negative, which is what the civil conversion expects.
+
+_MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+_WEEKDAY_NAMES = (
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+)
+
+# The Unix second of the zero Time, January 1, year 1, 00:00:00 UTC.
+_ZERO_TIME_SEC = -62135596800
+
+
+def _days_from_civil(y, m, d):
+    y -= 1 if m <= 2 else 0
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m - 3 if m > 2 else m + 9) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _civil_from_days(z):
+    z += 719468
+    era = (z if z >= 0 else z - 146096) // 146097
+    doe = z - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    d = doy - (153 * mp + 2) // 5 + 1
+    m = mp + 3 if mp < 10 else mp - 9
+    return (y + (1 if m <= 2 else 0), m, d)
+
+
+class Month(int):
+    """Go's time.Month, an int in 1..12 that prints as its English name."""
+
+    _hebi_type = "time.Month"
+
+    def String(self):
+        m = int(self)
+        if 1 <= m <= 12:
+            return _MONTH_NAMES[m - 1].encode("utf-8")
+        return ("%%!Month(%d)" % m).encode("utf-8")
+
+
+class Weekday(int):
+    """Go's time.Weekday, an int in 0..6 with Sunday at 0, printing as its name."""
+
+    _hebi_type = "time.Weekday"
+
+    def String(self):
+        w = int(self)
+        if 0 <= w <= 6:
+            return _WEEKDAY_NAMES[w].encode("utf-8")
+        return ("%%!Weekday(%d)" % w).encode("utf-8")
+
+
+class Location:
+    """Go's *time.Location, the zone a Time reads its wall clock through. Only a
+    fixed offset is modeled: UTC and the zones time.FixedZone builds, which is
+    enough for a deterministic Time. The host's local zone waits on its own slice
+    since it is not reproducible against go run."""
+
+    __slots__ = ("_name", "_offset")
+
+    def __init__(self, name, offset):
+        self._name = name
+        self._offset = offset
+
+    def String(self):
+        return self._name.encode("utf-8")
+
+
+time_utc = Location("UTC", 0)
+
+
+def time_fixed_zone(name, offset):
+    return Location(name.decode("utf-8", "replace") if isinstance(name, bytes) else name, int(offset))
+
+
+def _norm(hi, lo, base):
+    """Go's norm: carry lo into hi so lo lands in [0, base), which is how Date
+    folds an out-of-range component such as a 13th month or a 32nd day."""
+    if lo < 0:
+        n = (-lo - 1) // base + 1
+        hi -= n
+        lo += n * base
+    if lo >= base:
+        n = lo // base
+        hi += n
+        lo -= n * base
+    return hi, lo
+
+
+class Time:
+    """Go's time.Time, an instant carried as a Unix second, a nanosecond in
+    [0, 1e9), and the Location its wall clock reads through. Construction, the
+    accessors, the arithmetic, the ordering, and the default String are modeled;
+    Format and Parse wait on the next slice, and the monotonic clock reading a
+    wall time never carries is out of scope."""
+
+    __slots__ = ("_sec", "_nsec", "_loc")
+    _hebi_type = "time.Time"
+
+    def __init__(self, sec, nsec, loc):
+        self._sec = sec
+        self._nsec = nsec
+        self._loc = loc
+
+    def copy(self):
+        return Time(self._sec, self._nsec, self._loc)
+
+    def _local(self):
+        return self._sec + self._loc._offset
+
+    def _date(self):
+        local = self._local()
+        days = local // 86400
+        return _civil_from_days(days)
+
+    def _clock(self):
+        local = self._local()
+        rem = local - (local // 86400) * 86400
+        return (rem // 3600, (rem % 3600) // 60, rem % 60)
+
+    def Year(self):
+        return self._date()[0]
+
+    def Month(self):
+        return Month(self._date()[1])
+
+    def Day(self):
+        return self._date()[2]
+
+    def Hour(self):
+        return self._clock()[0]
+
+    def Minute(self):
+        return self._clock()[1]
+
+    def Second(self):
+        return self._clock()[2]
+
+    def Nanosecond(self):
+        return int(self._nsec)
+
+    def Weekday(self):
+        days = self._local() // 86400
+        return Weekday((days + 4) % 7)
+
+    def YearDay(self):
+        y, m, d = self._date()
+        return _days_from_civil(y, m, d) - _days_from_civil(y, 1, 1) + 1
+
+    def Date(self):
+        y, m, d = self._date()
+        return (y, Month(m), d)
+
+    def Clock(self):
+        return self._clock()
+
+    def Unix(self):
+        return _i64(self._sec)
+
+    def UnixNano(self):
+        return _i64(self._sec * 1000000000 + self._nsec)
+
+    def UnixMilli(self):
+        return _i64(self._sec * 1000 + _idiv(self._nsec, 1000000))
+
+    def UnixMicro(self):
+        return _i64(self._sec * 1000000 + _idiv(self._nsec, 1000))
+
+    def IsZero(self):
+        return self._sec == _ZERO_TIME_SEC and self._nsec == 0
+
+    def Add(self, d):
+        total = self._nsec + int(d)
+        sec = self._sec + total // 1000000000
+        nsec = total - (total // 1000000000) * 1000000000
+        return Time(sec, nsec, self._loc)
+
+    def Sub(self, u):
+        d = (self._sec - u._sec) * 1000000000 + (self._nsec - u._nsec)
+        return Duration(_i64(d))
+
+    def AddDate(self, years, months, days):
+        y, m, d = self._date()
+        h, mi, s = self._clock()
+        return time_date(y + years, m + months, d + days, h, mi, s, self._nsec, self._loc)
+
+    def Before(self, u):
+        return self._sec < u._sec or (self._sec == u._sec and self._nsec < u._nsec)
+
+    def After(self, u):
+        return u.Before(self)
+
+    def Equal(self, u):
+        return self._sec == u._sec and self._nsec == u._nsec
+
+    def UTC(self):
+        return Time(self._sec, self._nsec, time_utc)
+
+    def In(self, loc):
+        return Time(self._sec, self._nsec, loc)
+
+    def Location(self):
+        return self._loc
+
+    def String(self):
+        y, mo, d = self._date()
+        h, mi, s = self._clock()
+        out = "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, h, mi, s)
+        if self._nsec:
+            out += "." + ("%09d" % self._nsec).rstrip("0")
+        off = self._loc._offset
+        sign = "+" if off >= 0 else "-"
+        a = abs(off)
+        out += " %s%02d%02d" % (sign, a // 3600, (a % 3600) // 60)
+        if a % 60:
+            out += "%02d" % (a % 60)
+        out += " " + self._loc._name
+        return out.encode("utf-8")
+
+    def Format(self, layout):
+        """Go's time.Format: render the instant against a reference-time layout, the
+        one that spells out Mon Jan 2 15:04:05 MST 2006. The layout is scanned for
+        the pieces Go recognizes, each replaced by this Time's matching component, and
+        text in between is copied through."""
+        if isinstance(layout, (bytes, bytearray)):
+            layout = layout.decode("utf-8")
+        return _time_format(self, layout).encode("utf-8")
+
+
+def time_date(year, month, day, hour, minute, sec, nsec, loc):
+    """Go's time.Date: read the wall-clock components in loc, normalizing any that
+    fall out of range, and return the instant they name. The components carry into
+    one another the way Go's norm does, so a 13th month rolls into the next year and
+    a 32nd day into the next month, and the fixed-zone offset is removed to land on
+    the Unix second."""
+    sec, nsec = _norm(int(sec), int(nsec), 1000000000)
+    minute, sec = _norm(int(minute), sec, 60)
+    hour, minute = _norm(int(hour), minute, 60)
+    day, hour = _norm(int(day), hour, 24)
+    m = int(month) - 1
+    year, m = _norm(int(year), m, 12)
+    month = m + 1
+    days = _days_from_civil(year, month, 1) + (day - 1)
+    local = days * 86400 + hour * 3600 + minute * 60 + sec
+    return Time(local - loc._offset, nsec, loc)
+
+
+def time_zero():
+    """The zero Time, what `var t time.Time` names: January 1, year 1, 00:00:00 UTC.
+    Its IsZero is true and it prints as that instant, the same value Go's zero Time
+    holds."""
+    return Time(_ZERO_TIME_SEC, 0, time_utc)
+
+
+def _time_appendint(x, width):
+    """Go's appendInt: the decimal digits of x, zero-padded to at least width. A
+    negative x keeps its sign, and the pad counts the digits, not the sign."""
+    neg = x < 0
+    if neg:
+        x = -x
+    s = str(x)
+    if len(s) < width:
+        s = "0" * (width - len(s)) + s
+    if neg:
+        s = "-" + s
+    return s
+
+
+def _next_std_chunk(layout):
+    """Go's nextStdChunk: find the next reference-time piece in layout and split it
+    off. Returns (prefix, std, arg, suffix) where std is a short tag naming the piece,
+    arg carries the fractional-second digit count, and prefix and suffix are the text
+    on either side. std is the empty string when no piece is left."""
+    n = len(layout)
+    i = 0
+    while i < n:
+        c = layout[i]
+        if c == "J":  # January, Jan
+            if layout[i:i + 3] == "Jan":
+                if layout[i:i + 7] == "January":
+                    return layout[:i], "longmonth", 0, layout[i + 7:]
+                if not _starts_lower(layout[i + 3:]):
+                    return layout[:i], "month", 0, layout[i + 3:]
+        elif c == "M":  # Monday, Mon, MST
+            if layout[i:i + 3] == "Mon":
+                if layout[i:i + 6] == "Monday":
+                    return layout[:i], "longweekday", 0, layout[i + 6:]
+                if not _starts_lower(layout[i + 3:]):
+                    return layout[:i], "weekday", 0, layout[i + 3:]
+            if layout[i:i + 3] == "MST":
+                return layout[:i], "tz", 0, layout[i + 3:]
+        elif c == "0":  # 01, 02, 03, 04, 05, 06, 002
+            if i + 1 < n and "1" <= layout[i + 1] <= "6":
+                return layout[:i], _STD0X[layout[i + 1]], 0, layout[i + 2:]
+            if layout[i + 1:i + 3] == "02":
+                return layout[:i], "zeroyearday", 0, layout[i + 3:]
+        elif c == "1":  # 15, 1
+            if i + 1 < n and layout[i + 1] == "5":
+                return layout[:i], "hour", 0, layout[i + 2:]
+            return layout[:i], "nummonth", 0, layout[i + 1:]
+        elif c == "2":  # 2006, 2
+            if layout[i:i + 4] == "2006":
+                return layout[:i], "longyear", 0, layout[i + 4:]
+            return layout[:i], "day", 0, layout[i + 1:]
+        elif c == "_":  # _2, _2006, __2
+            if i + 1 < n and layout[i + 1] == "2":
+                if layout[i + 1:i + 5] == "2006":
+                    return layout[:i + 1], "longyear", 0, layout[i + 5:]
+                return layout[:i], "underday", 0, layout[i + 2:]
+            if layout[i + 1:i + 3] == "_2":
+                return layout[:i], "underyearday", 0, layout[i + 3:]
+        elif c == "3":
+            return layout[:i], "hour12", 0, layout[i + 1:]
+        elif c == "4":
+            return layout[:i], "minute", 0, layout[i + 1:]
+        elif c == "5":
+            return layout[:i], "second", 0, layout[i + 1:]
+        elif c == "P":  # PM
+            if layout[i:i + 2] == "PM":
+                return layout[:i], "pm_upper", 0, layout[i + 2:]
+        elif c == "p":  # pm
+            if layout[i:i + 2] == "pm":
+                return layout[:i], "pm_lower", 0, layout[i + 2:]
+        elif c == "-":  # -070000, -07:00:00, -0700, -07:00, -07
+            if layout[i:i + 7] == "-070000":
+                return layout[:i], "numsecondstz", 0, layout[i + 7:]
+            if layout[i:i + 9] == "-07:00:00":
+                return layout[:i], "numcolonsecondstz", 0, layout[i + 9:]
+            if layout[i:i + 5] == "-0700":
+                return layout[:i], "numtz", 0, layout[i + 5:]
+            if layout[i:i + 6] == "-07:00":
+                return layout[:i], "numcolontz", 0, layout[i + 6:]
+            if layout[i:i + 3] == "-07":
+                return layout[:i], "numshorttz", 0, layout[i + 3:]
+        elif c == "Z":  # Z070000, Z07:00:00, Z0700, Z07:00, Z07
+            if layout[i:i + 7] == "Z070000":
+                return layout[:i], "isosecondstz", 0, layout[i + 7:]
+            if layout[i:i + 9] == "Z07:00:00":
+                return layout[:i], "isocolonsecondstz", 0, layout[i + 9:]
+            if layout[i:i + 5] == "Z0700":
+                return layout[:i], "isotz", 0, layout[i + 5:]
+            if layout[i:i + 6] == "Z07:00":
+                return layout[:i], "isocolontz", 0, layout[i + 6:]
+            if layout[i:i + 3] == "Z07":
+                return layout[:i], "isoshorttz", 0, layout[i + 3:]
+        elif c == "." or c == ",":  # .000/.999 fractional seconds
+            if i + 1 < n and (layout[i + 1] == "0" or layout[i + 1] == "9"):
+                ch = layout[i + 1]
+                j = i + 1
+                while j < n and layout[j] == ch:
+                    j += 1
+                if j >= n or not layout[j].isdigit():
+                    std = "frac0" if ch == "0" else "frac9"
+                    return layout[:i], std, j - (i + 1), layout[j:]
+        i += 1
+    return layout, "", 0, ""
+
+
+def _starts_lower(s):
+    return len(s) > 0 and "a" <= s[0] <= "z"
+
+
+_STD0X = {"1": "zeromonth", "2": "zeroday", "3": "zerohour12",
+          "4": "zerominute", "5": "zerosecond", "6": "year"}
+
+
+def _time_zone_offset(offset, std, out):
+    """Append the numeric-zone forms Go writes for the offset stds. The ISO forms
+    print Z at a zero offset, the numeric forms always spell out the digits."""
+    if std in ("isotz", "isoshorttz", "isosecondstz", "isocolontz",
+               "isocolonsecondstz") and offset == 0:
+        out.append("Z")
+        return
+    zone = offset // 60 if offset >= 0 else -((-offset) // 60)
+    absoff = offset
+    if zone < 0:
+        out.append("-")
+        zone = -zone
+        absoff = -absoff
+    else:
+        out.append("+")
+    out.append(_time_appendint(zone // 60, 2))
+    if std in ("isocolontz", "isocolonsecondstz", "numcolontz", "numcolonsecondstz"):
+        out.append(":")
+    if std not in ("isoshorttz", "numshorttz"):
+        out.append(_time_appendint(zone % 60, 2))
+    if std in ("isosecondstz", "isocolonsecondstz", "numsecondstz", "numcolonsecondstz"):
+        if std in ("isocolonsecondstz", "numcolonsecondstz"):
+            out.append(":")
+        out.append(_time_appendint(absoff % 60, 2))
+
+
+def _time_frac(nsec, digits, drop):
+    """Append fractional seconds: digits places, drop trailing zeros (and the point)
+    when drop is true, matching Go's .0 fixed and .9 trimmed forms."""
+    s = "%09d" % nsec
+    s = s[:digits]
+    if drop:
+        s = s.rstrip("0")
+        if not s:
+            return ""
+    return "." + s
+
+
+def _time_format(t, layout):
+    name = t._loc._name
+    offset = t._loc._offset
+    year, month, day = t._date()
+    hour, minute, sec = t._clock()
+    wday = t.Weekday()
+    out = []
+    while layout:
+        prefix, std, arg, suffix = _next_std_chunk(layout)
+        if prefix:
+            out.append(prefix)
+        if std == "":
+            break
+        layout = suffix
+        if std == "year":
+            y = year % 100 if year >= 0 else (-year) % 100
+            out.append(_time_appendint(y, 2))
+        elif std == "longyear":
+            out.append(_time_appendint(year, 4))
+        elif std == "month":
+            out.append(_MONTH_NAMES[month - 1][:3])
+        elif std == "longmonth":
+            out.append(_MONTH_NAMES[month - 1])
+        elif std == "nummonth":
+            out.append(_time_appendint(month, 0))
+        elif std == "zeromonth":
+            out.append(_time_appendint(month, 2))
+        elif std == "weekday":
+            out.append(_WEEKDAY_NAMES[wday][:3])
+        elif std == "longweekday":
+            out.append(_WEEKDAY_NAMES[wday])
+        elif std == "day":
+            out.append(_time_appendint(day, 0))
+        elif std == "underday":
+            if day < 10:
+                out.append(" ")
+            out.append(_time_appendint(day, 0))
+        elif std == "zeroday":
+            out.append(_time_appendint(day, 2))
+        elif std in ("underyearday", "zeroyearday"):
+            yd = t.YearDay()
+            if std == "underyearday":
+                if yd < 100:
+                    out.append(" ")
+                if yd < 10:
+                    out.append(" ")
+                out.append(_time_appendint(yd, 0))
+            else:
+                out.append(_time_appendint(yd, 3))
+        elif std == "hour":
+            out.append(_time_appendint(hour, 2))
+        elif std == "hour12":
+            h = hour % 12
+            if h == 0:
+                h = 12
+            out.append(_time_appendint(h, 0))
+        elif std == "zerohour12":
+            h = hour % 12
+            if h == 0:
+                h = 12
+            out.append(_time_appendint(h, 2))
+        elif std == "minute":
+            out.append(_time_appendint(minute, 0))
+        elif std == "zerominute":
+            out.append(_time_appendint(minute, 2))
+        elif std == "second":
+            out.append(_time_appendint(sec, 0))
+        elif std == "zerosecond":
+            out.append(_time_appendint(sec, 2))
+        elif std == "pm_upper":
+            out.append("PM" if hour >= 12 else "AM")
+        elif std == "pm_lower":
+            out.append("pm" if hour >= 12 else "am")
+        elif std == "tz":
+            if name:
+                out.append(name)
+            else:
+                _time_zone_offset(offset, "numtz", out)
+        elif std in ("isotz", "isoshorttz", "isosecondstz", "isocolontz",
+                     "isocolonsecondstz", "numtz", "numshorttz", "numsecondstz",
+                     "numcolontz", "numcolonsecondstz"):
+            _time_zone_offset(offset, std, out)
+        elif std == "frac0":
+            out.append(_time_frac(t._nsec, arg, False))
+        elif std == "frac9":
+            out.append(_time_frac(t._nsec, arg, True))
+    return "".join(out)
+
+
 def _sleep(ns):
     """Pause the current goroutine for a Duration, Go's time.Sleep.
 
