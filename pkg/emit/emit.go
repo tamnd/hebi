@@ -112,7 +112,7 @@ func Module(m *ir.Module) (string, error) {
 		if wrote {
 			b.WriteString("\n\n")
 		}
-		if err := emitStruct(&b, sd); err != nil {
+		if err := emitStruct(&b, m.Package, sd); err != nil {
 			return "", err
 		}
 		wrote = true
@@ -526,8 +526,14 @@ func emitInterface(b *strings.Builder, id *ir.InterfaceDef) {
 // sharing; a value-struct field defaults to None and builds a fresh zero instance
 // in the constructor body, so a keyword literal that omits it still gets an
 // independent value, and copies by calling that field's own copy.
-func emitStruct(b *strings.Builder, sd *ir.StructDef) error {
+func emitStruct(b *strings.Builder, pkg string, sd *ir.StructDef) error {
 	fmt.Fprintf(b, "class %s:\n", sd.Name)
+	writeIndent(b, 1)
+	// _hebi_type is the Go type name fmt's %T and %#v print, package-qualified the
+	// Go way, such as main.Point. It lives on the class, not the instance, so it
+	// coexists with __slots__, and go_str keys the struct-rendering path on its
+	// presence.
+	fmt.Fprintf(b, "_hebi_type = %q\n", pkg+"."+sd.Name)
 	writeIndent(b, 1)
 	b.WriteString("__slots__ = (")
 	for i, f := range sd.Fields {

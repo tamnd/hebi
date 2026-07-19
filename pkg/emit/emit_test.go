@@ -203,6 +203,7 @@ func TestModuleStruct(t *testing.T) {
 		}},
 	}
 	want := `class Inner:
+    _hebi_type = "main.Inner"
     __slots__ = ("N",)
 
     def __init__(self, N=0):
@@ -213,6 +214,7 @@ func TestModuleStruct(t *testing.T) {
 
 
 class Outer:
+    _hebi_type = "main.Outer"
     __slots__ = ("V", "K")
 
     def __init__(self, V=None, K=0):
@@ -263,6 +265,7 @@ func TestModuleComparableAndFunc(t *testing.T) {
 		}},
 	}
 	want := `class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):
@@ -325,6 +328,7 @@ func TestModuleArray(t *testing.T) {
 
 
 class Grid:
+    _hebi_type = "main.Grid"
     __slots__ = ("Cells",)
 
     def __init__(self, Cells=None):
@@ -397,6 +401,7 @@ func TestModuleSlice(t *testing.T) {
 
 
 class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X",)
 
     def __init__(self, X=0):
