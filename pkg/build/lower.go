@@ -4862,6 +4862,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "unicode/utf8"); ok {
 			return l.lowerUTF8Func(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "unicode"); ok {
+			return l.lowerUnicodeFunc(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "math"); ok {
 			return l.lowerMathFunc(e, name)
 		}
@@ -5605,6 +5608,42 @@ func (l *lowerer) lowerStrconvFunc(e *ast.CallExpr, name string) (ir.Expr, error
 	intrinsic, ok := strconvIntrinsics[name]
 	if !ok {
 		return nil, l.errf(e.Pos(), "strconv.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
+}
+
+// unicodeIntrinsics maps a unicode function to the runtime shim. A rune
+// classifies against Go's pinned category tables the shim embeds, not the host
+// Python's unicodedata, which drifts by CPython release, so the result matches
+// go run byte for byte on any interpreter. IsControl and IsSpace are fixed
+// code-point sets independent of the Unicode version. The case-mapping functions
+// and the wider classifiers wait for their own slice, which pins the case ranges
+// the same way, and a function outside this table fails loudly.
+var unicodeIntrinsics = map[string]string{
+	"IsControl": "unicode_is_control",
+	"IsSpace":   "unicode_is_space",
+	"IsLetter":  "unicode_is_letter",
+	"IsDigit":   "unicode_is_digit",
+	"IsNumber":  "unicode_is_number",
+	"IsUpper":   "unicode_is_upper",
+	"IsLower":   "unicode_is_lower",
+	"IsPunct":   "unicode_is_punct",
+}
+
+// lowerUnicodeFunc lowers a call to the standard unicode package through
+// unicodeIntrinsics. A spread argument has no unicode function that takes one,
+// so it fails loudly, as does a function the table does not carry.
+func (l *lowerer) lowerUnicodeFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "unicode.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := unicodeIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "unicode.%s is not supported yet", name)
 	}
 	args, err := l.lowerCallArgs(e.Args)
 	if err != nil {

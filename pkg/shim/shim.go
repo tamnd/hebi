@@ -6,6 +6,8 @@ import _ "embed"
 // writes the source beside the emitted modules as Name + ".py".
 const Name = "_hebirt"
 
+//go:generate go run ./runtime/gen/main.go
+
 //go:embed runtime/_hebirt.py
 var source string
 
