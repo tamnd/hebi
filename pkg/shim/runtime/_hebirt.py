@@ -951,6 +951,114 @@ def _sleep(ns):
         time.sleep(ns / 1e9)
 
 
+# Channels. A Go channel is not a queue: an unbuffered channel is a rendezvous, a
+# direct handoff where the send completes only when a receiver takes the value in
+# the same instant, which programs lean on as a happens-before edge. There is no
+# standard-library primitive with that shape, so the runtime builds one class on
+# one threading.Condition whose lock guards every field, the whole channel
+# contract legible in one place rather than spread across a scheduler.
+
+
+class Chan:
+    """A Go channel, a typed conduit with rendezvous and close semantics.
+
+    The buffer holds handed-off or buffered values, the capacity is zero for an
+    unbuffered channel, and the zero factory builds the element's zero value for a
+    receive on a closed channel, called fresh each time so a struct zero is not
+    shared. Everything happens under the one condition, so a parked send or
+    receive consumes nothing until another operation wakes it to re-check.
+    """
+
+    __slots__ = ("_cap", "_buf", "_closed", "_cond", "_zero")
+
+    def __init__(self, cap, zero):
+        self._cap = cap
+        self._buf = []
+        self._closed = False
+        self._cond = threading.Condition()
+        self._zero = zero
+
+    def send(self, value):
+        with self._cond:
+            if self._closed:
+                raise GoPanic("send on closed channel")
+            if self._cap == 0:
+                # Unbuffered: deposit the value and park until a receiver has
+                # taken it, so the send returns only once the buffer is empty
+                # again, the rendezvous Go promises.
+                self._buf.append(value)
+                self._cond.notify_all()
+                while self._buf and not self._closed:
+                    self._cond.wait()
+                if self._closed and self._buf:
+                    raise GoPanic("send on closed channel")
+                return
+            # Buffered: block only while the buffer is full, then deposit.
+            while len(self._buf) >= self._cap and not self._closed:
+                self._cond.wait()
+            if self._closed:
+                raise GoPanic("send on closed channel")
+            self._buf.append(value)
+            self._cond.notify_all()
+
+    def recv(self):
+        with self._cond:
+            while True:
+                if self._buf:
+                    value = self._buf.pop(0)
+                    self._cond.notify_all()
+                    return value, True
+                if self._closed:
+                    # A closed and drained channel is always ready and never
+                    # blocks, which is what terminates a range and what makes a
+                    # closed channel ready in a select.
+                    return self._zero(), False
+                self._cond.wait()
+
+    def close(self):
+        with self._cond:
+            if self._closed:
+                raise GoPanic("close of closed channel")
+            self._closed = True
+            self._cond.notify_all()
+
+
+def chan_send(ch, value):
+    """Send on a channel, Go's ch <- value, blocking forever on a nil channel.
+
+    A nil channel blocks both send and receive forever, a real idiom for
+    disabling an operation, so the nil case parks on a condition nothing ever
+    signals rather than raising.
+    """
+    if ch is None:
+        _block_forever()
+    ch.send(value)
+
+
+def chan_recv(ch):
+    """Receive one value from a channel, Go's v := <-ch, dropping the ok flag.
+
+    A nil channel blocks forever. The comma-ok and range forms that need the ok
+    flag route through their own helper.
+    """
+    if ch is None:
+        _block_forever()
+    value, _ok = ch.recv()
+    return value
+
+
+def _block_forever():
+    """Park the current goroutine on a condition that is never signaled.
+
+    A goroutine blocked on a nil channel is stuck until the program exits,
+    exactly as in Go, so it waits on a private condition no other code holds.
+    """
+    cond = threading.Condition()
+    with cond:
+        while True:
+            cond.wait()
+
+
 # String helpers. A Go string is Python bytes, so byte indexing, length, and
 # comparison need no helper, but ranging over a string decodes UTF-8 one rune at
 # a time, yielding the byte index of each rune and the rune itself. The decoder

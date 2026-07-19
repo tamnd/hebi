@@ -1489,6 +1489,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerDefer(s)
 	case *ast.GoStmt:
 		return l.lowerGo(s)
+	case *ast.SendStmt:
+		return l.lowerSend(s)
 	default:
 		return nil, l.errf(s.Pos(), "statement %T is not supported yet", s)
 	}
@@ -1526,6 +1528,25 @@ func (l *lowerer) lowerGo(s *ast.GoStmt) ([]ir.Stmt, error) {
 	}
 	spawn := &ir.Intrinsic{Name: "go", Args: append([]ir.Expr{fn}, args...)}
 	return []ir.Stmt{&ir.ExprStmt{X: spawn}}, nil
+}
+
+// lowerSend lowers a channel send ch <- v to a call into the runtime send helper.
+// Go copies the value into the channel, so a struct value sent by name is cloned
+// at the send the same way any value copy is, and a scalar passes through. The
+// helper blocks the sending goroutine until a receiver takes the value on an
+// unbuffered channel, which is the rendezvous.
+func (l *lowerer) lowerSend(s *ast.SendStmt) ([]ir.Stmt, error) {
+	ch, err := l.lowerExpr(s.Chan)
+	if err != nil {
+		return nil, err
+	}
+	value, err := l.lowerExpr(s.Value)
+	if err != nil {
+		return nil, err
+	}
+	value = l.copyIfValueRead(s.Value, value)
+	send := &ir.Intrinsic{Name: "chan_send", Args: []ir.Expr{ch, value}}
+	return []ir.Stmt{&ir.ExprStmt{X: send}}, nil
 }
 
 // asPanicCall returns the call expression when x is a call to the builtin panic,
@@ -3910,6 +3931,15 @@ func (l *lowerer) lowerUnary(e *ast.UnaryExpr) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.UnaryExpr{Op: e.Op.String(), X: x}, nil
+	case token.ARROW:
+		// A one-value receive <-ch takes a value and drops the ok flag. The
+		// comma-ok and range forms that keep the flag route through their own
+		// helper on a later slice.
+		x, err := l.lowerExpr(e.X)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.Intrinsic{Name: "chan_recv", Args: []ir.Expr{x}}, nil
 	case token.AND:
 		return l.lowerAddr(e)
 	default:
@@ -4542,6 +4572,20 @@ func (l *lowerer) lowerMake(e *ast.CallExpr) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.MapLit{}, nil
+	}
+	if ch, ok := t.Underlying().(*types.Chan); ok {
+		// An unbuffered channel is a rendezvous, capacity zero. A buffered channel
+		// takes a capacity argument and waits on its own slice. The element zero
+		// factory is what a receive on a closed channel returns, built fresh each
+		// call so a struct zero is never shared.
+		if len(e.Args) > 1 {
+			return nil, l.errf(e.Pos(), "a buffered channel is not supported yet")
+		}
+		zero, err := l.zeroValueOfType(ch.Elem(), e.Pos())
+		if err != nil {
+			return nil, err
+		}
+		return &ir.Intrinsic{Name: "Chan", Args: []ir.Expr{&ir.IntLit{Text: "0"}, &ir.Lambda{Body: zero}}}, nil
 	}
 	slice, ok := t.Underlying().(*types.Slice)
 	if !ok {
