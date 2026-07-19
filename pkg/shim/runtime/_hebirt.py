@@ -9,6 +9,7 @@ a time as later milestones add language surface.
 import decimal
 import math
 import os
+import random
 import struct
 import sys
 import threading
@@ -955,8 +956,17 @@ def _sleep(ns):
 # direct handoff where the send completes only when a receiver takes the value in
 # the same instant, which programs lean on as a happens-before edge. There is no
 # standard-library primitive with that shape, so the runtime builds one class on
-# one threading.Condition whose lock guards every field, the whole channel
-# contract legible in one place rather than spread across a scheduler.
+# one shared condition, _chan_cond, whose lock guards every channel's fields. One
+# lock across all channels is what lets a select wait on several at once and be
+# woken by an operation on any of them, and it removes the cross-channel ordering
+# deadlock a lock per channel would risk.
+
+
+# The one condition every channel and every select shares. A send, a receive, or
+# a close notifies it, so a select parked on several channels wakes when any of
+# them changes, and a channel operation and a select never take two locks in a
+# different order.
+_chan_cond = threading.Condition()
 
 
 class Chan:
@@ -965,62 +975,101 @@ class Chan:
     The buffer holds handed-off or buffered values, the capacity is zero for an
     unbuffered channel, and the zero factory builds the element's zero value for a
     receive on a closed channel, called fresh each time so a struct zero is not
-    shared. Everything happens under the one condition, so a parked send or
-    receive consumes nothing until another operation wakes it to re-check.
+    shared. The receiver count is the number of receivers parked on this channel,
+    which is what makes a send to an unbuffered channel ready in a select. Every
+    field is guarded by the shared _chan_cond, so a parked send or receive
+    consumes nothing until another operation wakes it to re-check.
     """
 
-    __slots__ = ("_cap", "_buf", "_closed", "_cond", "_zero")
+    __slots__ = ("_cap", "_buf", "_closed", "_zero", "_recv_waiting")
 
     def __init__(self, cap, zero):
         self._cap = cap
         self._buf = []
         self._closed = False
-        self._cond = threading.Condition()
         self._zero = zero
+        self._recv_waiting = 0
 
     def send(self, value):
-        with self._cond:
-            if self._closed:
-                raise GoPanic("send on closed channel")
-            if self._cap == 0:
-                # Unbuffered: deposit the value and park until a receiver has
-                # taken it, so the send returns only once the buffer is empty
-                # again, the rendezvous Go promises.
-                self._buf.append(value)
-                self._cond.notify_all()
-                while self._buf and not self._closed:
-                    self._cond.wait()
-                if self._closed and self._buf:
-                    raise GoPanic("send on closed channel")
-                return
-            # Buffered: block only while the buffer is full, then deposit.
-            while len(self._buf) >= self._cap and not self._closed:
-                self._cond.wait()
-            if self._closed:
-                raise GoPanic("send on closed channel")
+        with _chan_cond:
+            self._send_locked(value)
+
+    def _send_locked(self, value):
+        """Send, holding _chan_cond. The plain send path, which for an unbuffered
+        channel parks until a receiver takes the value, the rendezvous Go
+        promises."""
+        if self._closed:
+            raise GoPanic("send on closed channel")
+        if self._cap == 0:
+            # Unbuffered: deposit the value and park until a receiver has taken
+            # it, so the send returns only once the buffer is empty again.
             self._buf.append(value)
-            self._cond.notify_all()
+            _chan_cond.notify_all()
+            while self._buf and not self._closed:
+                _chan_cond.wait()
+            if self._closed and self._buf:
+                raise GoPanic("send on closed channel")
+            return
+        # Buffered: block only while the buffer is full, then deposit.
+        while len(self._buf) >= self._cap and not self._closed:
+            _chan_cond.wait()
+        if self._closed:
+            raise GoPanic("send on closed channel")
+        self._buf.append(value)
+        _chan_cond.notify_all()
 
     def recv(self):
-        with self._cond:
+        with _chan_cond:
+            return self._recv_locked()
+
+    def _recv_locked(self):
+        """Receive, holding _chan_cond, counting this receiver while it is parked
+        so a select send to an unbuffered channel can see a waiting receiver."""
+        self._recv_waiting += 1
+        try:
             while True:
                 if self._buf:
                     value = self._buf.pop(0)
-                    self._cond.notify_all()
+                    _chan_cond.notify_all()
                     return value, True
                 if self._closed:
                     # A closed and drained channel is always ready and never
                     # blocks, which is what terminates a range and what makes a
                     # closed channel ready in a select.
                     return self._zero(), False
-                self._cond.wait()
+                _chan_cond.wait()
+        finally:
+            self._recv_waiting -= 1
 
     def close(self):
-        with self._cond:
+        with _chan_cond:
             if self._closed:
                 raise GoPanic("close of closed channel")
             self._closed = True
-            self._cond.notify_all()
+            _chan_cond.notify_all()
+
+    def _recv_ready(self):
+        """Whether a receive would proceed without blocking: a buffered or
+        handed-off value is waiting, or the channel is closed and so always
+        ready. Called under _chan_cond by select."""
+        return len(self._buf) > 0 or self._closed
+
+    def _send_ready(self):
+        """Whether a send would proceed without blocking: the buffer has room, a
+        receiver is parked with no pending value already matched to it, or the
+        channel is closed so the send is ready to panic the Go way. Called under
+        _chan_cond by select."""
+        return len(self._buf) < self._cap or self._recv_waiting > len(self._buf) or self._closed
+
+    def _send_deposit(self, value):
+        """Deposit a value for a select send whose readiness was just checked
+        under the lock. It does not wait for the rendezvous to drain, so a select
+        never blocks after committing to a case; the parked receiver that made
+        the case ready takes the value on the next wake."""
+        if self._closed:
+            raise GoPanic("send on closed channel")
+        self._buf.append(value)
+        _chan_cond.notify_all()
 
 
 def chan_send(ch, value):
@@ -1064,6 +1113,70 @@ def chan_close(ch):
     if ch is None:
         raise GoPanic("close of nil channel")
     ch.close()
+
+
+# A select case is a tuple whose first element tags its direction, 0 for a
+# receive and 1 for a send, followed by the channel and, for a send, the value.
+# An integer tag keeps the case a plain tuple the lowering can build and avoids
+# the Go-string-is-bytes mismatch a text tag would bring.
+_SEL_RECV = 0
+
+
+def _select_ready(case):
+    """Whether a select case can proceed. A nil-channel case is never ready and is
+    skipped, matching Go, so a select over only nil channels with no default
+    blocks forever. A receive case is ready when a receive would not block, a send
+    case when a send would not block."""
+    ch = case[1]
+    if ch is None:
+        return False
+    if case[0] == _SEL_RECV:
+        return ch._recv_ready()
+    return ch._send_ready()
+
+
+def _select_fire(case, index):
+    """Execute a ready select case and return the triple the caller dispatches on,
+    the case index with the received value and ok flag for a receive, or the index
+    with a placeholder pair for a send."""
+    ch = case[1]
+    if case[0] == _SEL_RECV:
+        value, ok = ch._recv_locked()
+        return index, value, ok
+    ch._send_deposit(case[2])
+    return index, None, False
+
+
+def select(has_default, *cases):
+    """Run Go's select: choose uniformly at random among the ready cases, take the
+    default when none is ready and one is given, otherwise park until a case
+    becomes ready and choose again.
+
+    cases is the per-case tuples in source order, (0, ch) for a receive or
+    (1, ch, value) for a send, and the returned index is the position of the
+    chosen case among them, or minus one for the default. Go mandates the uniform
+    choice among ready cases, so the picker is unbiased rather than first-ready.
+
+    A parked select registers as a receiver on each of its receive cases so a send
+    to an unbuffered channel can see it, waits on the shared condition so any
+    channel operation wakes it, then deregisters and re-evaluates, since between
+    the wake and the re-lock another goroutine may have taken the value.
+    """
+    with _chan_cond:
+        while True:
+            ready = [i for i in range(len(cases)) if _select_ready(cases[i])]
+            if ready:
+                index = random.choice(ready)
+                return _select_fire(cases[index], index)
+            if has_default:
+                return -1, None, False
+            for case in cases:
+                if case[0] == _SEL_RECV and case[1] is not None:
+                    case[1]._recv_waiting += 1
+            _chan_cond.wait()
+            for case in cases:
+                if case[0] == _SEL_RECV and case[1] is not None:
+                    case[1]._recv_waiting -= 1
 
 
 def _block_forever():
