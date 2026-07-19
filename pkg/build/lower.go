@@ -4819,8 +4819,8 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "errors"); ok {
 			return l.lowerErrorsFunc(e, name)
 		}
-		if name, ok := l.pkgFunc(fun, "fmt"); ok && name == "Errorf" {
-			return l.lowerErrorf(e)
+		if name, ok := l.pkgFunc(fun, "fmt"); ok {
+			return l.lowerFmtFunc(e, name)
 		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
@@ -5519,6 +5519,125 @@ func (l *lowerer) checkErrorfFormat(pos token.Pos, format string) error {
 		if !strings.ContainsRune(errorfVerbs, rune(format[i])) {
 			return l.errf(pos, "fmt.Errorf format directive %%%c is not supported yet", format[i])
 		}
+	}
+	return nil
+}
+
+// lowerFmtFunc routes a call to the fmt package to the right lowering. Println
+// is handled earlier on its own path, so this covers the formatted printers,
+// Printf and Sprintf, the plain printers, Print, Sprint, and Sprintln, and
+// Errorf. A fmt function outside this set is not on the compiled tier yet and
+// fails loudly.
+func (l *lowerer) lowerFmtFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	switch name {
+	case "Errorf":
+		return l.lowerErrorf(e)
+	case "Printf":
+		return l.lowerFmtFormatted(e, "Printf", "printf")
+	case "Sprintf":
+		return l.lowerFmtFormatted(e, "Sprintf", "sprintf")
+	case "Print":
+		return l.lowerFmtPlain(e, "goprint")
+	case "Sprint":
+		return l.lowerFmtPlain(e, "sprint")
+	case "Sprintln":
+		return l.lowerFmtPlain(e, "sprintln")
+	}
+	return nil, l.errf(e.Pos(), "call to fmt.%s is not supported yet", name)
+}
+
+// printfVerbs is the set of format verbs the runtime formatter renders. It is
+// wider than errorfVerbs because Printf carries the numeric and float verbs a
+// plain error message does not, and unlike Errorf it admits flags, a width, and
+// a precision, which checkPrintfFormat parses. A verb outside this set fails at
+// compile time rather than reaching the runtime to be mangled.
+const printfVerbs = "vTtbcdeEfFgGoqsUxX"
+
+// lowerFmtFormatted lowers Printf or Sprintf. The format must be a constant
+// string so its directives are checked here at compile time, and the whole call
+// lowers to the matching intrinsic, which scans the format again at run time to
+// render each operand the Go way. The format lowers to bytes like any Go string
+// and the operands lower plainly.
+func (l *lowerer) lowerFmtFormatted(e *ast.CallExpr, verb, intrinsic string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "fmt.%s with a spread argument is not supported yet", verb)
+	}
+	if len(e.Args) == 0 {
+		return nil, l.errf(e.Pos(), "fmt.%s needs a format argument", verb)
+	}
+	tv := l.pkg.Info.Types[e.Args[0]]
+	if tv.Value == nil || tv.Value.Kind() != constant.String {
+		return nil, l.errf(e.Args[0].Pos(), "fmt.%s needs a constant format string", verb)
+	}
+	if err := l.checkPrintfFormat(e.Args[0].Pos(), constant.StringVal(tv.Value)); err != nil {
+		return nil, err
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
+}
+
+// lowerFmtPlain lowers Print, Sprint, or Sprintln, none of which take a format
+// string. The arguments lower through the Println path so a float32 operand
+// prints its single-precision digits the way go_str alone could not, and the
+// call becomes the matching intrinsic.
+func (l *lowerer) lowerFmtPlain(e *ast.CallExpr, intrinsic string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "fmt.%s with a spread argument is not supported yet", intrinsic)
+	}
+	args, err := l.lowerPrintlnArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
+}
+
+// checkPrintfFormat scans a Printf or Sprintf format and rejects any directive
+// the runtime formatter does not carry. It parses the same grammar the runtime
+// does, optional flags, an optional width, an optional precision after a dot,
+// then the verb, so a star width or precision is accepted and a doubled percent
+// is a literal. An incomplete directive or an unknown verb fails loudly.
+func (l *lowerer) checkPrintfFormat(pos token.Pos, format string) error {
+	i, n := 0, len(format)
+	for i < n {
+		if format[i] != '%' {
+			i++
+			continue
+		}
+		i++
+		if i < n && format[i] == '%' {
+			i++
+			continue
+		}
+		for i < n && strings.IndexByte("+-# 0", format[i]) >= 0 {
+			i++
+		}
+		if i < n && format[i] == '*' {
+			i++
+		} else {
+			for i < n && format[i] >= '0' && format[i] <= '9' {
+				i++
+			}
+		}
+		if i < n && format[i] == '.' {
+			i++
+			if i < n && format[i] == '*' {
+				i++
+			} else {
+				for i < n && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
+			}
+		}
+		if i >= n {
+			return l.errf(pos, "fmt format ends with an incomplete directive")
+		}
+		if !strings.ContainsRune(printfVerbs, rune(format[i])) {
+			return l.errf(pos, "fmt format directive %%%c is not supported yet", format[i])
+		}
+		i++
 	}
 	return nil
 }

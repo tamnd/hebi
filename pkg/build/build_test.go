@@ -717,6 +717,7 @@ func TestStructsEmit(t *testing.T) {
 
 
 class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):
@@ -757,6 +758,7 @@ func TestStructValueFieldEmit(t *testing.T) {
 	t.Parallel()
 	source := "package main\n\ntype Inner struct {\n\tN int\n}\n\ntype Outer struct {\n\tV Inner\n\tK int\n}\n\nfunc main() {\n\tvar o Outer\n\t_ = o\n}\n"
 	want := `class Inner:
+    _hebi_type = "main.Inner"
     __slots__ = ("N",)
 
     def __init__(self, N=0):
@@ -775,6 +777,7 @@ func TestStructValueFieldEmit(t *testing.T) {
 
 
 class Outer:
+    _hebi_type = "main.Outer"
     __slots__ = ("V", "K")
 
     def __init__(self, V=None, K=0):
@@ -873,6 +876,7 @@ func TestEmbeddedPromotionEmit(t *testing.T) {
 
 
 class Base:
+    _hebi_type = "main.Base"
     __slots__ = ("ID",)
 
     def __init__(self, ID=0):
@@ -891,6 +895,7 @@ class Base:
 
 
 class User:
+    _hebi_type = "main.User"
     __slots__ = ("Base", "Name")
 
     def __init__(self, Base_=None, Name=0):
@@ -931,6 +936,7 @@ func TestFuncParamsEmit(t *testing.T) {
 	t.Parallel()
 	source := "package main\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc idp(p Point) Point {\n\treturn p\n}\n\nfunc main() {\n\ta := Point{1, 2}\n\t_ = idp(a)\n}\n"
 	want := `class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):
@@ -1037,6 +1043,7 @@ func TestArrayFieldEmit(t *testing.T) {
 
 
 class Grid:
+    _hebi_type = "main.Grid"
     __slots__ = ("Cells",)
 
     def __init__(self, Cells=None):
@@ -1075,6 +1082,7 @@ func TestArrayMutableZeroEmit(t *testing.T) {
 	t.Parallel()
 	source := "package main\n\ntype Point struct {\n\tX int\n\tY int\n}\n\nfunc main() {\n\tvar pts [2]Point\n\tvar grid [2][3]int\n\t_ = pts\n\t_ = grid\n}\n"
 	want := `class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):
@@ -1185,6 +1193,7 @@ func TestSliceFieldEmit(t *testing.T) {
 
 
 class Bag:
+    _hebi_type = "main.Bag"
     __slots__ = ("Items", "N")
 
     def __init__(self, Items=` + shim.Name + `.NIL_SLICE, N=0):
@@ -1219,6 +1228,7 @@ func TestSliceMakeEmit(t *testing.T) {
 
 
 class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):
@@ -1294,6 +1304,7 @@ func TestSliceAppendEmit(t *testing.T) {
 
 
 class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X",)
 
     def __init__(self, X=0):
@@ -1579,6 +1590,7 @@ func TestCompositeLiteralEmit(t *testing.T) {
 
 
 class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):
@@ -1650,6 +1662,7 @@ func TestPointerEmit(t *testing.T) {
 
 
 class Point:
+    _hebi_type = "main.Point"
     __slots__ = ("X", "Y")
 
     def __init__(self, X=0, Y=0):

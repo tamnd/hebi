@@ -16,15 +16,16 @@ import threading
 import time
 
 
-def go_str(value):
-    """Return Go's fmt default string for a value.
+def go_str(value, plus=False):
+    """Return Go's fmt default string for a value, %v by default and %+v when plus.
 
     Go prints booleans as true and false where Python prints True and False, so
     those two are special-cased. Floats are formatted the Go way, which differs
     from Python's str: Go uses the shortest round-tripping form and switches to
-    exponent notation at different thresholds. Everything else defers to
-    Python's str, which already matches Go for the integers and strings hebi
-    covers.
+    exponent notation at different thresholds. A struct dumps its fields in
+    braces, and under plus each field is labelled with its name, the difference
+    between %v and %+v. Everything else defers to Python's str, which already
+    matches Go for the integers hebi covers.
     """
     if value is True:
         return "true"
@@ -46,12 +47,12 @@ def go_str(value):
         # A Go array prints as its elements in brackets separated by single
         # spaces, each element formatted by its own rule, and a nested array
         # recurses, so [2][2]int reads as [[1 2] [3 4]] the way Go prints it.
-        return "[" + " ".join(go_str(e) for e in value) + "]"
+        return "[" + " ".join(go_str(e, plus) for e in value) + "]"
     if isinstance(value, Slice):
         # A Go slice prints the same bracket form as an array, walking the header
         # so only the visible length is shown and the backing beyond it stays
         # hidden, matching fmt's view of a slice through its length.
-        return "[" + " ".join(go_str(value.array[value.offset + k]) for k in range(value.length)) + "]"
+        return "[" + " ".join(go_str(value.array[value.offset + k], plus) for k in range(value.length)) + "]"
     if value is NIL_MAP:
         # A nil map prints as an empty map, the same form an empty map takes, since
         # Go's fmt shows both as map[].
@@ -65,7 +66,7 @@ def go_str(value):
             items = sorted(value.items(), key=lambda kv: kv[0])
         except TypeError:
             items = list(value.items())
-        return "map[" + " ".join(go_str(k) + ":" + go_str(v) for k, v in items) + "]"
+        return "map[" + " ".join(go_str(k, plus) + ":" + go_str(v, plus) for k, v in items) + "]"
     err = getattr(value, "Error", None)
     if callable(err):
         # An error value prints as its Error text, so fmt.Println(err) writes the
@@ -77,6 +78,17 @@ def go_str(value):
         # A Stringer prints through String, which fmt uses when a value carries no
         # Error, so a type that defines String reads as its own text.
         return go_str(s())
+    slots = getattr(type(value), "__slots__", None)
+    if slots is not None and hasattr(type(value), "_hebi_type"):
+        # A struct that carries no Stringer or error dumps its fields in braces,
+        # each field rendered by its own rule and separated by single spaces. Under
+        # plus each field is prefixed with its name and a colon, so %v reads {1 2}
+        # and %+v reads {X:1 Y:2}, matching Go's default struct formats.
+        if plus:
+            body = " ".join(name + ":" + go_str(getattr(value, name), True) for name in slots)
+        else:
+            body = " ".join(go_str(getattr(value, name), False) for name in slots)
+        return "{" + body + "}"
     return str(value)
 
 
@@ -732,6 +744,308 @@ def errorf(fmt, *args):
     if len(wrapped) == 1:
         return _WrapError(msg, wrapped[0])
     return _WrapErrors(msg, wrapped)
+
+
+# fmt.Printf and its siblings. Go's printf verbs carry flags, a width, and a
+# precision that Python's own formatting does not reproduce byte for byte, so the
+# format is interpreted here directly over its bytes and each verb renders its
+# operand to Go's exact text. go_str already supplies the %v default, so the
+# engine reuses it for v and layers the numeric, string, and float verbs on top.
+
+_FMT_DIGITS = frozenset(range(0x30, 0x3A))
+_FMT_FLAGS = frozenset((0x2B, 0x2D, 0x20, 0x23, 0x30))  # + - space # 0
+
+
+def _go_type(value):
+    """Return the Go type name fmt's %T prints for a value.
+
+    A struct carries its package-qualified name as a class attribute, and the
+    scalar kinds map to their Go names; the integer width and named scalar types
+    are not distinguished at runtime yet, so a plain int reads as int.
+    """
+    t = getattr(type(value), "_hebi_type", None)
+    if t is not None:
+        return t
+    if value is None:
+        return "<nil>"
+    if value is True or value is False:
+        return "bool"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float64"
+    if isinstance(value, bytes):
+        return "string"
+    if isinstance(value, bytearray):
+        return "[]uint8"
+    return type(value).__name__
+
+
+def _go_sharp(value):
+    """Render a value in Go's %#v form, its Go-syntax representation.
+
+    A struct prints its package-qualified name and its fields as name:value pairs
+    in braces, a string prints Go-quoted, and the scalars print as their source
+    literals. A Stringer is not consulted, since %#v always shows the underlying
+    representation.
+    """
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "<nil>"
+    if isinstance(value, float):
+        return _gofloat(value)
+    if isinstance(value, bytes):
+        return _go_quote(value).decode("utf-8", "replace")
+    t = getattr(type(value), "_hebi_type", None)
+    slots = getattr(type(value), "__slots__", None)
+    if t is not None and slots is not None:
+        body = ", ".join(name + ":" + _go_sharp(getattr(value, name)) for name in slots)
+        return t + "{" + body + "}"
+    return str(value)
+
+
+def _pad(b, flags, width, zero_ok, headlen, dlen):
+    """Pad a rendered field to width, the Go way.
+
+    A field at least the width wide is returned unchanged. The minus flag pads on
+    the right with spaces; the zero flag, when the verb allows it, pads with zeros
+    after any sign or base prefix; otherwise the field is right-justified with
+    spaces. dlen is the display width in runes, which is what Go counts.
+    """
+    if width is None or dlen >= width:
+        return b
+    padn = width - dlen
+    if 0x2D in flags:
+        return b + b" " * padn
+    if zero_ok:
+        return b[:headlen] + b"0" * padn + b[headlen:]
+    return b" " * padn + b
+
+
+def _fmt_int(value, base, upper, flags, width, prec):
+    """Render an integer verb, %d %b %o %x %X, with flags, width, and precision."""
+    neg = value < 0
+    mag = -value if neg else value
+    if base == 10:
+        digits = str(mag)
+    else:
+        digits = format(mag, {2: "b", 8: "o", 16: "X" if upper else "x"}[base])
+    if prec is not None:
+        if prec == 0 and mag == 0:
+            digits = ""
+        elif len(digits) < prec:
+            digits = "0" * (prec - len(digits)) + digits
+    prefix = ""
+    if 0x23 in flags:
+        if base == 8 and not digits.startswith("0"):
+            prefix = "0"
+        elif base == 16 and mag != 0:
+            prefix = "0X" if upper else "0x"
+    sign = "-" if neg else ("+" if 0x2B in flags else (" " if 0x20 in flags else ""))
+    head = sign + prefix
+    body = (head + digits).encode("utf-8")
+    zero_ok = 0x30 in flags and prec is None and 0x2D not in flags
+    return _pad(body, flags, width, zero_ok, len(head), len(head) + len(digits))
+
+
+def _fmt_float(value, kind, flags, width, prec):
+    """Render a float verb, %f %e %E %g %G, with flags, width, and precision."""
+    special = True
+    if value != value:
+        core, neg = "NaN", False
+    elif value == float("inf"):
+        core, neg = "Inf", False
+    elif value == float("-inf"):
+        core, neg = "Inf", True
+    else:
+        special = False
+        neg = math.copysign(1.0, value) < 0.0
+        av = -value if neg else value
+        if kind in (0x66, 0x46):  # f F
+            core = "%.*f" % (6 if prec is None else prec, av)
+        elif kind in (0x65, 0x45):  # e E
+            core = "%.*e" % (6 if prec is None else prec, av)
+        else:  # g G
+            core = _gofloat(av) if prec is None else "%.*g" % (prec if prec else 1, av)
+        if kind in (0x45, 0x47):  # E G
+            core = core.upper()
+    sign = "-" if neg else ("+" if 0x2B in flags else (" " if 0x20 in flags else ""))
+    body = (sign + core).encode("utf-8")
+    zero_ok = 0x30 in flags and 0x2D not in flags and not special
+    return _pad(body, flags, width, zero_ok, len(sign), len(sign) + len(core))
+
+
+def _fmt_str(value, flags, width, prec):
+    """Render a %s verb, decoding a Go string or deferring to go_str otherwise."""
+    if isinstance(value, (bytes, bytearray)):
+        s = bytes(value).decode("utf-8", "replace")
+    else:
+        s = go_str(value)
+    if prec is not None:
+        s = s[:prec]
+    return _pad(s.encode("utf-8"), flags, width, False, 0, len(s))
+
+
+def _fmt_hexbytes(value, upper, flags, width):
+    """Render %x or %X over a Go string or byte slice as its hex digits."""
+    s = ("%02X" if upper else "%02x")
+    body = ("".join(s % b for b in bytes(value))).encode("utf-8")
+    return _pad(body, flags, width, False, 0, len(body))
+
+
+def _fmt_verb(verb, arg, flags, width, prec):
+    """Render one directive's operand to bytes for the given verb."""
+    if verb == 0x76:  # v
+        if 0x23 in flags:
+            s = _go_sharp(arg)
+        else:
+            s = go_str(arg, 0x2B in flags)
+        return _pad(s.encode("utf-8"), flags, width, False, 0, len(s))
+    if verb == 0x54:  # T
+        s = _go_type(arg)
+        return _pad(s.encode("utf-8"), flags, width, False, 0, len(s))
+    if verb == 0x64:  # d
+        return _fmt_int(arg, 10, False, flags, width, prec)
+    if verb == 0x62:  # b
+        return _fmt_int(arg, 2, False, flags, width, prec)
+    if verb == 0x6F:  # o
+        return _fmt_int(arg, 8, False, flags, width, prec)
+    if verb == 0x78:  # x
+        if isinstance(arg, (bytes, bytearray)):
+            return _fmt_hexbytes(arg, False, flags, width)
+        return _fmt_int(arg, 16, False, flags, width, prec)
+    if verb == 0x58:  # X
+        if isinstance(arg, (bytes, bytearray)):
+            return _fmt_hexbytes(arg, True, flags, width)
+        return _fmt_int(arg, 16, True, flags, width, prec)
+    if verb == 0x73:  # s
+        return _fmt_str(arg, flags, width, prec)
+    if verb == 0x71:  # q
+        b = _go_quote(arg) if isinstance(arg, (bytes, bytearray)) else go_str(arg).encode("utf-8")
+        return _pad(b, flags, width, False, 0, len(b))
+    if verb in (0x66, 0x46, 0x65, 0x45, 0x67, 0x47):  # f F e E g G
+        return _fmt_float(arg, verb, flags, width, prec)
+    if verb == 0x74:  # t
+        s = "true" if arg else "false"
+        return _pad(s.encode("utf-8"), flags, width, False, 0, len(s))
+    if verb == 0x63:  # c
+        s = chr(arg)
+        return _pad(s.encode("utf-8"), flags, width, False, 0, len(s))
+    if verb == 0x55:  # U
+        s = "U+%04X" % arg
+        return _pad(s.encode("utf-8"), flags, width, False, 0, len(s))
+    # An unknown verb prints Go's bad-verb marker so a mismatch is visible rather
+    # than silently dropped.
+    return b"%!" + bytes((verb,)) + b"(" + go_str(arg).encode("utf-8") + b")"
+
+
+def _fmt(fmt, args):
+    """Interpret a printf-style format over its bytes and return the result bytes.
+
+    A percent begins a directive: any flags, an optional width, an optional
+    precision after a dot, then the verb. A star for the width or precision reads
+    its value from the next operand, the way Go does, and the operand for the verb
+    follows. Everything outside a directive copies through unchanged.
+    """
+    out = bytearray()
+    i = 0
+    argi = 0
+    n = len(fmt)
+    while i < n:
+        c = fmt[i]
+        if c != 0x25:
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        if i < n and fmt[i] == 0x25:  # %%
+            out.append(0x25)
+            i += 1
+            continue
+        flags = set()
+        while i < n and fmt[i] in _FMT_FLAGS:
+            flags.add(fmt[i])
+            i += 1
+        width = None
+        if i < n and fmt[i] == 0x2A:  # *
+            width = args[argi]
+            argi += 1
+            i += 1
+            if width < 0:
+                flags.add(0x2D)
+                width = -width
+        else:
+            w, saw = 0, False
+            while i < n and fmt[i] in _FMT_DIGITS:
+                w = w * 10 + (fmt[i] - 0x30)
+                saw = True
+                i += 1
+            if saw:
+                width = w
+        prec = None
+        if i < n and fmt[i] == 0x2E:  # .
+            i += 1
+            if i < n and fmt[i] == 0x2A:
+                prec = args[argi]
+                argi += 1
+                i += 1
+            else:
+                p = 0
+                while i < n and fmt[i] in _FMT_DIGITS:
+                    p = p * 10 + (fmt[i] - 0x30)
+                    i += 1
+                prec = p
+        if i >= n:
+            break
+        verb = fmt[i]
+        i += 1
+        arg = args[argi]
+        argi += 1
+        out += _fmt_verb(verb, arg, flags, width, prec)
+    return bytes(out)
+
+
+def sprintf(fmt, *args):
+    """fmt.Sprintf: the formatted text as a Go string, which is bytes."""
+    return _fmt(fmt, args)
+
+
+def printf(fmt, *args):
+    """fmt.Printf: write the formatted text to standard output, no newline."""
+    sys.stdout.write(_fmt(fmt, args).decode("utf-8", "replace"))
+
+
+def _sprint(args):
+    """Join operands the way fmt.Sprint does: a space only between two non-strings."""
+    out = []
+    prev_str = False
+    for k, a in enumerate(args):
+        is_str = isinstance(a, (bytes, bytearray))
+        if k > 0 and not prev_str and not is_str:
+            out.append(" ")
+        out.append(go_str(a))
+        prev_str = is_str
+    return "".join(out).encode("utf-8")
+
+
+def sprint(*args):
+    """fmt.Sprint: operands in their default formats, spaces between non-strings."""
+    return _sprint(args)
+
+
+def goprint(*args):
+    """fmt.Print: like Sprint, written to standard output."""
+    sys.stdout.write(_sprint(args).decode("utf-8", "replace"))
+
+
+def sprintln(*args):
+    """fmt.Sprintln: operands space-separated with a trailing newline, as a string."""
+    return (" ".join(go_str(a) for a in args) + "\n").encode("utf-8")
 
 
 def errors_unwrap(err):
