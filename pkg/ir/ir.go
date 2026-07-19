@@ -16,8 +16,38 @@ type Module struct {
 	// Structs are the package's struct types in source order, each emitted as a
 	// Python class before the functions that use it.
 	Structs []*StructDef
+	// Interfaces are the package's interface types in source order, each emitted
+	// as a runtime-checkable Protocol class ahead of the structs and functions.
+	Interfaces []*InterfaceDef
 	// Funcs are the package's functions in source order.
 	Funcs []*Func
+}
+
+// InterfaceDef is a Go interface type lowered to a runtime-checkable Protocol.
+// The Protocol documents the method set and answers a structural isinstance, but
+// it does not take part in dispatch: hebi holds an interface value as the
+// concrete Python object itself, so recv.M(args) dispatches straight on that
+// object the way Go's dynamic dispatch does. Emitting the Protocol keeps the
+// interface's shape visible in the source and is what the milestone's exit gate
+// means by lowering interfaces to Protocols.
+type InterfaceDef struct {
+	// Name is the interface type name, which becomes the Protocol class name.
+	Name string
+	// Methods are the interface's methods, in the type checker's stable order, so
+	// the emit is a pure function of the type. An embedded interface's methods are
+	// already folded in here, so embedding needs no separate node.
+	Methods []InterfaceMethod
+}
+
+// InterfaceMethod is one method of an interface's method set, lowered to a bare
+// Protocol method whose body is an ellipsis. Params are synthetic positional
+// names, since an interface signature need not name its parameters and the
+// Protocol only needs the arity to read right.
+type InterfaceMethod struct {
+	// Name is the method name.
+	Name string
+	// Params are the positional parameter names after the receiver.
+	Params []string
 }
 
 // StructDef is a Go struct type lowered to a Python class with __slots__, a

@@ -32,13 +32,16 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 				continue
 			}
 			for _, spec := range gen.Specs {
-				sd, err := l.lowerTypeSpec(spec.(*ast.TypeSpec))
+				sd, id, err := l.lowerTypeSpec(spec.(*ast.TypeSpec))
 				if err != nil {
 					return nil, err
 				}
 				if sd != nil {
 					m.Structs = append(m.Structs, sd)
 					l.structs[sd.Name] = sd
+				}
+				if id != nil {
+					m.Interfaces = append(m.Interfaces, id)
 				}
 			}
 		}
@@ -70,19 +73,33 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 }
 
 // lowerTypeSpec lowers a single type declaration. A struct type becomes an IR
-// StructDef, the class the emitter generates. A defined non-struct type, such as
-// type Celsius float64, needs no class because its values already lower through
-// their underlying type, so it returns nil. Embedded fields and reference-typed
-// fields wait on later slices and fail loudly here.
-func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, error) {
+// StructDef, the class the emitter generates; an interface type becomes an
+// InterfaceDef, the Protocol the emitter generates. A defined non-struct,
+// non-interface type, such as type Celsius float64, needs no declaration of its
+// own because its values already lower through their underlying type, so both
+// results are nil. Embedded fields and reference-typed fields wait on later
+// slices and fail loudly here.
+func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, *ir.InterfaceDef, error) {
 	obj, ok := l.pkg.Info.Defs[ts.Name].(*types.TypeName)
 	if !ok {
-		return nil, l.errf(ts.Pos(), "type %s is not supported yet", ts.Name.Name)
+		return nil, nil, l.errf(ts.Pos(), "type %s is not supported yet", ts.Name.Name)
 	}
-	st, ok := obj.Type().Underlying().(*types.Struct)
-	if !ok {
-		return nil, nil
+	switch under := obj.Type().Underlying().(type) {
+	case *types.Struct:
+		sd, err := l.lowerStructSpec(ts, obj, under)
+		return sd, nil, err
+	case *types.Interface:
+		id, err := l.lowerInterfaceSpec(ts, under)
+		return nil, id, err
+	default:
+		return nil, nil, nil
 	}
+}
+
+// lowerStructSpec builds the StructDef for a struct type declaration: one field
+// per struct field in declaration order, and the comparability flag that decides
+// whether the class earns a field-wise __eq__.
+func (l *lowerer) lowerStructSpec(ts *ast.TypeSpec, obj *types.TypeName, st *types.Struct) (*ir.StructDef, error) {
 	sd := &ir.StructDef{Name: ts.Name.Name, Comparable: types.Comparable(obj.Type())}
 	for i := range st.NumFields() {
 		fv := st.Field(i)
@@ -97,6 +114,30 @@ func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, error) {
 		sd.Fields = append(sd.Fields, field)
 	}
 	return sd, nil
+}
+
+// lowerInterfaceSpec builds the InterfaceDef for an interface type declaration.
+// The method set comes from the type's underlying interface, which the type
+// checker has already expanded to include any embedded interface's methods, so
+// embedding contributes its methods without a separate node. Each method lowers
+// to a bare signature with synthetic positional parameter names, since a
+// Protocol only needs the method's name and arity to read as the interface's
+// shape; hebi dispatches on the concrete object, not the Protocol.
+func (l *lowerer) lowerInterfaceSpec(ts *ast.TypeSpec, it *types.Interface) (*ir.InterfaceDef, error) {
+	id := &ir.InterfaceDef{Name: ts.Name.Name}
+	for i := range it.NumMethods() {
+		method := it.Method(i)
+		sig, ok := method.Type().(*types.Signature)
+		if !ok {
+			return nil, l.errf(ts.Pos(), "interface %s method %s is not a function", ts.Name.Name, method.Name())
+		}
+		params := make([]string, sig.Params().Len())
+		for j := range params {
+			params[j] = fmt.Sprintf("p%d", j)
+		}
+		id.Methods = append(id.Methods, ir.InterfaceMethod{Name: method.Name(), Params: params})
+	}
+	return id, nil
 }
 
 // structField classifies one struct field by its type. A value-struct field

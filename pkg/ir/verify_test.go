@@ -84,6 +84,20 @@ func TestVerifyRejects(t *testing.T) {
 		{"bad return value", func(m *Module) {
 			m.Funcs[0].Body = append(m.Funcs[0].Body, &ReturnStmt{Value: &BinaryExpr{Op: "", X: &IntLit{Text: "1"}, Y: &IntLit{Text: "2"}}})
 		}, "no operator"},
+		{"nil interface", func(m *Module) { m.Interfaces = []*InterfaceDef{nil} }, "interface 0 is nil"},
+		{"empty interface name", func(m *Module) { m.Interfaces = []*InterfaceDef{{Name: ""}} }, "interface 0 has no name"},
+		{"duplicate interface", func(m *Module) {
+			m.Interfaces = []*InterfaceDef{{Name: "S"}, {Name: "S"}}
+		}, "interface S is defined more than once"},
+		{"empty interface method name", func(m *Module) {
+			m.Interfaces = []*InterfaceDef{{Name: "S", Methods: []InterfaceMethod{{Name: ""}}}}
+		}, "method 0 has no name"},
+		{"duplicate interface method", func(m *Module) {
+			m.Interfaces = []*InterfaceDef{{Name: "S", Methods: []InterfaceMethod{{Name: "M"}, {Name: "M"}}}}
+		}, "method M is declared more than once"},
+		{"empty interface method param", func(m *Module) {
+			m.Interfaces = []*InterfaceDef{{Name: "S", Methods: []InterfaceMethod{{Name: "M", Params: []string{""}}}}}
+		}, "parameter 0 has no name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -101,6 +115,22 @@ func TestVerifyRejects(t *testing.T) {
 				t.Errorf("error = %q, want it to contain %q", err, tt.wantSub)
 			}
 		})
+	}
+}
+
+// TestVerifyAcceptsInterfaceSurface checks that a well-formed interface set, one
+// with a parameterless method, one with a parameterised method, and an empty
+// interface, passes structural verification alongside the functions.
+func TestVerifyAcceptsInterfaceSurface(t *testing.T) {
+	t.Parallel()
+	m := hello()
+	m.Interfaces = []*InterfaceDef{
+		{Name: "Speaker", Methods: []InterfaceMethod{{Name: "Speak"}}},
+		{Name: "Sink", Methods: []InterfaceMethod{{Name: "Put", Params: []string{"p0"}}}},
+		{Name: "Any"},
+	}
+	if err := Verify(m); err != nil {
+		t.Fatalf("Verify rejected a well-formed interface surface: %v", err)
 	}
 }
 

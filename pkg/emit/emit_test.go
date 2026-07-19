@@ -82,6 +82,94 @@ if __name__ == "__main__":
 	}
 }
 
+// TestModuleInterface covers the Protocol classes an interface set lowers to:
+// the typing import sorts before the runtime shim, each interface emits a
+// runtime-checkable Protocol, a method keeps its synthetic positional parameter,
+// two methods on one Protocol are separated by a blank line, and an empty
+// interface has a single pass body. The Protocols emit ahead of the function.
+func TestModuleInterface(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package: "main",
+		Interfaces: []*ir.InterfaceDef{
+			{Name: "RW", Methods: []ir.InterfaceMethod{
+				{Name: "Read"},
+				{Name: "Write", Params: []string{"p0"}},
+			}},
+			{Name: "Any"},
+		},
+		Funcs: []*ir.Func{{
+			Name: "main",
+			Body: []ir.Stmt{&ir.ExprStmt{X: &ir.Intrinsic{Name: "println", Args: []ir.Expr{&ir.IntLit{Text: "1"}}}}},
+		}},
+	}
+	want := `from typing import Protocol, runtime_checkable
+
+import _hebirt
+
+
+@runtime_checkable
+class RW(Protocol):
+    def Read(self): ...
+
+    def Write(self, p0): ...
+
+
+@runtime_checkable
+class Any(Protocol):
+    pass
+
+
+def main():
+    _hebirt.println(1)
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// TestModuleInterfaceNoShim covers a module with an interface but no intrinsic:
+// the header is the typing import alone, so no runtime import appears, and the
+// two blank lines before the first Protocol still hold.
+func TestModuleInterfaceNoShim(t *testing.T) {
+	t.Parallel()
+	m := &ir.Module{
+		Package:    "main",
+		Interfaces: []*ir.InterfaceDef{{Name: "Marker"}},
+		Funcs:      []*ir.Func{{Name: "main"}},
+	}
+	want := `from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class Marker(Protocol):
+    pass
+
+
+def main():
+    pass
+
+
+if __name__ == "__main__":
+    main()
+`
+	got, err := Module(m)
+	if err != nil {
+		t.Fatalf("Module: %v", err)
+	}
+	if got != want {
+		t.Errorf("emit mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 // TestModuleStruct covers the class a struct lowers to and the new nodes that
 // use it: the __slots__ tuple with the single-field trailing comma, a scalar
 // field defaulting to its zero and a value-struct field defaulting to None with

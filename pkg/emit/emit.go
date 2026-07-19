@@ -75,12 +75,35 @@ func maskHelper(bits int, signed bool) string {
 // not yet support.
 func Module(m *ir.Module) (string, error) {
 	var b strings.Builder
-	if usesShim(m) {
-		fmt.Fprintf(&b, "import %s\n\n\n", shim.Name)
+	imports := false
+	if len(m.Interfaces) > 0 {
+		// A module with any interface declares Protocol classes, so it imports the
+		// Protocol base and its runtime-checkable decorator from typing, a standard
+		// library import that sorts before the first-party runtime shim.
+		b.WriteString("from typing import Protocol, runtime_checkable\n")
+		imports = true
 	}
-	// Structs emit first as classes, in source order, so a function that
-	// constructs one refers to a name already bound.
+	if usesShim(m) {
+		if imports {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "import %s\n", shim.Name)
+		imports = true
+	}
+	if imports {
+		b.WriteString("\n\n")
+	}
+	// Interfaces emit first as Protocol classes, then structs as classes, both in
+	// source order, so a function or class that names one refers to a name already
+	// bound.
 	wrote := false
+	for _, id := range m.Interfaces {
+		if wrote {
+			b.WriteString("\n\n")
+		}
+		emitInterface(&b, id)
+		wrote = true
+	}
 	for _, sd := range m.Structs {
 		if wrote {
 			b.WriteString("\n\n")
@@ -366,6 +389,34 @@ func capturesUseShim(caps []ir.Capture) bool {
 func emitFunc(b *strings.Builder, fn *ir.Func) error {
 	fmt.Fprintf(b, "def %s(%s):\n", fn.Name, strings.Join(fn.Params, ", "))
 	return emitBlock(b, fn.Body, 1)
+}
+
+// emitInterface writes the runtime-checkable Protocol a Go interface lowers to:
+// the @runtime_checkable decorator, a class deriving Protocol, and one bare
+// method per interface method whose body is an ellipsis. The Protocol carries no
+// annotations, matching the annotation-free code the emitter produces elsewhere,
+// so it documents the method set and answers a structural isinstance without
+// taking part in dispatch. An empty interface has no methods, so its body is a
+// single pass, and it accepts every value the way Go's any does.
+func emitInterface(b *strings.Builder, id *ir.InterfaceDef) {
+	b.WriteString("@runtime_checkable\n")
+	fmt.Fprintf(b, "class %s(Protocol):\n", id.Name)
+	if len(id.Methods) == 0 {
+		writeIndent(b, 1)
+		b.WriteString("pass\n")
+		return
+	}
+	for i, method := range id.Methods {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		writeIndent(b, 1)
+		fmt.Fprintf(b, "def %s(self", method.Name)
+		for _, p := range method.Params {
+			fmt.Fprintf(b, ", %s", p)
+		}
+		b.WriteString("): ...\n")
+	}
 }
 
 // emitStruct writes the Python class a Go struct lowers to: a __slots__ tuple of

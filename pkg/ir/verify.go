@@ -69,6 +69,34 @@ func Verify(m *Module) error {
 			}
 		}
 	}
+	ifaces := make(map[string]bool, len(m.Interfaces))
+	for i, id := range m.Interfaces {
+		if id == nil {
+			return fmt.Errorf("ir: interface %d is nil", i)
+		}
+		if id.Name == "" {
+			return fmt.Errorf("ir: interface %d has no name", i)
+		}
+		if ifaces[id.Name] || structs[id.Name] {
+			return fmt.Errorf("ir: interface %s is defined more than once", id.Name)
+		}
+		ifaces[id.Name] = true
+		methods := make(map[string]bool, len(id.Methods))
+		for j, method := range id.Methods {
+			if method.Name == "" {
+				return fmt.Errorf("ir: interface %s: method %d has no name", id.Name, j)
+			}
+			if methods[method.Name] {
+				return fmt.Errorf("ir: interface %s: method %s is declared more than once", id.Name, method.Name)
+			}
+			methods[method.Name] = true
+			for k, p := range method.Params {
+				if p == "" {
+					return fmt.Errorf("ir: interface %s: method %s: parameter %d has no name", id.Name, method.Name, k)
+				}
+			}
+		}
+	}
 	seen := make(map[string]bool, len(m.Funcs))
 	for i, fn := range m.Funcs {
 		if fn == nil {
