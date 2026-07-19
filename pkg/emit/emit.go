@@ -36,6 +36,10 @@ var binOps = map[string]string{
 	"||": "or",
 	"<<": "<<",
 	">>": ">>",
+	// Floor division and remainder, emitted only for an unsigned operand, whose
+	// non-negative value makes Python's // and % agree with Go's truncation.
+	"//": "//",
+	"%":  "%",
 	// Identity for the interface-to-nil check: an interface value is None when it
 	// is the nil interface, so err == nil lowers to err is None and err != nil to
 	// err is not None, the faithful analogue of Go's nil interface identity test.
@@ -203,15 +207,25 @@ func stmtUnwinds(s ir.Stmt) bool {
 	return false
 }
 
-// exprUnwinds reports whether evaluating an expression can raise a GoPanic. The
-// one-result type assertion is the expression that does, through its _type_assert
-// intrinsic, which panics when the interface does not hold the asserted type; the
-// comma-ok _type_assert_ok never panics. Every other form only recurses into its
-// sub-expressions to find one that can.
+// panicIntrinsics names the runtime intrinsics that raise a GoPanic on their own,
+// so an expression carrying one can crash the Go way even when its arguments cannot.
+// The one-result type assertion panics when the interface does not hold the asserted
+// type, and integer division and remainder panic on a zero divisor; the comma-ok
+// _type_assert_ok and the float _fdiv never panic.
+var panicIntrinsics = map[string]bool{
+	"_type_assert": true,
+	"_idiv":        true,
+	"_imod":        true,
+	"_quo":         true,
+}
+
+// exprUnwinds reports whether evaluating an expression can raise a GoPanic. A
+// handful of runtime intrinsics panic on their own, listed in panicIntrinsics, and
+// every other form only recurses into its sub-expressions to find one that can.
 func exprUnwinds(e ir.Expr) bool {
 	switch e := e.(type) {
 	case *ir.Intrinsic:
-		return e.Name == "_type_assert" || argsUnwind(e.Args)
+		return panicIntrinsics[e.Name] || argsUnwind(e.Args)
 	case *ir.BinaryExpr:
 		return exprUnwinds(e.X) || exprUnwinds(e.Y)
 	case *ir.UnaryExpr:

@@ -3701,6 +3701,9 @@ func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	if e.Op == token.QUO || e.Op == token.REM {
+		return l.lowerDivMod(e, x, y)
+	}
 	op := e.Op.String()
 	if l.isInterfaceNilCompare(e) {
 		// An interface value is None when it is the nil interface, so the check is
@@ -3986,6 +3989,141 @@ func (l *lowerer) narrow(e ast.Expr, op token.Token, inner ir.Expr) ir.Expr {
 		return inner
 	}
 	return &ir.Mask{Bits: bits, Signed: signed, X: inner}
+}
+
+// numClass is the numeric kind of a division or remainder operand, which decides
+// the Python form the operator lowers to. A type parameter that the constraint
+// walk cannot resolve to a single kind, and one whose set mixes integer and float,
+// is numMixed and dispatches on the runtime value.
+type numClass int
+
+const (
+	numOther numClass = iota
+	numSignedInt
+	numUnsignedInt
+	numFloat
+	numMixed
+)
+
+// lowerDivMod lowers the two operators whose Python spelling depends on the operand
+// type, division and remainder. Go integer division truncates toward zero and a Go
+// remainder takes the sign of the dividend, neither of which Python's // and % give
+// for a negative operand, so a signed integer routes through the _idiv and _imod
+// helpers and its result renarrows to the operand width; an unsigned integer is a
+// non-negative Python int and uses the bare floor operators. Float division routes
+// through _fdiv for Go's infinity and NaN on a zero divisor. When the operand is an
+// erased type parameter the form comes from the constraint's type set: a uniform
+// set picks the exact form, and a set that mixes integer and float routes division
+// through the runtime _quo dispatcher, since the one erased definition cannot choose
+// statically.
+func (l *lowerer) lowerDivMod(e *ast.BinaryExpr, x, y ir.Expr) (ir.Expr, error) {
+	t := l.pkg.Info.TypeOf(e)
+	class := l.numericClass(t)
+	if e.Op == token.REM {
+		switch class {
+		case numUnsignedInt:
+			return &ir.BinaryExpr{Op: "%", X: x, Y: y}, nil
+		case numSignedInt, numMixed:
+			return &ir.Intrinsic{Name: "_imod", Args: []ir.Expr{x, y}}, nil
+		default:
+			return nil, l.errf(e.Pos(), "remainder on %s is not supported yet", t)
+		}
+	}
+	switch class {
+	case numFloat:
+		return l.float32Wrap(e, &ir.Intrinsic{Name: "_fdiv", Args: []ir.Expr{x, y}}), nil
+	case numUnsignedInt:
+		return &ir.BinaryExpr{Op: "//", X: x, Y: y}, nil
+	case numSignedInt:
+		idiv := &ir.Intrinsic{Name: "_idiv", Args: []ir.Expr{x, y}}
+		if bits, signed, ok := intWidth(t); ok && signed {
+			return &ir.Mask{Bits: bits, Signed: true, X: idiv}, nil
+		}
+		return idiv, nil
+	case numMixed:
+		return &ir.Intrinsic{Name: "_quo", Args: []ir.Expr{x, y}}, nil
+	default:
+		return nil, l.errf(e.Pos(), "division on %s is not supported yet", t)
+	}
+}
+
+// numericClass classifies a division or remainder operand type. A concrete basic
+// type maps straight to its kind, and a type parameter is classified from its
+// constraint's type set.
+func (l *lowerer) numericClass(t types.Type) numClass {
+	if tp, ok := t.(*types.TypeParam); ok {
+		return l.constraintNumericClass(tp)
+	}
+	basic, ok := t.Underlying().(*types.Basic)
+	if !ok {
+		return numOther
+	}
+	info := basic.Info()
+	switch {
+	case info&types.IsFloat != 0:
+		return numFloat
+	case info&types.IsUnsigned != 0:
+		return numUnsignedInt
+	case info&types.IsInteger != 0:
+		return numSignedInt
+	default:
+		return numOther
+	}
+}
+
+// constraintNumericClass classifies a type parameter from its constraint's type
+// set, walked best effort through embedded interfaces and unions. A set that is all
+// signed integer, all unsigned integer, or all float picks that exact form. A set
+// that mixes integer and float, or one the walk cannot fully resolve, is numMixed,
+// which is always correct since it lowers to a helper that dispatches on the runtime
+// value. A set mixing signed and unsigned integers stays on the signed helpers,
+// which are correct for both because an unsigned value is a non-negative Python int.
+func (l *lowerer) constraintNumericClass(tp *types.TypeParam) numClass {
+	var seenInt, seenUint, seenFloat, seenOther bool
+	var walk func(t types.Type)
+	walk = func(t types.Type) {
+		switch u := t.Underlying().(type) {
+		case *types.Interface:
+			for i := 0; i < u.NumEmbeddeds(); i++ {
+				walk(u.EmbeddedType(i))
+			}
+		case *types.Union:
+			for i := 0; i < u.Len(); i++ {
+				walk(u.Term(i).Type())
+			}
+		case *types.Basic:
+			info := u.Info()
+			switch {
+			case info&types.IsFloat != 0:
+				seenFloat = true
+			case info&types.IsUnsigned != 0:
+				seenUint = true
+			case info&types.IsInteger != 0:
+				seenInt = true
+			default:
+				seenOther = true
+			}
+		default:
+			seenOther = true
+		}
+	}
+	walk(tp.Constraint())
+	switch {
+	case seenOther:
+		return numMixed
+	case seenFloat && (seenInt || seenUint):
+		return numMixed
+	case seenFloat:
+		return numFloat
+	case seenInt && seenUint:
+		return numSignedInt
+	case seenUint:
+		return numUnsignedInt
+	case seenInt:
+		return numSignedInt
+	default:
+		return numMixed
+	}
 }
 
 // float32Wrap wraps inner in the single-precision helper when e's type is
