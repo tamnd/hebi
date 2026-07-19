@@ -299,6 +299,19 @@ func verifyExpr(where string, e Expr) error {
 			return err
 		}
 		return verifyArgs(where, e.Args)
+	case *MethodValue:
+		if e.Name == "" {
+			return fmt.Errorf("ir: %s binds a method with no name", where)
+		}
+		return verifyExpr(where+": receiver", e.Recv)
+	case *MethodExpr:
+		if e.Recv == "" {
+			return fmt.Errorf("ir: %s is a method expression with no type", where)
+		}
+		if e.Name == "" {
+			return fmt.Errorf("ir: %s is a method expression with no name", where)
+		}
+		return nil
 	case *Intrinsic:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s is an intrinsic with no name", where)
