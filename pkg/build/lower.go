@@ -4833,6 +4833,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "strings"); ok {
 			return l.lowerStringsFunc(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "strconv"); ok {
+			return l.lowerStrconvFunc(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
 		}
@@ -5381,6 +5384,45 @@ var stringsIntrinsics = map[string]string{
 	"Replace":      "str_replace",
 	"ReplaceAll":   "str_replace_all",
 	"EqualFold":    "str_equal_fold",
+}
+
+// strconvIntrinsics maps a strconv package function to the runtime shim that
+// carries its Go semantics. The parse functions keep Go's (value, error) shape,
+// returning a value and a *strconv.NumError the shim builds on a bad input, and
+// the format functions render an integer, a float, or a bool the way strconv
+// does. The append family and the hex-float verbs wait for their own slice, and
+// a function outside this table fails loudly.
+var strconvIntrinsics = map[string]string{
+	"Atoi":        "strconv_atoi",
+	"Itoa":        "strconv_itoa",
+	"ParseInt":    "strconv_parse_int",
+	"ParseUint":   "strconv_parse_uint",
+	"FormatInt":   "strconv_format_int",
+	"FormatUint":  "strconv_format_uint",
+	"ParseBool":   "strconv_parse_bool",
+	"FormatBool":  "strconv_format_bool",
+	"ParseFloat":  "strconv_parse_float",
+	"FormatFloat": "strconv_format_float",
+	"Quote":       "strconv_quote",
+}
+
+// lowerStrconvFunc lowers a call to the standard strconv package by mapping the
+// function to its runtime shim through strconvIntrinsics. No mapped function
+// takes a spread argument, so one fails loudly, as does a function the table
+// does not carry.
+func (l *lowerer) lowerStrconvFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "strconv.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := strconvIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "strconv.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
 }
 
 // lowerStringsFunc lowers a call to the standard strings package by mapping the
