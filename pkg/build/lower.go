@@ -2105,15 +2105,16 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		return l.refZero(key, pos)
 	}
 	if st, ok := t.Underlying().(*types.Struct); ok {
-		if st.NumFields() == 0 {
-			// An empty struct carries no fields, so its zero value holds nothing and
-			// every value of it is equal. It lowers to the empty tuple regardless of
-			// whether the type is named or the anonymous struct{}, which is what a
-			// signal channel sends and what struct{}{} constructs.
-			return &ir.EmptyStruct{}, nil
-		}
 		named, ok := t.(*types.Named)
 		if !ok {
+			if st.NumFields() == 0 {
+				// The anonymous empty struct, struct{}, carries no fields, so its value
+				// holds nothing and every value of it is equal. It lowers to the empty
+				// tuple, which is what a signal channel sends and struct{}{} constructs. A
+				// named empty struct keeps its class, since it can carry methods that must
+				// still dispatch, so only the anonymous case takes the tuple.
+				return &ir.EmptyStruct{}, nil
+			}
 			return nil, l.errf(pos, "zero value of an anonymous struct is not supported yet")
 		}
 		return &ir.StructLit{Type: named.Obj().Name()}, nil
@@ -4048,10 +4049,13 @@ func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 		return l.lowerMapLit(e, mp)
 	}
 	if st, ok := t.Underlying().(*types.Struct); ok && st.NumFields() == 0 {
-		// An empty struct literal, struct{}{} or a named empty struct's Type{}, holds
-		// nothing, so it lowers to the empty tuple, the same value its zero takes. This
-		// keeps a zero and a literal of the same empty struct comparing equal.
-		return &ir.EmptyStruct{}, nil
+		if _, isNamed := t.(*types.Named); !isNamed {
+			// An anonymous empty struct literal, struct{}{}, holds nothing, so it lowers
+			// to the empty tuple, the same value its zero takes, which keeps a zero and a
+			// literal comparing equal. A named empty struct's literal keeps its class so
+			// its methods dispatch, so it falls through to the constructor path below.
+			return &ir.EmptyStruct{}, nil
+		}
 	}
 	named, ok := t.(*types.Named)
 	if !ok {

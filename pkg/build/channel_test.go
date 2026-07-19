@@ -233,3 +233,29 @@ func main() {
 `
 	assertProgramMatchesGo(t, src)
 }
+
+// TestNamedEmptyStructMethod checks that a named empty struct keeps its class so
+// its methods still dispatch, the regression the anonymous-only empty struct
+// lowering guards against: only struct{} becomes the empty tuple, while a named
+// type struct{} with a method stays an object, held in an interface and called.
+func TestNamedEmptyStructMethod(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+import "fmt"
+
+type speaker interface{ Speak() string }
+
+type dog struct{}
+
+func (d dog) Speak() string { return "woof" }
+
+func main() {
+	var s speaker = dog{}
+	fmt.Println(s.Speak())
+	var z dog
+	fmt.Println(z.Speak())
+}
+`
+	assertProgramMatchesGo(t, src)
+}
