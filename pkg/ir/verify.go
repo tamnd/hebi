@@ -172,12 +172,29 @@ func verifyStmt(where string, s Stmt) error {
 		}
 		return verifyExpr(where+": value", s.Value)
 	case *DeferBlock:
+		for i, n := range s.Results {
+			if n == "" {
+				return fmt.Errorf("ir: %s: defer result %d has no name", where, i)
+			}
+		}
+		if !s.Reshape && len(s.Results) != 0 {
+			return fmt.Errorf("ir: %s is a plain defer block carrying result names", where)
+		}
 		return verifyBlock(where+": defer body", s.Body)
 	case *DeferPush:
 		if err := verifyExpr(where+": deferred call", s.Func); err != nil {
 			return err
 		}
 		return verifyArgs(where, s.Args)
+	case *DeferReturn:
+		for i, n := range s.Results {
+			if n == "" {
+				return fmt.Errorf("ir: %s: defer return result %d has no name", where, i)
+			}
+		}
+		return nil
+	case *Panic:
+		return verifyExpr(where+": panic value", s.Value)
 	case *IfStmt:
 		if err := verifyExpr(where+": if condition", s.Cond); err != nil {
 			return err

@@ -372,7 +372,7 @@ func TestMapHelpers(t *testing.T) {
 		"try:\n" +
 		"    r.NIL_MAP['x'] = 1\n" +
 		"    print('no panic')\n" +
-		"except Exception as e:\n" +
+		"except r.GoPanic as e:\n" +
 		"    print(e)"
 	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
 	cmd.Dir = dir
@@ -460,12 +460,12 @@ func TestCellAndNilHelpers(t *testing.T) {
 		"try:\n" +
 		"    r.NIL_PTR.get()\n" +
 		"    print('no panic')\n" +
-		"except Exception as e:\n" +
+		"except r.GoPanic as e:\n" +
 		"    print(e)\n" +
 		"try:\n" +
 		"    r.NIL_PTR.set(1)\n" +
 		"    print('no panic')\n" +
-		"except Exception as e:\n" +
+		"except r.GoPanic as e:\n" +
 		"    print(e)"
 	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
 	cmd.Dir = dir
@@ -476,8 +476,8 @@ func TestCellAndNilHelpers(t *testing.T) {
 	want := "3\n10\n" +
 		"True False\n" +
 		"True False\n" +
-		"invalid memory address or nil pointer dereference\n" +
-		"invalid memory address or nil pointer dereference\n"
+		"runtime error: invalid memory address or nil pointer dereference\n" +
+		"runtime error: invalid memory address or nil pointer dereference\n"
 	if got := string(out); got != want {
 		t.Errorf("cell helper output = %q, want %q", got, want)
 	}

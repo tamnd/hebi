@@ -7,7 +7,9 @@ a time as later milestones add language surface.
 """
 
 import decimal
+import os
 import struct
+import sys
 
 
 def go_str(value):
@@ -251,12 +253,12 @@ class Slice:
         if isinstance(i, slice):
             return _subslice(self, i)
         if i < 0 or i >= self.length:
-            raise _runtime_error("index out of range")
+            raise _runtime_error("index out of range [%d] with length %d" % (i, self.length))
         return self.array[self.offset + i]
 
     def __setitem__(self, i, v):
         if i < 0 or i >= self.length:
-            raise _runtime_error("index out of range")
+            raise _runtime_error("index out of range [%d] with length %d" % (i, self.length))
         self.array[self.offset + i] = v
 
     def __len__(self):
@@ -378,14 +380,179 @@ def _slice_copy(dst, src):
     return n
 
 
-def _runtime_error(msg):
-    """Build the exception a failed slice bounds check raises.
+# Panic machinery. Go has two failure mechanisms: an error is an ordinary value a
+# function returns, and a panic is a stack-unwinding event that runs deferred
+# calls on the way out and is caught only by recover inside one. An error stays a
+# value in emitted Python, but a panic is the one thing that unwinds a stack, so
+# it lowers to a raised exception, GoPanic, whose propagation up the Python stack
+# mirrors the panic's up the goroutine stack.
 
-    The full panic model arrives in a later milestone; for now the helper names
-    the failure the Go way and returns an exception the caller raises, so an
-    out-of-range index or reslice stops loudly rather than reading a wrong slot.
+
+class GoPanic(BaseException):
+    """A Go panic in flight, carrying the panicked value verbatim.
+
+    It derives from BaseException, not Exception, so a stray except Exception in
+    hand-written Python that wraps compiled code does not swallow a Go panic, the
+    same reasoning that puts KeyboardInterrupt and SystemExit under BaseException.
+    The value is whatever Go panicked with, handed back unchanged by recover, and
+    the recovered flag lets a function's deferred-call harness tell a consumed
+    panic from one still unwinding.
     """
-    return IndexError(msg)
+
+    __slots__ = ("value", "recovered")
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.value = value
+        self.recovered = False
+
+    def __str__(self):
+        return panic_message(self.value)
+
+
+class _RuntimeError:
+    """A Go runtime error, the value a runtime panic carries.
+
+    Its message reads "runtime error: " followed by the specific failure, exactly
+    as Go's runtime.Error values print, so a recover sees a message that matches
+    the oracle and an unrecovered panic renders the same banner line go run does.
+    """
+
+    __slots__ = ("_msg",)
+
+    def __init__(self, msg):
+        self._msg = msg
+
+    def Error(self):
+        return "runtime error: " + self._msg
+
+    def __str__(self):
+        return self.Error()
+
+
+class _PlainError:
+    """A runtime panic whose message carries no "runtime error:" prefix.
+
+    A few runtime panics, the nil map assignment among them, are plain-string
+    panics rather than runtime.Error values, so Go prints the bare message, which
+    this type reproduces for those cases.
+    """
+
+    __slots__ = ("_msg",)
+
+    def __init__(self, msg):
+        self._msg = msg
+
+    def Error(self):
+        return self._msg
+
+    def __str__(self):
+        return self._msg
+
+
+class PanicNilError:
+    """The error Go 1.21 panics with for panic(nil).
+
+    Since Go 1.21 panic(nil) panics with a *runtime.PanicNilError rather than a
+    literal nil, so recover always returns non-nil when a panic occurred. Under an
+    older go.mod hebi panics with None instead, reproducing the old ambiguity for
+    a module that opted into it.
+    """
+
+    __slots__ = ()
+
+    def Error(self):
+        return "panic called with nil argument"
+
+    def __str__(self):
+        return self.Error()
+
+
+def _runtime_error(msg):
+    """Return the GoPanic a runtime check raises, carrying a runtime error value.
+
+    A failed bounds check or a nil pointer dereference panics the Go way: the
+    returned GoPanic carries a _RuntimeError whose Error reads "runtime error: "
+    and msg, so a recover sees Go's message and an unrecovered one prints it in the
+    banner.
+    """
+    return GoPanic(_RuntimeError(msg))
+
+
+def _nil_map_error():
+    """Return the GoPanic a write to a nil map raises, a plain-message runtime panic."""
+    return GoPanic(_PlainError("assignment to entry in nil map"))
+
+
+def _recover():
+    """Return the in-flight panic value, or None when no Go panic is being handled.
+
+    It reads the exception currently being handled from sys.exc_info, and when that
+    is a GoPanic not yet consumed it marks the panic recovered so the deferred-call
+    harness stops the unwind and hands the value back. Called with no panic in
+    flight, or on an already-consumed one, it returns None, matching Go's recover
+    returning nil outside a panicking deferred call.
+    """
+    exc = sys.exc_info()[1]
+    if isinstance(exc, GoPanic) and not exc.recovered:
+        exc.recovered = True
+        return exc.value
+    return None
+
+
+def _run_defers(defers):
+    """Run the recorded deferred calls last-in-first-out, draining the list as it goes.
+
+    Each call is popped before it runs, so a deferred call that itself panics leaves
+    only the remaining, not-yet-run calls behind, and the handler that catches the
+    new panic runs those and no more, matching Go where the rest of the deferred
+    calls still run as a panic climbs the stack. Draining also makes a second run a
+    no-op, so a normal return and a panic handler never double-run a call.
+    """
+    while defers:
+        fn, args = defers.pop()
+        fn(*args)
+
+
+def panic_message(value):
+    """Render a panic value the way Go's runtime prints it in the crash banner.
+
+    A nil panic reads as Go 1.21's message, an error renders through Error, a Go
+    string (Python bytes) decodes to its text, a Python string prints itself, a
+    Stringer renders through String, and any other value falls back to Go's default
+    format, so the banner line matches go run for the common panic kinds.
+    """
+    if value is None:
+        return "panic called with nil argument"
+    err = getattr(value, "Error", None)
+    if callable(err):
+        return err()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        return value
+    s = getattr(value, "String", None)
+    if callable(s):
+        return s()
+    return go_str(value)
+
+
+def _crash(p):
+    """Print the Go panic banner to stderr and exit with status 2.
+
+    An unrecovered panic that runs off the top of main crashes the program the Go
+    way: the banner reads "panic: " and the rendered value, a goroutine header
+    follows, and the process exits with status 2. os._exit is deliberate so no
+    finally or atexit handler runs, matching Go's abrupt crash rather than a
+    catchable SystemExit. Standard output is flushed first, since os._exit skips
+    the buffer flush and a deferred call that printed on the way out would
+    otherwise lose its output.
+    """
+    sys.stdout.flush()
+    sys.stderr.write("panic: " + panic_message(p.value) + "\n\n")
+    sys.stderr.write("goroutine 1 [running]:\n")
+    sys.stderr.flush()
+    os._exit(2)
 
 
 # String helpers. A Go string is Python bytes, so byte indexing, length, and
@@ -473,7 +640,7 @@ class _NilMap:
         return ()
 
     def __setitem__(self, key, value):
-        raise _runtime_error("assignment to entry in nil map")
+        raise _nil_map_error()
 
 
 NIL_MAP = _NilMap()

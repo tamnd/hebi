@@ -258,11 +258,43 @@ type DerefSet struct {
 	Value Expr
 }
 
-// DeferBlock wraps the statements of a function that runs deferred calls. It
-// lowers to a _defers list, a try over Body, and a finally that runs the pushed
-// calls in last-in-first-out order, matching Go's rule that a function's deferred
-// calls run in reverse of the order they were deferred as the function returns.
-type DeferBlock struct{ Body []Stmt }
+// DeferBlock wraps the statements of a function that runs deferred calls. In its
+// plain form it lowers to a _defers list, a try over Body, and a finally that
+// runs the pushed calls in last-in-first-out order, matching Go's rule that a
+// function's deferred calls run in reverse of the order they were deferred as the
+// function returns.
+//
+// When Reshape is set the block instead lowers to a try over Body with an except
+// that catches an escaping panic, runs the deferred calls, and re-raises only if
+// none of them recovered, and each return in Body has already been rewritten to a
+// DeferReturn that runs the deferred calls before it hands back Results. This is
+// the shape a function needs when a deferred call reads or changes a named result
+// or calls recover, since the deferred calls must run between the return's value
+// assignment and the actual handing back of that value, which the plain finally
+// cannot express. Results names the function's result variables, which the reshape
+// initialises to their zero values before the try so a panic path can still return
+// them.
+type DeferBlock struct {
+	Body    []Stmt
+	Reshape bool
+	Results []string
+}
+
+// Panic raises a Go panic carrying Value, which lowers to raising the runtime's
+// GoPanic exception. The panic unwinds the Python stack the way it unwinds the
+// goroutine stack, running deferred calls through each reshaped DeferBlock it
+// passes and stopping only where a deferred call recovers it.
+type Panic struct{ Value Expr }
+
+// DeferReturn is the return of a reshaped deferring function: it runs the recorded
+// deferred calls and then hands back the result variables. Results names those
+// variables, empty for a function with no results, one name for a single result,
+// or several for a multiple-return, and the emitter renders the handoff as a bare
+// return, a single name, or a tuple. A plain return cannot express this because
+// Python evaluates a return's expression before the finally runs, so a deferred
+// call's change to a result would not be seen; assigning the results first and
+// running the deferred calls here lets that change land before the value is read.
+type DeferReturn struct{ Results []string }
 
 // DeferPush records a deferred call at the point the defer statement runs, which
 // lowers to appending the callable and its argument tuple to the _defers list.
@@ -298,6 +330,8 @@ func (*SetIndex) isStmt()        {}
 func (*DerefSet) isStmt()        {}
 func (*DeferBlock) isStmt()      {}
 func (*DeferPush) isStmt()       {}
+func (*DeferReturn) isStmt()     {}
+func (*Panic) isStmt()           {}
 func (*IfStmt) isStmt()          {}
 func (*ForStmt) isStmt()         {}
 func (*ForRange) isStmt()        {}
