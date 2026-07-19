@@ -483,6 +483,27 @@ class PanicNilError:
         return self.Error()
 
 
+class TypeAssertionError:
+    """Go's *runtime.TypeAssertionError, the value a failed type assertion panics with.
+
+    Its Error text reads "interface conversion: ..." the way Go's does, so a
+    recovered assertion failure hands back the message go run prints. The message
+    is a Go string, carried as bytes like every other, so Error returns the bytes
+    and go_str decodes them when the value is printed.
+    """
+
+    __slots__ = ("_msg",)
+
+    def __init__(self, msg):
+        self._msg = msg
+
+    def Error(self):
+        return self._msg
+
+    def __str__(self):
+        return go_str(self._msg)
+
+
 class _StringError:
     """The error value errors.New returns, a string wrapped as an error.
 
@@ -960,6 +981,79 @@ def _map_lookup(m, k, zero):
     if k in m:
         return (m[k], True)
     return (zero, False)
+
+
+def _assert_pass(v, typ, structural):
+    """Report whether v's dynamic type satisfies a type assertion x.(T) to typ.
+
+    A concrete target needs an exact dynamic-type match, so type(v) is typ, which
+    also keeps a Go bool from passing an int assertion since a Python bool is an
+    int subtype that isinstance would wave through. An interface target needs
+    structural satisfaction, so isinstance against its runtime_checkable Protocol.
+    A nil interface, None, holds no dynamic type and satisfies neither.
+    """
+    if v is None:
+        return False
+    if structural:
+        return isinstance(v, typ)
+    return type(v) is typ
+
+
+def _type_assert(v, typ, structural, iface_name, target_name, methods):
+    """Go's one-result assertion x.(T): return the value when it holds a T, else panic.
+
+    The panic carries a TypeAssertionError whose message matches Go's, so a recover
+    reads the same text and an unrecovered failure crashes with Go's exit status.
+    """
+    if _assert_pass(v, typ, structural):
+        return v
+    raise GoPanic(TypeAssertionError(_assert_fail_message(v, structural, iface_name, target_name, methods)))
+
+
+def _type_assert_ok(v, typ, structural, zero):
+    """Go's comma-ok assertion v, ok := x.(T): (value, True) on a hit, (zero, False) on a miss."""
+    if _assert_pass(v, typ, structural):
+        return (v, True)
+    return (zero, False)
+
+
+def _assert_fail_message(v, structural, iface_name, target_name, methods):
+    """Build a failed assertion's message as bytes, a Go string like every other.
+
+    Go names the source interface, the dynamic type it held, and the target that
+    did not match. A concrete target that does not match reads "is T, not U". An
+    interface target the value fails to implement reads "is not U: missing method M",
+    naming the first method of the target the value lacks, so the message ends the
+    way Go's does for a structural miss.
+    """
+    if v is None:
+        return b"interface conversion: " + iface_name + b" is nil, not " + target_name
+    got = _go_type_name(v)
+    if structural:
+        missing = _first_missing_method(v, methods)
+        return b"interface conversion: " + got + b" is not " + target_name + b": missing method " + missing
+    return b"interface conversion: " + iface_name + b" is " + got + b", not " + target_name
+
+
+def _first_missing_method(v, methods):
+    """Return the first interface method name, as bytes, the value does not provide."""
+    for name in methods:
+        if not callable(getattr(v, name.decode("utf-8"), None)):
+            return name
+    return b""
+
+
+def _go_type_name(v):
+    """Best-effort Go type name for a dynamic value, used only in a failed assertion's message."""
+    if isinstance(v, bool):
+        return b"bool"
+    if isinstance(v, int):
+        return b"int"
+    if isinstance(v, float):
+        return b"float64"
+    if isinstance(v, bytes):
+        return b"string"
+    return type(v).__name__.encode("utf-8")
 
 
 def _map_delete(m, k):

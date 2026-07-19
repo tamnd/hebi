@@ -1941,6 +1941,9 @@ func (l *lowerer) lowerMultiAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 			return l.lowerUnpackCall(s, call)
 		}
 		if len(s.Lhs) == 2 {
+			if ta, ok := astUnparen(s.Rhs[0]).(*ast.TypeAssertExpr); ok {
+				return l.lowerTypeAssertCommaOk(s, ta)
+			}
 			return l.lowerMapCommaOk(s)
 		}
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
@@ -2048,6 +2051,50 @@ func (l *lowerer) lowerMapCommaOk(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	}}
 	if valName != "_" {
 		if clone := l.cloneForType(mp.Elem(), &ir.Ident{Name: valName}); clone != nil {
+			out = append(out, &ir.AssignStmt{Name: valName, Value: clone})
+		}
+	}
+	return out, nil
+}
+
+// lowerTypeAssertCommaOk lowers the two-value assertion v, ok := x.(T), which binds
+// the value and a boolean that is true when the interface held a T. It becomes a
+// tuple assignment from the _type_assert_ok helper, which returns the value and true
+// on a hit and the target's zero value and false on a miss, so ok distinguishes a
+// present zero from a type mismatch. A struct or array value target clones the bound
+// value afterward, the copy extracting a value out of the interface owes, matching
+// the single-result form and the map comma-ok read.
+func (l *lowerer) lowerTypeAssertCommaOk(s *ast.AssignStmt, ta *ast.TypeAssertExpr) ([]ir.Stmt, error) {
+	valName := tupleName(s.Lhs[0])
+	okName := tupleName(s.Lhs[1])
+	if valName == "" || okName == "" {
+		return nil, l.errf(s.Pos(), "the comma-ok assertion binds two plain names")
+	}
+	for _, t := range s.Lhs {
+		if id, ok := t.(*ast.Ident); ok && l.isBoxedIdent(id) {
+			return nil, l.errf(id.Pos(), "assignment to the address-taken variable %s in a comma-ok assertion is not supported yet", id.Name)
+		}
+	}
+	x, err := l.lowerExpr(ta.X)
+	if err != nil {
+		return nil, err
+	}
+	target := l.pkg.Info.TypeOf(ta.Type)
+	info, err := l.assertTarget(target, ta.Type)
+	if err != nil {
+		return nil, err
+	}
+	zero, err := l.zeroValueOfType(target, s.Pos())
+	if err != nil {
+		return nil, err
+	}
+	out := []ir.Stmt{&ir.TupleAssign{
+		Names:  []string{valName, okName},
+		Value:  &ir.Intrinsic{Name: "_type_assert_ok", Args: []ir.Expr{x, info.ref, &ir.BoolLit{Value: info.structural}, zero}},
+		Define: s.Tok == token.DEFINE,
+	}}
+	if valName != "_" {
+		if clone := l.cloneForType(target, &ir.Ident{Name: valName}); clone != nil {
 			out = append(out, &ir.AssignStmt{Name: valName, Value: clone})
 		}
 	}
@@ -2990,9 +3037,134 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 		return l.lowerCall(e)
 	case *ast.FuncLit:
 		return l.lowerFuncLit(e, false)
+	case *ast.TypeAssertExpr:
+		return l.lowerTypeAssert(e)
 	default:
 		return nil, l.errf(e.Pos(), "expression %T is not supported yet", e)
 	}
+}
+
+// lowerTypeAssert lowers the one-result type assertion x.(T), which returns the
+// value when the interface holds a T and panics otherwise. The runtime does the
+// check and the panic, so the value carries its class, whether the assertion is
+// structural for an interface target or exact for a concrete one, and the Go type
+// names a failed assertion's message reads. A struct value target extracts a copy
+// out of the interface, so the result is cloned, and the clone runs only on the
+// success path since the panic escapes the call before it.
+func (l *lowerer) lowerTypeAssert(e *ast.TypeAssertExpr) (ir.Expr, error) {
+	if e.Type == nil {
+		return nil, l.errf(e.Pos(), "a type switch guard is not a value")
+	}
+	x, err := l.lowerExpr(e.X)
+	if err != nil {
+		return nil, err
+	}
+	target := l.pkg.Info.TypeOf(e.Type)
+	info, err := l.assertTarget(target, e.Type)
+	if err != nil {
+		return nil, err
+	}
+	ifaceName := l.goTypeName(l.pkg.Info.TypeOf(e.X))
+	call := &ir.Intrinsic{Name: "_type_assert", Args: []ir.Expr{
+		x, info.ref, &ir.BoolLit{Value: info.structural},
+		&ir.StringLit{Value: ifaceName}, &ir.StringLit{Value: info.name},
+		&ir.ArrayLit{Elems: info.methods},
+	}}
+	if isStructValue(target) {
+		return &ir.Clone{X: call}, nil
+	}
+	return call, nil
+}
+
+// assertInfo is what a type assertion needs to reach the runtime check: ref is the
+// class object the dynamic type is tested against, structural says whether the test
+// is an isinstance against an interface's Protocol rather than an exact concrete
+// type, name is Go's name for the target in a failed assertion's message, and
+// methods are the target interface's method names, which a failed structural
+// assertion reports the first missing one of.
+type assertInfo struct {
+	ref        ir.Expr
+	structural bool
+	name       string
+	methods    []ir.Expr
+}
+
+// assertTarget describes the runtime check a type assertion to t needs: the class
+// object the dynamic type is tested against, whether the test is structural, an
+// isinstance against an interface's Protocol, or exact, an identical concrete
+// dynamic type, and Go's name for the target that a failed assertion reports. A
+// pointer to a struct tests against the struct's class, since a pointer stored in
+// an interface is that struct object under elision, and a basic type tests against
+// the Python type its values take. The empty interface waits on its own slice, and
+// any other target fails loudly.
+func (l *lowerer) assertTarget(t types.Type, expr ast.Expr) (assertInfo, error) {
+	name := l.goTypeName(t)
+	switch u := t.Underlying().(type) {
+	case *types.Interface:
+		if u.NumMethods() == 0 {
+			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to the empty interface is not supported yet")
+		}
+		named, ok := t.(*types.Named)
+		if !ok {
+			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to an unnamed interface is not supported yet")
+		}
+		methods := make([]ir.Expr, u.NumMethods())
+		for i := range methods {
+			methods[i] = &ir.StringLit{Value: u.Method(i).Name()}
+		}
+		return assertInfo{ref: &ir.Ident{Name: named.Obj().Name()}, structural: true, name: name, methods: methods}, nil
+	case *types.Struct:
+		named, ok := t.(*types.Named)
+		if !ok {
+			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to an anonymous struct is not supported yet")
+		}
+		return assertInfo{ref: &ir.Ident{Name: named.Obj().Name()}, name: name}, nil
+	case *types.Pointer:
+		named, ok := u.Elem().(*types.Named)
+		if !ok {
+			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to %s is not supported yet", name)
+		}
+		if _, ok := named.Underlying().(*types.Struct); !ok {
+			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to %s is not supported yet", name)
+		}
+		return assertInfo{ref: &ir.Ident{Name: named.Obj().Name()}, name: name}, nil
+	case *types.Basic:
+		py, ok := basicPyType(u)
+		if !ok {
+			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to %s is not supported yet", name)
+		}
+		return assertInfo{ref: &ir.Ident{Name: py}, name: name}, nil
+	default:
+		return assertInfo{}, l.errf(expr.Pos(), "a type assertion to %s is not supported yet", name)
+	}
+}
+
+// basicPyType maps a Go basic type to the Python type an assertion tests against.
+// Every integer width shares Python's int and every float width shares its float,
+// so an assertion cannot tell two of them apart, the erasure the compiled tier
+// accepts; a Go string is bytes at runtime, so string tests against bytes.
+func basicPyType(b *types.Basic) (string, bool) {
+	switch info := b.Info(); {
+	case info&types.IsInteger != 0:
+		return "int", true
+	case info&types.IsFloat != 0:
+		return "float", true
+	case info&types.IsBoolean != 0:
+		return "bool", true
+	case info&types.IsString != 0:
+		return "bytes", true
+	}
+	return "", false
+}
+
+// goTypeName renders a type the way Go names it in a message, with the package
+// name rather than its full path, so main.Widget and int and *main.Node read as
+// they do in a panic Go prints. Go's runtime writes a space in the empty interface,
+// interface {}, where go/types writes interface{}, so the spelling is normalized to
+// match the banner an unrecovered assertion prints.
+func (l *lowerer) goTypeName(t types.Type) string {
+	name := types.TypeString(t, func(p *types.Package) string { return p.Name() })
+	return strings.ReplaceAll(name, "interface{}", "interface {}")
 }
 
 // lowerSelector lowers a selector used as a value. A field read s.field becomes a

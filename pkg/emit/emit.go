@@ -163,37 +163,107 @@ func moduleUnwinds(m *ir.Module) bool {
 }
 
 func blockUnwinds(body []ir.Stmt) bool {
-	for _, s := range body {
-		switch s := s.(type) {
-		case *ir.Panic, *ir.DeferBlock, *ir.DeferPush, *ir.DeferReturn:
-			return true
-		case *ir.IfStmt:
-			if blockUnwinds(s.Then) || blockUnwinds(s.Else) {
+	return slices.ContainsFunc(body, stmtUnwinds)
+}
+
+// stmtUnwinds reports whether a statement can raise or propagate a GoPanic, either
+// because it is a panic or a defer node, or because one of its expressions can
+// panic while it is evaluated, which a one-result type assertion does.
+func stmtUnwinds(s ir.Stmt) bool {
+	switch s := s.(type) {
+	case *ir.Panic, *ir.DeferBlock, *ir.DeferPush, *ir.DeferReturn:
+		return true
+	case *ir.ExprStmt:
+		return exprUnwinds(s.X)
+	case *ir.ReturnStmt:
+		return exprUnwinds(s.Value)
+	case *ir.AssignStmt:
+		return exprUnwinds(s.Value)
+	case *ir.TupleAssign:
+		return exprUnwinds(s.Value)
+	case *ir.SetField:
+		return exprUnwinds(s.Object) || exprUnwinds(s.Value)
+	case *ir.SetIndex:
+		return exprUnwinds(s.Object) || exprUnwinds(s.Index) || exprUnwinds(s.Value)
+	case *ir.DerefSet:
+		return exprUnwinds(s.Ptr) || exprUnwinds(s.Value)
+	case *ir.IfStmt:
+		return exprUnwinds(s.Cond) || blockUnwinds(s.Then) || blockUnwinds(s.Else)
+	case *ir.ForStmt:
+		return exprUnwinds(s.Cond) || blockUnwinds(s.Body)
+	case *ir.ForRange:
+		return exprUnwinds(s.Start) || exprUnwinds(s.Stop) || exprUnwinds(s.Step) || blockUnwinds(s.Body)
+	case *ir.RangeMap:
+		return exprUnwinds(s.Source) || blockUnwinds(s.Body)
+	case *ir.RangeString:
+		return exprUnwinds(s.Source) || blockUnwinds(s.Body)
+	case *ir.FuncDef:
+		return blockUnwinds(s.Body)
+	}
+	return false
+}
+
+// exprUnwinds reports whether evaluating an expression can raise a GoPanic. The
+// one-result type assertion is the expression that does, through its _type_assert
+// intrinsic, which panics when the interface does not hold the asserted type; the
+// comma-ok _type_assert_ok never panics. Every other form only recurses into its
+// sub-expressions to find one that can.
+func exprUnwinds(e ir.Expr) bool {
+	switch e := e.(type) {
+	case *ir.Intrinsic:
+		return e.Name == "_type_assert" || argsUnwind(e.Args)
+	case *ir.BinaryExpr:
+		return exprUnwinds(e.X) || exprUnwinds(e.Y)
+	case *ir.UnaryExpr:
+		return exprUnwinds(e.X)
+	case *ir.Mask:
+		return exprUnwinds(e.X)
+	case *ir.Convert:
+		return exprUnwinds(e.X)
+	case *ir.IndexExpr:
+		return exprUnwinds(e.X) || exprUnwinds(e.Index)
+	case *ir.CallExpr:
+		return argsUnwind(e.Args)
+	case *ir.MethodCall:
+		return exprUnwinds(e.Recv) || argsUnwind(e.Args)
+	case *ir.MethodValue:
+		return exprUnwinds(e.Recv)
+	case *ir.FieldAccess:
+		return exprUnwinds(e.X)
+	case *ir.Deref:
+		return exprUnwinds(e.X)
+	case *ir.Tuple:
+		return argsUnwind(e.Elems)
+	case *ir.Lambda:
+		return exprUnwinds(e.Body)
+	case *ir.Clone:
+		return exprUnwinds(e.X)
+	case *ir.ArrayZero:
+		return exprUnwinds(e.Elem)
+	case *ir.ArrayLit:
+		return argsUnwind(e.Elems)
+	case *ir.ArrayClone:
+		return exprUnwinds(e.X)
+	case *ir.MapLit:
+		for _, en := range e.Entries {
+			if exprUnwinds(en.Key) || exprUnwinds(en.Value) {
 				return true
 			}
-		case *ir.ForStmt:
-			if blockUnwinds(s.Body) {
-				return true
-			}
-		case *ir.ForRange:
-			if blockUnwinds(s.Body) {
-				return true
-			}
-		case *ir.RangeMap:
-			if blockUnwinds(s.Body) {
-				return true
-			}
-		case *ir.RangeString:
-			if blockUnwinds(s.Body) {
-				return true
-			}
-		case *ir.FuncDef:
-			if blockUnwinds(s.Body) {
+		}
+	case *ir.SliceExpr:
+		return exprUnwinds(e.X) || exprUnwinds(e.Low) || exprUnwinds(e.High) || exprUnwinds(e.Max)
+	case *ir.StructLit:
+		for _, f := range e.Fields {
+			if exprUnwinds(f.Value) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func argsUnwind(args []ir.Expr) bool {
+	return slices.ContainsFunc(args, exprUnwinds)
 }
 
 // usesShim reports whether the module contains any intrinsic, which is the only
