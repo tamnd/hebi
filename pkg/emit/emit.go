@@ -1352,6 +1352,8 @@ func emitExpr(e ir.Expr) (string, error) {
 		return shim.Name + ".NIL_PTR", nil
 	case *ir.NilInterface:
 		return "None", nil
+	case *ir.EmptyStruct:
+		return "()", nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}
