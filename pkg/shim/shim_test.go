@@ -565,3 +565,45 @@ func TestErrorWrapHelpers(t *testing.T) {
 		t.Errorf("wrap helper output = %q, want %q", got, want)
 	}
 }
+
+// TestErrorAsHelper runs errors_as under CPython: it returns the matched value
+// and true for an error of the wanted type, the zero value and false for a miss,
+// and it walks a single %w wrap and a join tree to the first error of that type.
+func TestErrorAsHelper(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"class MyErr:\n" +
+		"    def Error(self):\n" +
+		"        return b'my'\n" +
+		"e = MyErr()\n" +
+		"v, ok = r.errors_as(e, MyErr)\n" +
+		"print(ok, v is e)\n" +
+		"v, ok = r.errors_as(r.errors_new(b'x'), MyErr)\n" +
+		"print(ok, v is None)\n" +
+		"v, ok = r.errors_as(r.errorf(b'w: %w', e), MyErr)\n" +
+		"print(ok, v is e)\n" +
+		"j = r.errors_join(r.errors_new(b'a'), e)\n" +
+		"v, ok = r.errors_as(j, MyErr)\n" +
+		"print(ok, v is e)"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run errors_as helper: %v\n%s", err, out)
+	}
+	want := "True True\n" +
+		"False True\n" +
+		"True True\n" +
+		"True True\n"
+	if got := string(out); got != want {
+		t.Errorf("errors_as helper output = %q, want %q", got, want)
+	}
+}
