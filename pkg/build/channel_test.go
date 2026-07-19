@@ -209,3 +209,27 @@ func main() {
 `
 	assertProgramMatchesGo(t, src)
 }
+
+// TestChannelLenCap checks len and cap on a channel against go run: len is how
+// many values are buffered and cap is the buffer size, both read through the
+// runtime rather than Python's len, since a channel is a Chan object with no
+// __len__. An unbuffered channel reports zero for both.
+func TestChannelLenCap(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+import "fmt"
+
+func main() {
+	ch := make(chan int, 3)
+	ch <- 1
+	ch <- 2
+	fmt.Println(len(ch), cap(ch))
+	<-ch
+	fmt.Println(len(ch), cap(ch))
+	un := make(chan int)
+	fmt.Println(len(un), cap(un))
+}
+`
+	assertProgramMatchesGo(t, src)
+}
