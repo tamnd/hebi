@@ -20,7 +20,7 @@ import (
 // error for any surface it does not yet handle, so an unsupported construct
 // fails loudly rather than emitting something wrong.
 func lower(pkg *frontend.Package) (*ir.Module, error) {
-	l := &lowerer{pkg: pkg, structs: map[string]*ir.StructDef{}, structTypes: map[string]*types.TypeName{}}
+	l := &lowerer{pkg: pkg, structs: map[string]*ir.StructDef{}, structTypes: map[string]*types.TypeName{}, named: map[string]*ir.NamedDef{}}
 	m := &ir.Module{Package: pkg.Name}
 	// Collect struct type declarations first so the emitter has every class
 	// before the functions that construct or read one, and so a value-struct
@@ -32,7 +32,7 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 				continue
 			}
 			for _, spec := range gen.Specs {
-				sd, id, err := l.lowerTypeSpec(spec.(*ast.TypeSpec))
+				sd, id, nd, err := l.lowerTypeSpec(spec.(*ast.TypeSpec))
 				if err != nil {
 					return nil, err
 				}
@@ -42,6 +42,10 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 				}
 				if id != nil {
 					m.Interfaces = append(m.Interfaces, id)
+				}
+				if nd != nil {
+					m.Named = append(m.Named, nd)
+					l.named[nd.Name] = nd
 				}
 			}
 		}
@@ -55,11 +59,9 @@ func lower(pkg *frontend.Package) (*ir.Module, error) {
 				continue
 			}
 			if fd.Recv != nil {
-				owner, method, err := l.lowerMethod(fd)
-				if err != nil {
+				if err := l.lowerMethod(fd); err != nil {
 					return nil, err
 				}
-				owner.Methods = append(owner.Methods, method)
 				continue
 			}
 			fn, err := l.lowerFunc(fd)
@@ -153,25 +155,109 @@ func (l *lowerer) promotedForwarder(obj *types.TypeName, sel *types.Selection) (
 // lowerTypeSpec lowers a single type declaration. A struct type becomes an IR
 // StructDef, the class the emitter generates; an interface type becomes an
 // InterfaceDef, the Protocol the emitter generates. A defined non-struct,
-// non-interface type, such as type Celsius float64, needs no declaration of its
-// own because its values already lower through their underlying type, so both
-// results are nil. Embedded fields and reference-typed fields wait on later
-// slices and fail loudly here.
-func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, *ir.InterfaceDef, error) {
+// non-interface type that carries methods, such as type Duration int64 with a
+// String method, becomes a NamedDef, a class subclassing its base so a value can
+// hold its methods. A defined non-struct type with no methods needs no
+// declaration because its values already lower through their underlying type, so
+// all three results are nil. Embedded fields and reference-typed fields wait on
+// later slices and fail loudly here.
+func (l *lowerer) lowerTypeSpec(ts *ast.TypeSpec) (*ir.StructDef, *ir.InterfaceDef, *ir.NamedDef, error) {
 	obj, ok := l.pkg.Info.Defs[ts.Name].(*types.TypeName)
 	if !ok {
-		return nil, nil, l.errf(ts.Pos(), "type %s is not supported yet", ts.Name.Name)
+		return nil, nil, nil, l.errf(ts.Pos(), "type %s is not supported yet", ts.Name.Name)
 	}
 	switch under := obj.Type().Underlying().(type) {
 	case *types.Struct:
 		sd, err := l.lowerStructSpec(ts, obj, under)
-		return sd, nil, err
+		return sd, nil, nil, err
 	case *types.Interface:
 		id, err := l.lowerInterfaceSpec(ts, under)
-		return nil, id, err
+		return nil, id, nil, err
 	default:
-		return nil, nil, nil
+		nd, err := l.lowerNamedSpec(ts, obj)
+		return nil, nil, nd, err
 	}
+}
+
+// lowerNamedSpec builds the NamedDef for a defined non-struct, non-interface type
+// that carries methods, choosing the Python base its underlying basic type takes:
+// int for any integer, float for a floating type, bytes for a string, the same
+// representation an unboxed value of the type already uses. A type with no methods
+// returns a nil NamedDef, so it stays unboxed and its values flow through the
+// underlying type as before. A method on a type whose underlying is not a boxable
+// basic type, a boolean or a complex or an alias to a composite, fails loudly so a
+// half-supported box is never emitted.
+func (l *lowerer) lowerNamedSpec(ts *ast.TypeSpec, obj *types.TypeName) (*ir.NamedDef, error) {
+	named, ok := obj.Type().(*types.Named)
+	if !ok || named.NumMethods() == 0 {
+		return nil, nil
+	}
+	basic, ok := obj.Type().Underlying().(*types.Basic)
+	if !ok {
+		return nil, l.errf(ts.Pos(), "a method on type %s is not supported yet", ts.Name.Name)
+	}
+	var base string
+	switch info := basic.Info(); {
+	case info&types.IsInteger != 0:
+		base = "int"
+	case info&types.IsFloat != 0:
+		base = "float"
+	case info&types.IsString != 0:
+		base = "bytes"
+	default:
+		return nil, l.errf(ts.Pos(), "a method on type %s is not supported yet", ts.Name.Name)
+	}
+	return &ir.NamedDef{Name: ts.Name.Name, Base: base, Type: l.goTypeName(obj.Type())}, nil
+}
+
+// namedBoxOf returns the NamedDef a type boxes into, or nil when the type is not
+// one of this package's named types that carry methods. It matches on the type's
+// own package as well as its name, so a type from another package that happens to
+// share a name is never mistaken for a local box.
+func (l *lowerer) namedBoxOf(t types.Type) *ir.NamedDef {
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil
+	}
+	if named.Obj().Pkg() != l.pkg.Types {
+		return nil
+	}
+	return l.named[named.Obj().Name()]
+}
+
+// boxNamed wraps a lowered base value in its named type's class when the type is a
+// boxed named type, so the value carries the type's methods. A call to the class
+// name over the base value builds the instance, since the class subclasses the base
+// and needs no constructor of its own. A type that is not boxed passes through.
+func (l *lowerer) boxNamed(t types.Type, x ir.Expr) ir.Expr {
+	if nd := l.namedBoxOf(t); nd != nil {
+		return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}}
+	}
+	return x
+}
+
+// boxNamedExpr boxes the lowered value of an expression whose static type is a
+// boxed named type, but only for the nodes that mint a fresh base value: a literal,
+// a constant, and an arithmetic or unary result. A variable, field, or parameter
+// read is already an instance of the box, so it is left alone, which keeps the box
+// from being re-applied on every read. A conversion boxes at its own lowering, and
+// a call returns whatever its callee already boxed, so both are skipped here.
+func (l *lowerer) boxNamedExpr(e ast.Expr, x ir.Expr) ir.Expr {
+	nd := l.namedBoxOf(l.pkg.Info.TypeOf(e))
+	if nd == nil {
+		return x
+	}
+	switch e.(type) {
+	case *ast.BasicLit, *ast.BinaryExpr, *ast.UnaryExpr:
+		return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}}
+	case *ast.Ident, *ast.SelectorExpr:
+		// A named constant folds to a bare literal and needs the box; a variable or
+		// field read is already an instance, so only the constant case wraps.
+		if l.pkg.Info.Types[e].Value != nil {
+			return &ir.CallExpr{Name: nd.Name, Args: []ir.Expr{x}}
+		}
+	}
+	return x
 }
 
 // lowerStructSpec builds the StructDef for a struct type declaration: one field
@@ -277,6 +363,12 @@ type lowerer struct {
 	// so the promoted-method pass can read a struct's method set and walk the
 	// embedded field path a promoted method reaches through.
 	structTypes map[string]*types.TypeName
+	// named indexes the package's named non-struct types that carry methods, by type
+	// name, so a value of such a type is boxed into its class and a method call
+	// dispatches on the box. A type with no methods is absent here and passes through
+	// as its bare underlying value, which is why an existing named type keeps working
+	// unchanged.
+	named map[string]*ir.NamedDef
 	// rangeSeq numbers the internal names a range over a string allocates, so a
 	// nested or repeated range gets distinct cursor and width names. It counts
 	// across the whole module in source order, which keeps the emit deterministic.
@@ -466,28 +558,29 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	return &ir.Func{Name: fd.Name.Name, Params: params, Body: body}, nil
 }
 
-// lowerMethod lowers a method declaration to a Python instance method attached to
-// the receiver type's class, and returns that class along with the method. The
-// receiver becomes self, so the receiver name is recorded for the body lowering
-// and dropped from the parameter list. A value receiver and a pointer receiver
-// lower the same way here, an instance method over self, because the copy a value
-// receiver needs is passed by the caller, not taken inside the method. A method on
-// a non-struct named type, which has no class, waits on its own slice.
-func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, error) {
+// lowerMethod lowers a method declaration to a Python instance method and attaches
+// it to its receiver type, a struct's class or a named non-struct type's boxing
+// class. The receiver becomes self, so the receiver name is recorded for the body
+// lowering and dropped from the parameter list. A value receiver and a pointer
+// receiver lower the same way here, an instance method over self, because the copy
+// a value receiver needs is passed by the caller, not taken inside the method. A
+// method on a named type the collection pass did not register, one whose underlying
+// is not a boxable basic type, was already rejected there.
+func (l *lowerer) lowerMethod(fd *ast.FuncDecl) error {
 	if fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0 {
-		return nil, nil, l.errf(fd.Pos(), "type parameters are not supported yet")
+		return l.errf(fd.Pos(), "type parameters are not supported yet")
 	}
 	if fd.Body == nil {
-		return nil, nil, l.errf(fd.Pos(), "method %s has no body", fd.Name.Name)
+		return l.errf(fd.Pos(), "method %s has no body", fd.Name.Name)
 	}
 	recvField := fd.Recv.List[0]
 	typeName, err := l.receiverTypeName(recvField.Type)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	owner, ok := l.structs[typeName]
+	appendMethod, ok := l.methodOwner(typeName)
 	if !ok {
-		return nil, nil, l.errf(fd.Pos(), "a method on non-struct type %s is not supported yet", typeName)
+		return l.errf(fd.Pos(), "a method on non-struct type %s is not supported yet", typeName)
 	}
 	if len(recvField.Names) == 1 && recvField.Names[0].Name != "_" {
 		l.recv = l.pkg.Info.Defs[recvField.Names[0]]
@@ -495,15 +588,15 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 	defer func() { l.recv = nil }()
 	params, err := l.lowerParams(fd.Type.Params)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	prelude, err := l.beginResults(fd.Type.Results)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	defer func() { l.resultNames = nil; l.resultTypes = nil }()
 	if err := l.beginDefer(fd.Body, fd.Type.Results, fd.Pos()); err != nil {
-		return nil, nil, err
+		return err
 	}
 	defer func() { l.deferReshape = false; l.deferResults = nil }()
 	l.boxed = l.computeBoxed(fd)
@@ -513,15 +606,31 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 	boxInit := l.boxParamInits(fd.Type.Params)
 	body, err := l.lowerBlock(fd.Body)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	body = resolveLabeledJumps(body)
 	body, err = l.wrapDefers(body, fd.Body)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	body = append(append(boxInit, prelude...), body...)
-	return owner, &ir.Method{Name: fd.Name.Name, Params: params, Body: body}, nil
+	appendMethod(&ir.Method{Name: fd.Name.Name, Params: params, Body: body})
+	return nil
+}
+
+// methodOwner returns a sink that appends a lowered method to the receiver type's
+// definition, a struct's StructDef or a named type's NamedDef, and reports whether
+// the type name is one that carries methods. A named type registered by the
+// collection pass boxes its values, so its methods live on that box's class; a name
+// in neither table has no class and is rejected by the caller.
+func (l *lowerer) methodOwner(typeName string) (func(*ir.Method), bool) {
+	if sd, ok := l.structs[typeName]; ok {
+		return func(m *ir.Method) { sd.Methods = append(sd.Methods, m) }, true
+	}
+	if nd, ok := l.named[typeName]; ok {
+		return func(m *ir.Method) { nd.Methods = append(nd.Methods, m) }, true
+	}
+	return nil, false
 }
 
 // receiverTypeName returns the named type a method receiver binds to, seeing
@@ -2145,18 +2254,26 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 	}
 	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
+		var zero ir.Expr
 		switch info := basic.Info(); {
 		case info&types.IsInteger != 0:
-			return &ir.IntLit{Text: "0"}, nil
+			zero = &ir.IntLit{Text: "0"}
 		case info&types.IsFloat != 0:
 			if basic.Kind() == types.Float32 {
-				return &ir.Intrinsic{Name: "_f32", Args: []ir.Expr{&ir.FloatLit{Text: "0.0"}}}, nil
+				zero = &ir.Intrinsic{Name: "_f32", Args: []ir.Expr{&ir.FloatLit{Text: "0.0"}}}
+			} else {
+				zero = &ir.FloatLit{Text: "0.0"}
 			}
-			return &ir.FloatLit{Text: "0.0"}, nil
 		case info&types.IsBoolean != 0:
-			return &ir.BoolLit{Value: false}, nil
+			zero = &ir.BoolLit{Value: false}
 		case info&types.IsString != 0:
-			return &ir.StringLit{Value: ""}, nil
+			zero = &ir.StringLit{Value: ""}
+		}
+		if zero != nil {
+			// A boxed named type's zero is that base zero wrapped in the type's class,
+			// so var d Duration starts as a Duration whose value is zero and still
+			// answers its methods, matching Go's typed zero value.
+			return l.boxNamed(t, zero), nil
 		}
 	}
 	return nil, l.errf(pos, "zero value of %s is not supported yet", t)
@@ -3688,6 +3805,18 @@ func (l *lowerer) lowerRangeChan(s *ast.RangeStmt, label string) ([]ir.Stmt, err
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
+	x, err := l.lowerExprInner(e)
+	if err != nil {
+		return nil, err
+	}
+	return l.boxNamedExpr(e, x), nil
+}
+
+// lowerExprInner lowers an expression to its base IR form before any named-type
+// boxing. lowerExpr wraps its result so a fresh value of a boxed named type carries
+// its methods; splitting the two keeps that one boxing rule in a single place
+// rather than at every leaf that mints a value.
+func (l *lowerer) lowerExprInner(e ast.Expr) (ir.Expr, error) {
 	switch e := e.(type) {
 	case *ast.ParenExpr:
 		return l.lowerExpr(e.X)
@@ -3943,7 +4072,16 @@ func (l *lowerer) lowerMethodValue(e *ast.SelectorExpr, selection *types.Selecti
 		return nil, err
 	}
 	_, ptr := sig.Recv().Type().(*types.Pointer)
-	return &ir.MethodValue{Recv: recv, Name: e.Sel.Name, Copy: !ptr}, nil
+	return &ir.MethodValue{Recv: recv, Name: e.Sel.Name, Copy: !ptr && needsValueCopy(sig.Recv().Type())}, nil
+}
+
+// needsValueCopy reports whether a value receiver of type t must be copied at the
+// bind or the unbound call. A struct or array is a mutable value, so Go's copy on
+// a value receiver is observable and the emitter clones it; a named basic type
+// boxes into an immutable int, float, or bytes subclass, so the copy is a no-op and
+// is skipped, which also spares it a copy method it does not have.
+func needsValueCopy(t types.Type) bool {
+	return isStructValue(t) || isArrayValue(t)
 }
 
 // lowerMethodExpr lowers a method expression T.M to the unbound class function
@@ -3964,7 +4102,7 @@ func (l *lowerer) lowerMethodExpr(e *ast.SelectorExpr, selection *types.Selectio
 		return nil, l.errf(e.Pos(), "a method expression on non-struct type %s is not supported yet", e.Sel.Name)
 	}
 	_, ptr := sig.Recv().Type().(*types.Pointer)
-	return &ir.MethodExpr{Recv: name, Name: e.Sel.Name, ValueCopy: !ptr}, nil
+	return &ir.MethodExpr{Recv: name, Name: e.Sel.Name, ValueCopy: !ptr && needsValueCopy(sig.Recv().Type())}, nil
 }
 
 // methodSig returns the signature of the method a selection resolves to, with its
@@ -5255,6 +5393,17 @@ func (l *lowerer) isConversion(e *ast.CallExpr) bool {
 // the source is itself an integer and the whole conversion is a constant the
 // type checker has already proven in range.
 func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
+	x, err := l.lowerConversionInner(e)
+	if err != nil {
+		return nil, err
+	}
+	// A conversion to a boxed named type, such as Duration(n), builds a fresh value
+	// of that type, so its result carries the box; a conversion to an interface or a
+	// plain basic type is unboxed here and boxNamed passes it through.
+	return l.boxNamed(l.pkg.Info.TypeOf(e.Fun), x), nil
+}
+
+func (l *lowerer) lowerConversionInner(e *ast.CallExpr) (ir.Expr, error) {
 	if len(e.Args) != 1 {
 		return nil, l.errf(e.Pos(), "conversion takes one argument")
 	}

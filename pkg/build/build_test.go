@@ -594,7 +594,7 @@ func TestBuildRejectsUnsupported(t *testing.T) {
 		name   string
 		source string
 	}{
-		{"method on a non-struct type", "package main\n\ntype Celsius float64\n\nfunc (c Celsius) Freezing() bool {\n\treturn c <= 0\n}\n\nfunc main() {\n\tvar c Celsius\n\t_ = c.Freezing()\n}\n"},
+		{"method on a boolean named type", "package main\n\ntype Flag bool\n\nfunc (f Flag) On() bool {\n\treturn bool(f)\n}\n\nfunc main() {\n\tvar f Flag\n\t_ = f.On()\n}\n"},
 		{"reassigning an address-taken struct", "package main\n\ntype Point struct{ X int }\n\nfunc main() {\n\tp := Point{1}\n\tq := &p\n\tp = Point{2}\n\t_ = q\n}\n"},
 		{"writing through a pointer to a struct", "package main\n\ntype Point struct{ X int }\n\nfunc main() {\n\tp := Point{1}\n\tq := &p\n\t*q = Point{2}\n\t_ = q\n}\n"},
 		{"promoted method value", "package main\n\ntype Base struct{ N int }\n\nfunc (b Base) Get() int {\n\treturn b.N\n}\n\ntype User struct {\n\tBase\n\tName string\n}\n\nfunc main() {\n\tu := User{}\n\tf := u.Get\n\t_ = f\n}\n"},

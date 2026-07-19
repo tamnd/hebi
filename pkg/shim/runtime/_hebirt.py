@@ -36,6 +36,21 @@ def go_str(value, plus=False):
         # A nil interface, the one nil that lowers to Python None, prints as <nil>,
         # the same text Go's fmt writes for a nil error or a nil interface value.
         return "<nil>"
+    err = getattr(value, "Error", None)
+    if callable(err):
+        # An error value prints as its Error text, so fmt.Println(err) writes the
+        # message the way Go does; the result is a Go string, so it decodes through
+        # go_str the same as any other string. This is checked before the float and
+        # bytes fast paths so a named type that boxes into a float or bytes subclass,
+        # such as type Celsius float64 with an Error method, still reaches its method
+        # rather than printing as its underlying number or text.
+        return go_str(err())
+    s = getattr(value, "String", None)
+    if callable(s):
+        # A Stringer prints through String, which fmt uses when a value carries no
+        # Error, so a type that defines String reads as its own text, again ahead of
+        # the float and bytes paths so a boxed named type finds its Stringer.
+        return go_str(s())
     if isinstance(value, float):
         return _gofloat(value)
     if isinstance(value, bytes):
@@ -68,17 +83,6 @@ def go_str(value, plus=False):
         except TypeError:
             items = list(value.items())
         return "map[" + " ".join(go_str(k, plus) + ":" + go_str(v, plus) for k, v in items) + "]"
-    err = getattr(value, "Error", None)
-    if callable(err):
-        # An error value prints as its Error text, so fmt.Println(err) writes the
-        # message the way Go does; the result is a Go string, so it decodes through
-        # go_str the same as any other string.
-        return go_str(err())
-    s = getattr(value, "String", None)
-    if callable(s):
-        # A Stringer prints through String, which fmt uses when a value carries no
-        # Error, so a type that defines String reads as its own text.
-        return go_str(s())
     slots = getattr(type(value), "__slots__", None)
     if slots is not None and hasattr(type(value), "_hebi_type"):
         # A struct that carries no Stringer or error dumps its fields in braces,
