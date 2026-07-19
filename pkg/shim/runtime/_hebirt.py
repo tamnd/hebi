@@ -1027,7 +1027,9 @@ def _assert_fail_message(v, structural, iface_name, target_name, methods):
     way Go's does for a structural miss.
     """
     if v is None:
-        return b"interface conversion: " + iface_name + b" is nil, not " + target_name
+        # A nil interface carries no dynamic type, so Go names the source with the
+        # bare word interface here rather than the static source type.
+        return b"interface conversion: interface is nil, not " + target_name
     got = _go_type_name(v)
     if structural:
         missing = _first_missing_method(v, methods)

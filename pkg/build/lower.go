@@ -1557,7 +1557,7 @@ func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, erro
 		if err != nil {
 			return nil, nil, err
 		}
-		args, err := l.lowerCallArgs(call.Args)
+		args, err := l.lowerCallArgsTyped(call.Args, l.callParamTypes(call))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1575,7 +1575,7 @@ func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, erro
 			if err != nil {
 				return nil, nil, err
 			}
-			args, err := l.lowerCallArgs(call.Args)
+			args, err := l.lowerCallArgsTyped(call.Args, l.callParamTypes(call))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1586,7 +1586,7 @@ func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, erro
 		if _, ok := l.pkg.Info.Uses[fun].(*types.Builtin); ok {
 			return nil, nil, l.errf(call.Pos(), "a deferred builtin call %s is not supported yet", fun.Name)
 		}
-		args, err := l.lowerCallArgs(call.Args)
+		args, err := l.lowerCallArgsTyped(call.Args, l.callParamTypes(call))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -3240,7 +3240,11 @@ func (l *lowerer) assertTarget(t types.Type, expr ast.Expr) (assertInfo, error) 
 	switch u := t.Underlying().(type) {
 	case *types.Interface:
 		if u.NumMethods() == 0 {
-			return assertInfo{}, l.errf(expr.Pos(), "a type assertion to the empty interface is not supported yet")
+			// The empty interface accepts every non-nil value, so the only check is
+			// that the value is not the nil interface. _assert_pass against object with
+			// the structural flag is exactly that: None fails and every other value,
+			// always an object, passes, and there is no method a value could miss.
+			return assertInfo{ref: &ir.Ident{Name: "object"}, structural: true, name: name}, nil
 		}
 		named, ok := t.(*types.Named)
 		if !ok {
@@ -4023,7 +4027,7 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		args, err := l.lowerCallArgs(e.Args)
+		args, err := l.lowerCallArgsTyped(e.Args, l.callParamTypes(e))
 		if err != nil {
 			return nil, err
 		}
@@ -4055,7 +4059,7 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if b, ok := l.pkg.Info.Uses[fun].(*types.Builtin); ok {
 			return l.lowerBuiltin(e, fun, b)
 		}
-		args, err := l.lowerCallArgs(e.Args)
+		args, err := l.lowerCallArgsTyped(e.Args, l.callParamTypes(e))
 		if err != nil {
 			return nil, err
 		}
@@ -4094,7 +4098,7 @@ func (l *lowerer) lowerMethodCall(e *ast.CallExpr, sel *ast.SelectorExpr, select
 		if err != nil {
 			return nil, err
 		}
-		args, err := l.lowerCallArgs(e.Args)
+		args, err := l.lowerCallArgsTyped(e.Args, l.callParamTypes(e))
 		if err != nil {
 			return nil, err
 		}
@@ -4123,7 +4127,7 @@ func (l *lowerer) lowerMethodCall(e *ast.CallExpr, sel *ast.SelectorExpr, select
 			recv = l.copyIfValueRead(sel.X, recv)
 		}
 	}
-	args, err := l.lowerCallArgs(e.Args)
+	args, err := l.lowerCallArgsTyped(e.Args, l.callParamTypes(e))
 	if err != nil {
 		return nil, err
 	}
@@ -4372,6 +4376,22 @@ func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
 		return nil, l.errf(e.Pos(), "conversion takes one argument")
 	}
 	dest := l.pkg.Info.TypeOf(e.Fun)
+
+	if _, ok := dest.Underlying().(*types.Interface); ok {
+		// A conversion to an interface type is the identity under elision: the
+		// concrete value already is the interface value. A bare nil reads the nil
+		// interface from the destination type, a struct or array value read is
+		// copied to match the copy Go boxes into the interface, and a pointer or
+		// other reference is shared. A nil pointer keeps its sentinel, so the
+		// converted interface is not the nil interface, the typed-nil that compares
+		// unequal to bare nil.
+		x, err := l.lowerTyped(e.Args[0], dest)
+		if err != nil {
+			return nil, err
+		}
+		return l.copyIfValueRead(e.Args[0], x), nil
+	}
+
 	x, err := l.lowerExpr(e.Args[0])
 	if err != nil {
 		return nil, err
@@ -4398,16 +4418,6 @@ func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
 			return x, nil
 		}
 		return &ir.Mask{Bits: bits, Signed: signed, X: x}, nil
-	}
-
-	if _, ok := dest.Underlying().(*types.Interface); ok {
-		// A conversion to an interface type is the identity under elision: the
-		// concrete value already is the interface value. A struct or array value read
-		// is copied, matching the copy Go boxes into the interface, while a pointer or
-		// other reference is shared. A nil pointer keeps its sentinel, so the converted
-		// interface is not the nil interface, the typed-nil that compares unequal to
-		// bare nil.
-		return l.copyIfValueRead(e.Args[0], x), nil
 	}
 
 	return nil, l.errf(e.Pos(), "conversion to %s is not supported yet", dest)
@@ -4667,15 +4677,65 @@ func (l *lowerer) checkErrorfFormat(pos token.Pos, format string) error {
 // inside it must not touch the caller's. A non-struct argument and a fresh value
 // such as a literal or another call are left alone by copyIfValueRead.
 func (l *lowerer) lowerCallArgs(exprs []ast.Expr) ([]ir.Expr, error) {
+	return l.lowerCallArgsTyped(exprs, nil)
+}
+
+// lowerCallArgsTyped lowers call arguments the way lowerCallArgs does, but reads
+// the declared parameter type for each position so a bare untyped nil resolves its
+// sentinel from the parameter. A nil going into an interface parameter is the nil
+// interface, Python None, while a nil going into a pointer parameter is the pointer
+// sentinel. A position with no known parameter type, and every non-nil argument,
+// lowers plainly, so this is a no-op except where a nil argument needs its type.
+func (l *lowerer) lowerCallArgsTyped(exprs []ast.Expr, params []types.Type) ([]ir.Expr, error) {
 	out := make([]ir.Expr, len(exprs))
 	for i, a := range exprs {
-		lowered, err := l.lowerExpr(a)
+		var lowered ir.Expr
+		var err error
+		if i < len(params) && params[i] != nil {
+			lowered, err = l.lowerTyped(a, params[i])
+		} else {
+			lowered, err = l.lowerExpr(a)
+		}
 		if err != nil {
 			return nil, err
 		}
 		out[i] = l.copyIfValueRead(a, lowered)
 	}
 	return out, nil
+}
+
+// callParamTypes returns the declared parameter type for each argument position of
+// a call, so a bare nil argument can read its sentinel from the parameter. It
+// yields nothing, leaving the arguments to lower plainly, when the callee is not an
+// ordinary signature, when the call spreads a slice with f(xs...), or when a single
+// argument forwards a multi-value result as f(g()), since in those shapes no
+// per-position parameter type lines up with an argument expression. A variadic
+// parameter contributes its element type to every argument at or past its position.
+func (l *lowerer) callParamTypes(e *ast.CallExpr) []types.Type {
+	sig, ok := l.pkg.Info.TypeOf(e.Fun).(*types.Signature)
+	if !ok {
+		return nil
+	}
+	if e.Ellipsis.IsValid() {
+		return nil
+	}
+	params := sig.Params()
+	n := params.Len()
+	if !sig.Variadic() && len(e.Args) != n {
+		return nil
+	}
+	out := make([]types.Type, len(e.Args))
+	for i := range e.Args {
+		switch {
+		case sig.Variadic() && i >= n-1:
+			if slice, ok := params.At(n - 1).Type().(*types.Slice); ok {
+				out[i] = slice.Elem()
+			}
+		case i < n:
+			out[i] = params.At(i).Type()
+		}
+	}
+	return out
 }
 
 // intWidth returns the width in bits and signedness of a fixed-width integer
