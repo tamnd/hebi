@@ -276,6 +276,9 @@ type lowerer struct {
 	// errorsAsSeq numbers the value and ok temporaries an errors.As call spills to,
 	// so two calls in one function do not reuse a name.
 	errorsAsSeq int
+	// selectSeq numbers the index, value, and ok temporaries a select spills its
+	// run result to, so a nested select does not reuse an outer select's names.
+	selectSeq int
 	// scopes is the stack of enclosing loops and switches, innermost last, which
 	// tells a break whether it leaves a loop or a switch and lets a labeled break
 	// find the loop it names.
@@ -1491,6 +1494,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerGo(s)
 	case *ast.SendStmt:
 		return l.lowerSend(s)
+	case *ast.SelectStmt:
+		return l.lowerSelect(s)
 	default:
 		return nil, l.errf(s.Pos(), "statement %T is not supported yet", s)
 	}
@@ -1547,6 +1552,167 @@ func (l *lowerer) lowerSend(s *ast.SendStmt) ([]ir.Stmt, error) {
 	value = l.copyIfValueRead(s.Value, value)
 	send := &ir.Intrinsic{Name: "chan_send", Args: []ir.Expr{ch, value}}
 	return []ir.Stmt{&ir.ExprStmt{X: send}}, nil
+}
+
+// selectClause carries a lowered select comm clause: the dispatch index the run
+// result must equal to take it, minus one for the default, and the statements the
+// clause runs, the receive bindings first when it binds a value.
+type selectClause struct {
+	index  int
+	body   []ir.Stmt
+	isDflt bool
+}
+
+// lowerSelect lowers a select statement to a call into the runtime select builder
+// and an if-elif dispatch on the case it chose. The cases are collected in source
+// order as per-case tuples, (0, ch) for a receive or (1, ch, value) for a send,
+// which evaluates every channel operand and send value once on entry, the order
+// Go requires. The builder returns the chosen case index with the received value and
+// ok flag, and the dispatch binds a receive clause's variables from that pair
+// before running its body. A default makes the select non-blocking and lands as
+// the trailing else, since the builder returns minus one when it takes the
+// default.
+func (l *lowerer) lowerSelect(s *ast.SelectStmt) ([]ir.Stmt, error) {
+	idxName := seqName("_sel", l.selectSeq)
+	valName := seqName("_selv", l.selectSeq)
+	okName := seqName("_selok", l.selectSeq)
+	l.selectSeq++
+	var cases []ir.Expr
+	var clauses []selectClause
+	hasDefault := false
+	index := 0
+	for _, raw := range s.Body.List {
+		cc := raw.(*ast.CommClause)
+		if cc.Comm == nil {
+			if hasDefault {
+				return nil, l.errf(cc.Pos(), "a select has at most one default")
+			}
+			hasDefault = true
+			body, _, err := l.lowerCaseBody(cc.Body)
+			if err != nil {
+				return nil, err
+			}
+			clauses = append(clauses, selectClause{index: -1, body: body, isDflt: true})
+			continue
+		}
+		caseTuple, binds, err := l.lowerSelectComm(cc.Comm, valName, okName)
+		if err != nil {
+			return nil, err
+		}
+		body, _, err := l.lowerCaseBody(cc.Body)
+		if err != nil {
+			return nil, err
+		}
+		cases = append(cases, caseTuple)
+		clauses = append(clauses, selectClause{index: index, body: append(binds, body...)})
+		index++
+	}
+	args := append([]ir.Expr{&ir.BoolLit{Value: hasDefault}}, cases...)
+	run := &ir.TupleAssign{
+		Names: []string{idxName, valName, okName},
+		Value: &ir.Intrinsic{Name: "select", Args: args},
+	}
+	return []ir.Stmt{run, l.selectDispatch(clauses, idxName)}, nil
+}
+
+// selectDispatch builds the if-elif-else chain that runs the chosen clause. A
+// non-default clause guards on the run index equal to its position, and the
+// default clause, when present, is the trailing else, so a select without a
+// default has no else and a select with one always runs a branch.
+func (l *lowerer) selectDispatch(clauses []selectClause, idxName string) ir.Stmt {
+	var dflt []ir.Stmt
+	var cases []selectClause
+	for _, c := range clauses {
+		if c.isDflt {
+			dflt = c.body
+			continue
+		}
+		cases = append(cases, c)
+	}
+	chain := dflt
+	for i := len(cases) - 1; i >= 0; i-- {
+		chain = []ir.Stmt{&ir.IfStmt{
+			Cond: &ir.BinaryExpr{Op: "==", X: &ir.Ident{Name: idxName}, Y: &ir.IntLit{Text: strconv.Itoa(cases[i].index)}},
+			Then: cases[i].body,
+			Else: chain,
+		}}
+	}
+	if len(chain) == 1 {
+		return chain[0]
+	}
+	// A select with only a default lowers to the default body wrapped so the
+	// caller always receives one statement; an empty select is a compile error in
+	// Go, so at least one clause is always present.
+	return &ir.IfStmt{Cond: &ir.BoolLit{Value: true}, Then: chain}
+}
+
+// lowerSelectComm lowers one non-default communication clause into its case tuple
+// for the builder and the bindings its body needs. A send clause is ("send", ch,
+// value) with the value cloned in the way a channel send copies a struct, and it
+// binds nothing. A receive clause is ("recv", ch); a receive that binds names
+// carries assignments from the run result, the value and, when the clause used the
+// comma-ok form, the ok flag.
+func (l *lowerer) lowerSelectComm(comm ast.Stmt, valName, okName string) (ir.Expr, []ir.Stmt, error) {
+	switch c := comm.(type) {
+	case *ast.SendStmt:
+		ch, err := l.lowerExpr(c.Chan)
+		if err != nil {
+			return nil, nil, err
+		}
+		value, err := l.lowerExpr(c.Value)
+		if err != nil {
+			return nil, nil, err
+		}
+		value = l.copyIfValueRead(c.Value, value)
+		return &ir.Tuple{Elems: []ir.Expr{&ir.IntLit{Text: "1"}, ch, value}}, nil, nil
+	case *ast.ExprStmt:
+		u, ok := astUnparen(c.X).(*ast.UnaryExpr)
+		if !ok || u.Op != token.ARROW {
+			return nil, nil, l.errf(comm.Pos(), "a select case must be a send or a receive")
+		}
+		ch, err := l.lowerExpr(u.X)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &ir.Tuple{Elems: []ir.Expr{&ir.IntLit{Text: "0"}, ch}}, nil, nil
+	case *ast.AssignStmt:
+		return l.lowerSelectRecvBind(c, valName, okName)
+	default:
+		return nil, nil, l.errf(comm.Pos(), "a select case must be a send or a receive")
+	}
+}
+
+// lowerSelectRecvBind lowers a receive clause that binds names, v := <-ch or
+// v, ok := <-ch, returning the recv case tuple and the assignments that copy the
+// run result into the clause's variables. A blank target drops its half, and an
+// address-taken target waits on its own slice as in the comma-ok receive.
+func (l *lowerer) lowerSelectRecvBind(a *ast.AssignStmt, valName, okName string) (ir.Expr, []ir.Stmt, error) {
+	u, ok := astUnparen(a.Rhs[0]).(*ast.UnaryExpr)
+	if len(a.Rhs) != 1 || !ok || u.Op != token.ARROW {
+		return nil, nil, l.errf(a.Pos(), "a select case must be a send or a receive")
+	}
+	if len(a.Lhs) > 2 {
+		return nil, nil, l.errf(a.Pos(), "a select receive binds at most a value and an ok flag")
+	}
+	for _, t := range a.Lhs {
+		if id, ok := t.(*ast.Ident); ok && l.isBoxedIdent(id) {
+			return nil, nil, l.errf(id.Pos(), "assignment to the address-taken variable %s in a select receive is not supported yet", id.Name)
+		}
+	}
+	ch, err := l.lowerExpr(u.X)
+	if err != nil {
+		return nil, nil, err
+	}
+	var binds []ir.Stmt
+	if name := tupleName(a.Lhs[0]); name != "" && name != "_" {
+		binds = append(binds, &ir.AssignStmt{Name: name, Value: &ir.Ident{Name: valName}})
+	}
+	if len(a.Lhs) == 2 {
+		if name := tupleName(a.Lhs[1]); name != "" && name != "_" {
+			binds = append(binds, &ir.AssignStmt{Name: name, Value: &ir.Ident{Name: okName}})
+		}
+	}
+	return &ir.Tuple{Elems: []ir.Expr{&ir.IntLit{Text: "0"}, ch}}, binds, nil
 }
 
 // asPanicCall returns the call expression when x is a call to the builtin panic,

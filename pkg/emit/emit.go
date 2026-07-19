@@ -221,6 +221,7 @@ var panicIntrinsics = map[string]bool{
 	"_quo":         true,
 	"chan_send":    true,
 	"chan_close":   true,
+	"select":       true,
 }
 
 // exprUnwinds reports whether evaluating an expression can raise a GoPanic. A
@@ -1181,6 +1182,12 @@ func emitExpr(e ir.Expr) (string, error) {
 		parts, err := emitArgs(e.Elems)
 		if err != nil {
 			return "", err
+		}
+		if len(e.Elems) == 1 {
+			// A one-element Python tuple needs a trailing comma, or the
+			// parentheses read as plain grouping rather than a tuple, which would
+			// turn a single-case select's case list into the case itself.
+			return fmt.Sprintf("(%s,)", parts), nil
 		}
 		return fmt.Sprintf("(%s)", parts), nil
 	case *ir.Lambda:
