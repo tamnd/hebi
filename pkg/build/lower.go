@@ -4400,6 +4400,16 @@ func (l *lowerer) lowerConversion(e *ast.CallExpr) (ir.Expr, error) {
 		return &ir.Mask{Bits: bits, Signed: signed, X: x}, nil
 	}
 
+	if _, ok := dest.Underlying().(*types.Interface); ok {
+		// A conversion to an interface type is the identity under elision: the
+		// concrete value already is the interface value. A struct or array value read
+		// is copied, matching the copy Go boxes into the interface, while a pointer or
+		// other reference is shared. A nil pointer keeps its sentinel, so the converted
+		// interface is not the nil interface, the typed-nil that compares unequal to
+		// bare nil.
+		return l.copyIfValueRead(e.Args[0], x), nil
+	}
+
 	return nil, l.errf(e.Pos(), "conversion to %s is not supported yet", dest)
 }
 
