@@ -1455,6 +1455,123 @@ def _format_float_exp(f, prec, kind):
     return out.upper() if kind == "E" else out
 
 
+def _sort_window(sl):
+    """Sort the elements a slice header spans in place, ascending, the way
+    sort.Ints, sort.Float64s, and sort.Strings each do over their element type."""
+    if sl is NIL_SLICE:
+        return
+    b, n = sl.offset, sl.length
+    sl.array[b:b + n] = sorted(sl.array[b:b + n])
+
+
+def sort_ints(sl):
+    _sort_window(sl)
+
+
+def sort_float64s(sl):
+    _sort_window(sl)
+
+
+def sort_strings(sl):
+    _sort_window(sl)
+
+
+def _are_sorted(sl):
+    """Whether the elements a slice header spans are in ascending order."""
+    if sl is NIL_SLICE:
+        return True
+    b, n = sl.offset, sl.length
+    for i in range(1, n):
+        if sl.array[b + i] < sl.array[b + i - 1]:
+            return False
+    return True
+
+
+def sort_ints_are_sorted(sl):
+    return _are_sorted(sl)
+
+
+def sort_float64s_are_sorted(sl):
+    return _are_sorted(sl)
+
+
+def sort_strings_are_sorted(sl):
+    return _are_sorted(sl)
+
+
+def _search_window(sl, x):
+    """The smallest index at which x could be inserted to keep the window sorted,
+    which is what sort.SearchInts and its siblings return over a sorted slice."""
+    n = 0 if sl is NIL_SLICE else sl.length
+    b = 0 if sl is NIL_SLICE else sl.offset
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sl.array[b + mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def sort_search_ints(sl, x):
+    return _search_window(sl, x)
+
+
+def sort_search_strings(sl, x):
+    return _search_window(sl, x)
+
+
+def sort_search_float64s(sl, x):
+    return _search_window(sl, x)
+
+
+def sort_search(n, f):
+    """sort.Search: the smallest index in [0, n) at which f turns true, or n."""
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if not f(mid):
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def sort_slice(sl, less):
+    """sort.Slice: sort the slice in place by a less function over live indices.
+
+    less reads the slice by index, so the sort mutates the backing array in place
+    and less sees each swap. An insertion sort keeps the calls index-consistent
+    and produces the sorted order any total order defines, and sort.Slice makes
+    no stability promise, so a stable pass is a valid result.
+    """
+    if sl is NIL_SLICE:
+        return
+    b, n = sl.offset, sl.length
+    arr = sl.array
+    for i in range(1, n):
+        j = i
+        while j > 0 and less(j, j - 1):
+            arr[b + j], arr[b + j - 1] = arr[b + j - 1], arr[b + j]
+            j -= 1
+
+
+def sort_slice_stable(sl, less):
+    # The insertion sort sort_slice runs is already stable, so SliceStable shares
+    # it, holding the order of elements a less does not distinguish.
+    sort_slice(sl, less)
+
+
+def sort_slice_is_sorted(sl, less):
+    """sort.SliceIsSorted: whether no element is less than the one before it."""
+    n = 0 if sl is NIL_SLICE else sl.length
+    for i in range(1, n):
+        if less(i, i - 1):
+            return False
+    return True
+
+
 def errors_unwrap(err):
     """errors.Unwrap: one level through an Unwrap() error, None for anything else.
 
