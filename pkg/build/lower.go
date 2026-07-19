@@ -4957,6 +4957,17 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		if err != nil {
 			return nil, err
 		}
+		if _, ok := l.pkg.Info.TypeOf(e.Args[0]).Underlying().(*types.Chan); ok {
+			// A channel's len is how many values are buffered and its cap is the buffer
+			// size, both read through a runtime helper since a channel is a Chan object,
+			// not a Python sized value, and len must take the channel lock to read a
+			// consistent count.
+			name := "chan_len"
+			if fun.Name == "cap" {
+				name = "chan_cap"
+			}
+			return &ir.Intrinsic{Name: name, Args: []ir.Expr{arg}}, nil
+		}
 		if fun.Name == "cap" && isSliceValue(l.pkg.Info.TypeOf(e.Args[0])) {
 			return &ir.FieldAccess{X: arg, Name: "cap"}, nil
 		}

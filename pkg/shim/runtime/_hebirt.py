@@ -1131,6 +1131,24 @@ def chan_close(ch):
     ch.close()
 
 
+def chan_len(ch):
+    """Number of values buffered in a channel, Go's len(ch). A nil channel is
+    empty, so its length is zero. The buffer is read under the channel lock so the
+    count is consistent with concurrent sends and receives."""
+    if ch is None:
+        return 0
+    with _chan_cond:
+        return len(ch._buf)
+
+
+def chan_cap(ch):
+    """Buffer capacity of a channel, Go's cap(ch). A nil channel has no buffer, so
+    its capacity is zero, and an unbuffered channel's capacity is zero too."""
+    if ch is None:
+        return 0
+    return ch._cap
+
+
 # A select case is a tuple whose first element tags its direction, 0 for a
 # receive and 1 for a send, followed by the channel and, for a send, the value.
 # An integer tag keeps the case a plain tuple the lowering can build and avoids
