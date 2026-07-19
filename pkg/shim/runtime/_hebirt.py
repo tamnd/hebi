@@ -7,6 +7,7 @@ a time as later milestones add language surface.
 """
 
 import decimal
+import functools
 import math
 import os
 import random
@@ -1570,6 +1571,141 @@ def sort_slice_is_sorted(sl, less):
         if less(i, i - 1):
             return False
     return True
+
+
+def _copy_value(v):
+    """Copy a value the way an assignment does on this tier: a struct is copied by
+    value through its copy method, and every other value is passed through, since
+    an int, a string, or a slice header needs no copy for a shallow clone."""
+    if hasattr(type(v), "_hebi_type") and hasattr(v, "copy"):
+        return v.copy()
+    return v
+
+
+def slices_contains(sl, v):
+    for e in _slice_iter(sl):
+        if e == v:
+            return True
+    return False
+
+
+def slices_index(sl, v):
+    i = 0
+    for e in _slice_iter(sl):
+        if e == v:
+            return i
+        i += 1
+    return -1
+
+
+def slices_index_func(sl, f):
+    i = 0
+    for e in _slice_iter(sl):
+        if f(e):
+            return i
+        i += 1
+    return -1
+
+
+def slices_contains_func(sl, f):
+    for e in _slice_iter(sl):
+        if f(e):
+            return True
+    return False
+
+
+def slices_sort(sl):
+    _sort_window(sl)
+
+
+def slices_sort_func(sl, cmp):
+    """slices.SortFunc: sort in place by a cmp that returns Go's negative, zero, or
+    positive over two element values, ordering through the same comparison Go's
+    pattern-defeating sort would settle on for a total order."""
+    if sl is NIL_SLICE:
+        return
+    b, n = sl.offset, sl.length
+    sl.array[b:b + n] = sorted(sl.array[b:b + n], key=functools.cmp_to_key(cmp))
+
+
+def slices_max(sl):
+    n = 0 if sl is NIL_SLICE else sl.length
+    if n == 0:
+        raise _runtime_error("slices.Max: empty list")
+    it = _slice_iter(sl)
+    m = next(it)
+    for e in it:
+        if e > m:
+            m = e
+    return m
+
+
+def slices_min(sl):
+    n = 0 if sl is NIL_SLICE else sl.length
+    if n == 0:
+        raise _runtime_error("slices.Min: empty list")
+    it = _slice_iter(sl)
+    m = next(it)
+    for e in it:
+        if e < m:
+            m = e
+    return m
+
+
+def slices_reverse(sl):
+    if sl is NIL_SLICE:
+        return
+    arr = sl.array
+    lo, hi = sl.offset, sl.offset + sl.length - 1
+    while lo < hi:
+        arr[lo], arr[hi] = arr[hi], arr[lo]
+        lo += 1
+        hi -= 1
+
+
+def slices_equal(a, b):
+    la = 0 if a is NIL_SLICE else a.length
+    lb = 0 if b is NIL_SLICE else b.length
+    if la != lb:
+        return False
+    for x, y in zip(_slice_iter(a), _slice_iter(b)):
+        if x != y:
+            return False
+    return True
+
+
+def slices_clone(sl):
+    return _slice_lit([_copy_value(e) for e in _slice_iter(sl)])
+
+
+def slices_compact(sl):
+    """slices.Compact: drop each run of equal elements to its first, in place, and
+    return the head that holds the kept elements, sharing the backing Go keeps."""
+    n = 0 if sl is NIL_SLICE else sl.length
+    if n == 0:
+        return sl
+    b, arr = sl.offset, sl.array
+    k = 1
+    for i in range(1, n):
+        if arr[b + i] != arr[b + k - 1]:
+            arr[b + k] = arr[b + i]
+            k += 1
+    return Slice(arr, b, k, sl.cap)
+
+
+def slices_binary_search(sl, target):
+    """slices.BinarySearch: the insertion index for target and whether it is
+    present, over a sorted slice, Go's (int, bool) result."""
+    n = 0 if sl is NIL_SLICE else sl.length
+    b = 0 if sl is NIL_SLICE else sl.offset
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sl.array[b + mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo, (lo < n and sl.array[b + lo] == target)
 
 
 def errors_unwrap(err):

@@ -4839,6 +4839,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		if name, ok := l.pkgFunc(fun, "sort"); ok {
 			return l.lowerSortFunc(e, name)
 		}
+		if name, ok := l.pkgFunc(fun, "slices"); ok {
+			return l.lowerSlicesFunc(e, name)
+		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
 		}
@@ -5387,6 +5390,47 @@ var stringsIntrinsics = map[string]string{
 	"Replace":      "str_replace",
 	"ReplaceAll":   "str_replace_all",
 	"EqualFold":    "str_equal_fold",
+}
+
+// slicesIntrinsics maps a slices package function to the runtime shim that
+// carries its Go semantics. The search and membership functions compare element
+// values, Sort and SortFunc order in place, Reverse and Compact rewrite the
+// backing, and BinarySearch returns Go's (index, found) pair. Insert, Delete,
+// and the grow-and-shift family wait for their own slice, and a function outside
+// this table fails loudly.
+var slicesIntrinsics = map[string]string{
+	"Contains":     "slices_contains",
+	"ContainsFunc": "slices_contains_func",
+	"Index":        "slices_index",
+	"IndexFunc":    "slices_index_func",
+	"Sort":         "slices_sort",
+	"SortFunc":     "slices_sort_func",
+	"Max":          "slices_max",
+	"Min":          "slices_min",
+	"Reverse":      "slices_reverse",
+	"Equal":        "slices_equal",
+	"Clone":        "slices_clone",
+	"Compact":      "slices_compact",
+	"BinarySearch": "slices_binary_search",
+}
+
+// lowerSlicesFunc lowers a call to the standard slices package by mapping the
+// function to its runtime shim through slicesIntrinsics. No mapped function
+// takes a spread argument, so one fails loudly, as does a function the table
+// does not carry.
+func (l *lowerer) lowerSlicesFunc(e *ast.CallExpr, name string) (ir.Expr, error) {
+	if e.Ellipsis != token.NoPos {
+		return nil, l.errf(e.Pos(), "slices.%s with a spread argument is not supported yet", name)
+	}
+	intrinsic, ok := slicesIntrinsics[name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "slices.%s is not supported yet", name)
+	}
+	args, err := l.lowerCallArgs(e.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: intrinsic, Args: args}, nil
 }
 
 // sortIntrinsics maps a sort package function to the runtime shim that carries
