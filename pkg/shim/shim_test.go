@@ -14,7 +14,7 @@ func TestSourceEmbedded(t *testing.T) {
 	if strings.TrimSpace(src) == "" {
 		t.Fatal("embedded shim source is empty")
 	}
-	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "true", "false"} {
+	for _, want := range []string{"def go_str", "def println", "def _u8", "def _i8", "def _u64", "def _i64", "def _f32", "def _gofloat", "def _gofloat32", "def _clone_array", "def _arraykey", "class Slice", "def _slice_lit", "def _subslice", "def _subslice3", "NIL_SLICE", "def _slice_append", "def _grow", "def _slice_copy", "def _decode_rune", "class _NilMap", "NIL_MAP", "def _map_index", "def _map_lookup", "def _map_delete", "def _map_clear", "def _map_items", "def _map_keys", "class FieldPtr", "class IndexPtr", "class Cell", "class _NilPtr", "NIL_PTR", "true", "false"} {
 		if !strings.Contains(src, want) {
 			t.Errorf("shim source missing %q", want)
 		}
@@ -432,5 +432,53 @@ func TestPointerHelpers(t *testing.T) {
 	want := "1\n9\n2\n[1, 20, 3]\n"
 	if got := string(out); got != want {
 		t.Errorf("pointer helper output = %q, want %q", got, want)
+	}
+}
+
+// TestCellAndNilHelpers runs the boxed-local and nil-pointer helpers under CPython:
+// a Cell reads and writes its one slot so two names sharing a cell see each other's
+// writes, same-cell pointers compare equal by identity while distinct cells do not,
+// the nil sentinel compares equal only to itself, and a read or write through it
+// raises the Go nil pointer panic rather than a Python attribute error.
+func TestCellAndNilHelpers(t *testing.T) {
+	t.Parallel()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, Name+".py"), []byte(Source()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prog := "import _hebirt as r\n" +
+		"c = r.Cell(3)\n" +
+		"print(c.get())\n" +
+		"c.set(10)\n" +
+		"print(c.get())\n" +
+		"print(c == c, c == r.Cell(3))\n" +
+		"print(r.NIL_PTR == r.NIL_PTR, r.NIL_PTR == c)\n" +
+		"try:\n" +
+		"    r.NIL_PTR.get()\n" +
+		"    print('no panic')\n" +
+		"except Exception as e:\n" +
+		"    print(e)\n" +
+		"try:\n" +
+		"    r.NIL_PTR.set(1)\n" +
+		"    print('no panic')\n" +
+		"except Exception as e:\n" +
+		"    print(e)"
+	cmd := exec.CommandContext(t.Context(), py, "-c", prog)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run cell helpers: %v\n%s", err, out)
+	}
+	want := "3\n10\n" +
+		"True False\n" +
+		"True False\n" +
+		"invalid memory address or nil pointer dereference\n" +
+		"invalid memory address or nil pointer dereference\n"
+	if got := string(out); got != want {
+		t.Errorf("cell helper output = %q, want %q", got, want)
 	}
 }

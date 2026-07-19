@@ -229,6 +229,9 @@ func exprUsesShim(e ir.Expr) bool {
 	case *ir.NilMap:
 		// The nil map sentinel names a runtime helper, so it needs the shim import.
 		return true
+	case *ir.NilPtr:
+		// The nil pointer sentinel names a runtime helper, so it needs the shim import.
+		return true
 	case *ir.MapLit:
 		for _, en := range e.Entries {
 			if exprUsesShim(en.Key) || exprUsesShim(en.Value) {
@@ -931,6 +934,8 @@ func emitExpr(e ir.Expr) (string, error) {
 		return "{" + strings.Join(parts, ", ") + "}", nil
 	case *ir.NilMap:
 		return shim.Name + ".NIL_MAP", nil
+	case *ir.NilPtr:
+		return shim.Name + ".NIL_PTR", nil
 	default:
 		return "", fmt.Errorf("emit: unsupported expression type %T", e)
 	}

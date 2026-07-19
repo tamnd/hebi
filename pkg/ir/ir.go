@@ -455,6 +455,12 @@ type MapEntry struct {
 // on any write, so a read-only use is fine and a write is a panic, exactly as Go.
 type NilMap struct{}
 
+// NilPtr is the nil pointer sentinel, the zero value a pointer variable or a
+// pointer-typed struct field takes. It compares equal only to itself, so p == nil
+// is an identity test, and a dereference raises Go's nil pointer panic, so a read
+// through it stops the Go way rather than as a Python AttributeError.
+type NilPtr struct{}
+
 // Intrinsic is a call the runtime provides rather than user code, such as the
 // println path that fmt.Println lowers to. Keeping these explicit lets the
 // emitter route them to the shim without pattern-matching call targets.
@@ -558,3 +564,4 @@ func (*SliceExpr) isExpr()   {}
 func (*NilSlice) isExpr()    {}
 func (*MapLit) isExpr()      {}
 func (*NilMap) isExpr()      {}
+func (*NilPtr) isExpr()      {}

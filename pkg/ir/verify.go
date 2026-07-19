@@ -380,6 +380,8 @@ func verifyExpr(where string, e Expr) error {
 		}
 	case *NilMap:
 		// The nil map sentinel carries no operand, so there is nothing to check.
+	case *NilPtr:
+		// The nil pointer sentinel carries no operand, so there is nothing to check.
 	default:
 		return fmt.Errorf("ir: %s is an unknown expression type %T", where, e)
 	}

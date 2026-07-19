@@ -564,6 +564,17 @@ class FieldPtr:
     def set(self, v):
         setattr(self.obj, self.name, v)
 
+    def __eq__(self, other):
+        # Go pointer equality is same-address, so two field pointers are equal when
+        # they name the same field of the same object, not when they are the same
+        # Python object, which is why &s.F == &s.F holds even from fresh pointers.
+        if not isinstance(other, FieldPtr):
+            return NotImplemented
+        return self.obj is other.obj and self.name == other.name
+
+    def __hash__(self):
+        return hash((id(self.obj), self.name))
+
 
 class IndexPtr:
     """A Go pointer into an array or slice element, &a[i], that reads and writes.
@@ -585,3 +596,55 @@ class IndexPtr:
 
     def set(self, v):
         self.seq[self.idx] = v
+
+    def __eq__(self, other):
+        # Same-address equality again, so &a[i] == &a[i] holds for the same
+        # container and index even though the two pointer objects are distinct.
+        if not isinstance(other, IndexPtr):
+            return NotImplemented
+        return self.seq is other.seq and self.idx == other.idx
+
+    def __hash__(self):
+        return hash((id(self.seq), self.idx))
+
+
+class Cell:
+    """A Go pointer to a boxed local, the one-slot storage &x names.
+
+    Python has no address-of, so a local whose address is taken is boxed into a
+    Cell up front, and every read and write of the local goes through get and set.
+    Taking the address is then just naming the cell, so a copy of the pointer shares
+    the same cell, and two pointers are equal when they are the same cell, which is
+    Python object identity and exactly Go's same-address rule.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, v):
+        self.value = v
+
+
+class _NilPtr:
+    """The nil pointer sentinel, the zero value a pointer variable takes.
+
+    It compares equal only to itself, so p == nil is a plain identity test, and a
+    dereference raises Go's nil pointer panic rather than a Python AttributeError,
+    so a program that reads through a nil pointer stops the Go way.
+    """
+
+    __slots__ = ()
+
+    def get(self):
+        raise _runtime_error("invalid memory address or nil pointer dereference")
+
+    def set(self, v):
+        raise _runtime_error("invalid memory address or nil pointer dereference")
+
+
+NIL_PTR = _NilPtr()

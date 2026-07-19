@@ -114,6 +114,13 @@ func (l *lowerer) structField(name string, t types.Type, pos token.Pos) (ir.Stru
 		}
 		return ir.StructField{Name: name, Kind: ir.FieldArray, Zero: zero}, nil
 	}
+	if _, ok := t.Underlying().(*types.Pointer); ok {
+		// A pointer field can hold a nil zero, but pointing it at anything needs the
+		// address of a struct or a heap value, which waits on the struct-pointer
+		// slice, so a struct with a pointer field is deferred whole rather than half
+		// working.
+		return ir.StructField{}, l.errf(pos, "a pointer field %s is not supported yet", name)
+	}
 	zero, err := l.zeroValueOfType(t, pos)
 	if err != nil {
 		return ir.StructField{}, err
@@ -156,6 +163,11 @@ type lowerer struct {
 	// argument to keep the value the iteration held. It is empty under the pre-1.22
 	// shared-variable semantics, where a closure captures the one shared variable.
 	snapshot map[types.Object]bool
+	// boxed is the set of scalar locals in the function being lowered whose address
+	// is taken, so each is stored in a Cell and every read and write goes through
+	// the cell's get and set. Taking the address of such a local is then just naming
+	// its cell, which is how a pointer to a plain local reads on Python.
+	boxed map[types.Object]bool
 }
 
 // scope is one enclosing breakable construct: a loop or a switch, carrying the Go
@@ -250,11 +262,14 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if fd.Body == nil {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
 	}
+	l.boxed = l.computeBoxed(fd)
+	defer func() { l.boxed = nil }()
+	boxInit := l.boxParamInits(fd.Type.Params)
 	body, err := l.lowerBlock(fd.Body)
 	if err != nil {
 		return nil, err
 	}
-	body = append(prelude, body...)
+	body = append(append(boxInit, prelude...), body...)
 	body = resolveLabeledJumps(body)
 	return &ir.Func{Name: fd.Name.Name, Params: params, Body: body}, nil
 }
@@ -525,6 +540,11 @@ func (l *lowerer) closureNonlocals(e *ast.FuncLit) ([]string, error) {
 			// Declared inside the closure, so the write binds the closure's own local.
 			continue
 		}
+		if l.boxed[obj] {
+			// A write to an address-taken local goes through its cell's set, not a
+			// rebind of the name, so the closure needs no nonlocal to reach it.
+			continue
+		}
 		if obj.Parent() != nil && obj.Pkg() != nil && obj.Parent() == obj.Pkg().Scope() {
 			bad = l.errf(e.Pos(), "assignment to package-level variable %s from a closure is not supported yet", obj.Name())
 			continue
@@ -602,6 +622,189 @@ func forLoopVars(s *ast.ForStmt) []*ast.Ident {
 func identOf(e ast.Expr) *ast.Ident {
 	id, _ := e.(*ast.Ident)
 	return id
+}
+
+// computeBoxed finds the scalar locals and parameters of a function whose address
+// is taken with &x, the ones that must live in a Cell so a pointer to the local
+// names one shared slot. It looks only at &ident in this function's own body, not
+// inside a nested function literal, which boxes its own locals in its own frame. A
+// loop variable, a named result, a package-level variable, and a non-scalar are
+// left out, so taking the address of one of those still reaches the diagnosis in
+// lowerAddr rather than silently boxing a case this slice does not model.
+func (l *lowerer) computeBoxed(fd *ast.FuncDecl) map[types.Object]bool {
+	loopVars := l.loopVarObjects(fd.Body)
+	results := l.resultObjects(fd.Type.Results)
+	boxed := map[types.Object]bool{}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		u, ok := n.(*ast.UnaryExpr)
+		if !ok || u.Op != token.AND {
+			return true
+		}
+		id, ok := astUnparen(u.X).(*ast.Ident)
+		if !ok {
+			return true
+		}
+		v, ok := l.pkg.Info.ObjectOf(id).(*types.Var)
+		if !ok || v.IsField() {
+			return true
+		}
+		if loopVars[v] || results[v] || l.isPackageScope(v) {
+			return true
+		}
+		if _, ok := v.Type().Underlying().(*types.Basic); !ok {
+			return true
+		}
+		boxed[v] = true
+		return true
+	})
+	if len(boxed) == 0 {
+		return nil
+	}
+	return boxed
+}
+
+// loopVarObjects collects the variables a for or range loop declares in the body,
+// which are excluded from boxing because a pointer to a loop variable has its own
+// per-iteration lifetime this slice does not model yet.
+func (l *lowerer) loopVarObjects(body *ast.BlockStmt) map[types.Object]bool {
+	out := map[types.Object]bool{}
+	add := func(e ast.Expr) {
+		if id, ok := e.(*ast.Ident); ok && id.Name != "_" {
+			if obj := l.pkg.Info.Defs[id]; obj != nil {
+				out[obj] = true
+			}
+		}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.ForStmt:
+			for _, id := range forLoopVars(s) {
+				add(id)
+			}
+		case *ast.RangeStmt:
+			if s.Tok == token.DEFINE {
+				add(s.Key)
+				add(s.Value)
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// resultObjects collects the named result variables of a function, which are
+// excluded from boxing because a bare return returns them by name and a cell would
+// return the box rather than the value it holds.
+func (l *lowerer) resultObjects(fields *ast.FieldList) map[types.Object]bool {
+	out := map[types.Object]bool{}
+	if fields == nil {
+		return out
+	}
+	for _, field := range fields.List {
+		for _, name := range field.Names {
+			if obj := l.pkg.Info.Defs[name]; obj != nil {
+				out[obj] = true
+			}
+		}
+	}
+	return out
+}
+
+// isPackageScope reports whether an object is declared at package scope, so its
+// address is a package-global pointer this slice does not model.
+func (l *lowerer) isPackageScope(obj types.Object) bool {
+	return obj.Parent() != nil && obj.Pkg() != nil && obj.Parent() == obj.Pkg().Scope()
+}
+
+// boxParamInits builds the statements that re-home each address-taken parameter
+// into a cell at the top of the body, x = Cell(x), so a pointer to a parameter
+// aims at one shared slot the same way a pointer to a local does.
+func (l *lowerer) boxParamInits(fields *ast.FieldList) []ir.Stmt {
+	if fields == nil || len(l.boxed) == 0 {
+		return nil
+	}
+	var out []ir.Stmt
+	for _, field := range fields.List {
+		for _, name := range field.Names {
+			if obj := l.pkg.Info.Defs[name]; obj != nil && l.boxed[obj] {
+				out = append(out, &ir.AssignStmt{Name: name.Name, Value: l.cellOf(&ir.Ident{Name: name.Name})})
+			}
+		}
+	}
+	return out
+}
+
+// cellOf wraps a value in a Cell construction, the box a pointer to a local names.
+func (l *lowerer) cellOf(v ir.Expr) ir.Expr {
+	return &ir.Intrinsic{Name: "Cell", Args: []ir.Expr{v}}
+}
+
+// isBoxedIdent reports whether an identifier refers to an address-taken local that
+// lives in a cell, so its reads and writes go through the cell.
+func (l *lowerer) isBoxedIdent(id *ast.Ident) bool {
+	if len(l.boxed) == 0 {
+		return false
+	}
+	return l.boxed[l.pkg.Info.ObjectOf(id)]
+}
+
+// identRead lowers a read of an identifier, going through the cell with a deref
+// when the local is boxed and naming it directly otherwise.
+func (l *lowerer) identRead(id *ast.Ident) ir.Expr {
+	if l.isBoxedIdent(id) {
+		return &ir.Deref{X: &ir.Ident{Name: id.Name}}
+	}
+	return &ir.Ident{Name: id.Name}
+}
+
+// nilSentinel lowers a nil of a known type to the zero-value sentinel it names, a
+// nil pointer, a nil slice, or a nil map. An interface, function, or channel nil
+// waits on its own slice.
+func (l *lowerer) nilSentinel(t types.Type, pos token.Pos) (ir.Expr, error) {
+	switch t.Underlying().(type) {
+	case *types.Pointer:
+		return &ir.NilPtr{}, nil
+	case *types.Slice:
+		return &ir.NilSlice{}, nil
+	case *types.Map:
+		return &ir.NilMap{}, nil
+	default:
+		return nil, l.errf(pos, "nil of type %s is not supported yet", t)
+	}
+}
+
+// nilFor lowers the bare nil identifier where its type is not fixed by context.
+// An untyped nil carries no type of its own, so a nil that is not compared against
+// a typed operand, the one context this slice reads its type from, waits on the
+// slice that threads a destination type into every position nil can appear.
+func (l *lowerer) nilFor(id *ast.Ident) (ir.Expr, error) {
+	t := l.pkg.Info.TypeOf(id)
+	if t == nil || isUntypedNil(t) {
+		return nil, l.errf(id.Pos(), "nil in this position is not supported yet")
+	}
+	return l.nilSentinel(t, id.Pos())
+}
+
+// isUntypedNil reports whether a type is the predeclared untyped nil, which is
+// what go/types records for the nil identifier since nil never takes a default
+// type of its own the way an untyped number does.
+func isUntypedNil(t types.Type) bool {
+	b, ok := t.(*types.Basic)
+	return ok && b.Kind() == types.UntypedNil
+}
+
+// isNilExpr reports whether an expression is the bare nil identifier, so a caller
+// that knows the surrounding type can lower it to the right sentinel.
+func (l *lowerer) isNilExpr(e ast.Expr) bool {
+	id, ok := e.(*ast.Ident)
+	if !ok || id.Name != "nil" {
+		return false
+	}
+	t := l.pkg.Info.TypeOf(id)
+	return t != nil && isUntypedNil(t)
 }
 
 // snapshotLoopVars registers the given loop variables as per-iteration snapshots
@@ -765,6 +968,9 @@ func (l *lowerer) lowerDecl(s *ast.DeclStmt) ([]ir.Stmt, error) {
 				if err != nil {
 					return nil, err
 				}
+				if l.isBoxedIdent(name) {
+					zero = l.cellOf(zero)
+				}
 				out = append(out, &ir.AssignStmt{Name: name.Name, Value: zero, Define: true})
 			}
 			continue
@@ -779,6 +985,9 @@ func (l *lowerer) lowerDecl(s *ast.DeclStmt) ([]ir.Stmt, error) {
 			}
 			if name.Name != "_" {
 				value = l.copyIfValueRead(vs.Values[i], value)
+			}
+			if l.isBoxedIdent(name) {
+				value = l.cellOf(value)
 			}
 			out = append(out, &ir.AssignStmt{Name: name.Name, Value: value, Define: true})
 		}
@@ -817,6 +1026,11 @@ func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) 
 		// A map is a reference too, so its zero value is the nil map sentinel, which
 		// reads as empty and panics on write exactly as a Go nil map does.
 		return &ir.NilMap{}, nil
+	}
+	if _, ok := t.Underlying().(*types.Pointer); ok {
+		// A pointer's zero value is nil, the sentinel that compares equal only to
+		// itself and panics the Go way when a program reads through it.
+		return &ir.NilPtr{}, nil
 	}
 	basic, ok := t.Underlying().(*types.Basic)
 	if ok {
@@ -974,6 +1188,15 @@ func (l *lowerer) lowerAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 		if lhs.Name != "_" {
 			value = l.copyIfValueRead(s.Rhs[0], value)
 		}
+		if l.isBoxedIdent(lhs) {
+			// The local lives in a cell, so a define builds the cell around the value
+			// and a plain assignment writes through it, keeping every pointer to the
+			// local aimed at the one shared slot.
+			if s.Tok == token.DEFINE {
+				return []ir.Stmt{&ir.AssignStmt{Name: lhs.Name, Value: l.cellOf(value), Define: true}}, nil
+			}
+			return []ir.Stmt{&ir.DerefSet{Ptr: &ir.Ident{Name: lhs.Name}, Value: value}}, nil
+		}
 		return []ir.Stmt{&ir.AssignStmt{Name: lhs.Name, Value: value, Define: s.Tok == token.DEFINE}}, nil
 	case *ast.SelectorExpr:
 		obj, err := l.lowerFieldTarget(lhs)
@@ -1094,6 +1317,9 @@ func (l *lowerer) multiAssignNames(lhs []ast.Expr) ([]string, error) {
 		if !ok {
 			return nil, l.errf(t.Pos(), "a multiple assignment target must be a name for now")
 		}
+		if l.isBoxedIdent(id) {
+			return nil, l.errf(id.Pos(), "assignment to the address-taken variable %s in a multiple assignment is not supported yet", id.Name)
+		}
 		names[i] = id.Name
 	}
 	return names, nil
@@ -1115,6 +1341,11 @@ func (l *lowerer) lowerMapCommaOk(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	okName := tupleName(s.Lhs[1])
 	if valName == "" || okName == "" {
 		return nil, l.errf(s.Pos(), "the comma-ok read binds two plain names")
+	}
+	for _, t := range s.Lhs {
+		if id, ok := t.(*ast.Ident); ok && l.isBoxedIdent(id) {
+			return nil, l.errf(id.Pos(), "assignment to the address-taken variable %s in a comma-ok read is not supported yet", id.Name)
+		}
 	}
 	mp := l.pkg.Info.TypeOf(idx.X).Underlying().(*types.Map)
 	if err := l.checkMapKey(mp.Key(), s.Pos()); err != nil {
@@ -1194,8 +1425,11 @@ func (l *lowerer) lowerCompoundAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	inner := &ir.BinaryExpr{Op: spec.op, X: &ir.Ident{Name: name.Name}, Y: y}
+	inner := &ir.BinaryExpr{Op: spec.op, X: l.identRead(name), Y: y}
 	value := l.narrow(s.Lhs[0], spec.tok, inner)
+	if l.isBoxedIdent(name) {
+		return []ir.Stmt{&ir.DerefSet{Ptr: &ir.Ident{Name: name.Name}, Value: value}}, nil
+	}
 	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value}}, nil
 }
 
@@ -1211,8 +1445,11 @@ func (l *lowerer) lowerIncDec(s *ast.IncDecStmt) ([]ir.Stmt, error) {
 	if s.Tok == token.DEC {
 		op, tok = "-", token.SUB
 	}
-	inner := &ir.BinaryExpr{Op: op, X: &ir.Ident{Name: name.Name}, Y: &ir.IntLit{Text: "1"}}
+	inner := &ir.BinaryExpr{Op: op, X: l.identRead(name), Y: &ir.IntLit{Text: "1"}}
 	value := l.narrow(s.X, tok, inner)
+	if l.isBoxedIdent(name) {
+		return []ir.Stmt{&ir.DerefSet{Ptr: &ir.Ident{Name: name.Name}, Value: value}}, nil
+	}
 	return []ir.Stmt{&ir.AssignStmt{Name: name.Name, Value: value}}, nil
 }
 
@@ -2040,8 +2277,10 @@ func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
 			return &ir.BoolLit{Value: true}, nil
 		case "false":
 			return &ir.BoolLit{Value: false}, nil
+		case "nil":
+			return l.nilFor(e)
 		default:
-			return &ir.Ident{Name: e.Name}, nil
+			return l.identRead(e), nil
 		}
 	case *ast.UnaryExpr:
 		return l.lowerUnary(e)
@@ -2364,16 +2603,29 @@ func isStructValue(t types.Type) bool {
 }
 
 func (l *lowerer) lowerBinary(e *ast.BinaryExpr) (ir.Expr, error) {
-	x, err := l.lowerExpr(e.X)
+	x, err := l.lowerOperand(e.X, e.Y)
 	if err != nil {
 		return nil, err
 	}
-	y, err := l.lowerExpr(e.Y)
+	y, err := l.lowerOperand(e.Y, e.X)
 	if err != nil {
 		return nil, err
 	}
 	inner := &ir.BinaryExpr{Op: e.Op.String(), X: x, Y: y}
 	return l.narrow(e, e.Op, inner), nil
+}
+
+// lowerOperand lowers one side of a binary expression, resolving a bare nil to the
+// sentinel of the other operand's type. A comparison p == nil is the one place nil
+// takes its type from context in this slice, since the untyped nil has none of its
+// own and the typed operand supplies it.
+func (l *lowerer) lowerOperand(e, other ast.Expr) (ir.Expr, error) {
+	if l.isNilExpr(e) {
+		if t := l.pkg.Info.TypeOf(other); t != nil && !isUntypedNil(t) {
+			return l.nilSentinel(t, e.Pos())
+		}
+	}
+	return l.lowerExpr(e)
 }
 
 // lowerIndex lowers an index expression. Indexing a string yields a byte as an
@@ -2534,6 +2786,13 @@ func (l *lowerer) lowerAddr(e *ast.UnaryExpr) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.AddrIndex{Seq: seq, Index: index}, nil
+	case *ast.Ident:
+		if l.isBoxedIdent(operand) {
+			// The local is boxed into a cell, so its address is just the cell, named
+			// by the same identifier every read and write of the local goes through.
+			return &ir.Ident{Name: operand.Name}, nil
+		}
+		return nil, l.errf(e.Pos(), "taking the address of %s is not supported yet", operand.Name)
 	default:
 		return nil, l.errf(e.Pos(), "taking the address of %T is not supported yet", operand)
 	}
