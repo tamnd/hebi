@@ -187,6 +187,14 @@ func blockUsesShim(body []ir.Stmt) bool {
 			if capturesUseShim(s.Captures) || blockUsesShim(s.Body) {
 				return true
 			}
+		case *ir.DeferBlock:
+			if blockUsesShim(s.Body) {
+				return true
+			}
+		case *ir.DeferPush:
+			if exprUsesShim(s.Func) || argsUseShim(s.Args) {
+				return true
+			}
 		}
 	}
 	return false
@@ -194,7 +202,7 @@ func blockUsesShim(body []ir.Stmt) bool {
 
 func exprUsesShim(e ir.Expr) bool {
 	switch e := e.(type) {
-	case *ir.Intrinsic, *ir.Mask:
+	case *ir.Intrinsic, *ir.Mask, *ir.ShimFunc:
 		return true
 	case *ir.BinaryExpr:
 		return exprUsesShim(e.X) || exprUsesShim(e.Y)
@@ -531,6 +539,34 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		}
 		writeIndent(b, depth)
 		fmt.Fprintf(b, "%s.set(%s)\n", ptr, value)
+	case *ir.DeferBlock:
+		writeIndent(b, depth)
+		b.WriteString("_defers = []\n")
+		writeIndent(b, depth)
+		b.WriteString("try:\n")
+		if err := emitBlock(b, s.Body, depth+1); err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		b.WriteString("finally:\n")
+		writeIndent(b, depth+1)
+		b.WriteString("for _fn, _args in reversed(_defers):\n")
+		writeIndent(b, depth+2)
+		b.WriteString("_fn(*_args)\n")
+	case *ir.DeferPush:
+		fn, err := emitExpr(s.Func)
+		if err != nil {
+			return err
+		}
+		args, err := emitArgs(s.Args)
+		if err != nil {
+			return err
+		}
+		if len(s.Args) == 1 {
+			args += ","
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "_defers.append((%s, (%s)))\n", fn, args)
 	case *ir.IfStmt:
 		cond, err := emitExpr(s.Cond)
 		if err != nil {
@@ -808,6 +844,8 @@ func emitExpr(e ir.Expr) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s.%s(%s)", shim.Name, e.Name, args), nil
+	case *ir.ShimFunc:
+		return fmt.Sprintf("%s.%s", shim.Name, e.Name), nil
 	case *ir.FieldAccess:
 		x, err := emitExpr(e.X)
 		if err != nil {

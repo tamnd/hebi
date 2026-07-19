@@ -171,6 +171,13 @@ func verifyStmt(where string, s Stmt) error {
 			return err
 		}
 		return verifyExpr(where+": value", s.Value)
+	case *DeferBlock:
+		return verifyBlock(where+": defer body", s.Body)
+	case *DeferPush:
+		if err := verifyExpr(where+": deferred call", s.Func); err != nil {
+			return err
+		}
+		return verifyArgs(where, s.Args)
 	case *IfStmt:
 		if err := verifyExpr(where+": if condition", s.Cond); err != nil {
 			return err
@@ -317,6 +324,11 @@ func verifyExpr(where string, e Expr) error {
 			return fmt.Errorf("ir: %s is an intrinsic with no name", where)
 		}
 		return verifyArgs(where, e.Args)
+	case *ShimFunc:
+		if e.Name == "" {
+			return fmt.Errorf("ir: %s is a runtime function with no name", where)
+		}
+		return nil
 	case *AddrField:
 		if e.Name == "" {
 			return fmt.Errorf("ir: %s takes the address of a field with no name", where)

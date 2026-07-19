@@ -295,8 +295,12 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if err != nil {
 		return nil, err
 	}
-	body = append(append(boxInit, prelude...), body...)
 	body = resolveLabeledJumps(body)
+	body, err = l.wrapDefers(fd, body)
+	if err != nil {
+		return nil, err
+	}
+	body = append(append(boxInit, prelude...), body...)
 	return &ir.Func{Name: fd.Name.Name, Params: params, Body: body}, nil
 }
 
@@ -345,8 +349,12 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 	if err != nil {
 		return nil, nil, err
 	}
-	body = append(append(boxInit, prelude...), body...)
 	body = resolveLabeledJumps(body)
+	body, err = l.wrapDefers(fd, body)
+	if err != nil {
+		return nil, nil, err
+	}
+	body = append(append(boxInit, prelude...), body...)
 	return owner, &ir.Method{Name: fd.Name.Name, Params: params, Body: body}, nil
 }
 
@@ -897,6 +905,78 @@ func (l *lowerer) resultObjects(fields *ast.FieldList) map[types.Object]bool {
 	return out
 }
 
+// wrapDefers wraps a lowered function body in a DeferBlock when the source
+// contains a defer, so the body runs under a try whose finally fires the deferred
+// calls in reverse order. A body with no defer is left flat. A deferred function
+// literal that reads a named result would need the deferred calls to run before
+// the result is read, which waits on the recover slice, so it is diagnosed here.
+func (l *lowerer) wrapDefers(fd *ast.FuncDecl, body []ir.Stmt) ([]ir.Stmt, error) {
+	if !bodyHasDefer(fd.Body) {
+		return body, nil
+	}
+	if l.deferReadsNamedResult(fd) {
+		return nil, l.errf(fd.Pos(), "a deferred call that reads a named result is not supported yet")
+	}
+	return []ir.Stmt{&ir.DeferBlock{Body: body}}, nil
+}
+
+// bodyHasDefer reports whether a function body contains a defer statement in its
+// own frame. A defer inside a nested function literal belongs to that closure, so
+// the walk does not descend into one.
+func bodyHasDefer(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.DeferStmt:
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// deferReadsNamedResult reports whether a deferred function literal in the
+// function's own frame reads one of its named results. Such a read must see the
+// value a return sets and any change the deferred call makes, which needs the
+// return-through-the-finally shape the recover slice brings, so this slice
+// diagnoses it rather than emit a body that reads a stale result. A named result
+// passed as a deferred argument is snapshotted at the defer site, so it is not a
+// live read and does not trip this check.
+func (l *lowerer) deferReadsNamedResult(fd *ast.FuncDecl) bool {
+	results := l.resultObjects(fd.Type.Results)
+	if len(results) == 0 {
+		return false
+	}
+	found := false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		d, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		ast.Inspect(d.Call, func(m ast.Node) bool {
+			lit, ok := m.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+			ast.Inspect(lit.Body, func(k ast.Node) bool {
+				if id, ok := k.(*ast.Ident); ok && results[l.pkg.Info.ObjectOf(id)] {
+					found = true
+				}
+				return true
+			})
+			return false
+		})
+		return false
+	})
+	return found
+}
+
 // isPackageScope reports whether an object is declared at package scope, so its
 // address is a package-global pointer this slice does not model.
 func (l *lowerer) isPackageScope(obj types.Object) bool {
@@ -1140,8 +1220,79 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return []ir.Stmt{&ir.ExprStmt{X: x}}, nil
 	case *ast.ReturnStmt:
 		return l.lowerReturn(s)
+	case *ast.DeferStmt:
+		return l.lowerDefer(s)
 	default:
 		return nil, l.errf(s.Pos(), "statement %T is not supported yet", s)
+	}
+}
+
+// lowerDefer lowers a defer statement to a DeferPush that records the callable and
+// its arguments at the point the defer runs. Go evaluates the deferred call's
+// function value and its arguments when the defer statement is reached, not when
+// the call finally fires, so the receiver of a method value and every argument are
+// snapshotted here, and a value receiver takes its copy at this point exactly as a
+// plain method value does.
+func (l *lowerer) lowerDefer(s *ast.DeferStmt) ([]ir.Stmt, error) {
+	if s.Call.Ellipsis != token.NoPos {
+		return nil, l.errf(s.Pos(), "a deferred call with a spread argument is not supported yet")
+	}
+	fn, args, err := l.lowerDeferCallee(s.Call)
+	if err != nil {
+		return nil, err
+	}
+	return []ir.Stmt{&ir.DeferPush{Func: fn, Args: args}}, nil
+}
+
+// lowerDeferCallee splits a deferred call into the callable value and the
+// arguments the DeferPush records. A plain function is its name, a method value
+// binds and copies its receiver like any method value, an immediately deferred
+// function literal hoists to a nested def the push then names, and fmt.Println
+// becomes the shim's println function reference so the finally can call it later.
+// A deferred builtin or an otherwise shaped callee waits on its own slice.
+func (l *lowerer) lowerDeferCallee(call *ast.CallExpr) (ir.Expr, []ir.Expr, error) {
+	switch fun := astUnparen(call.Fun).(type) {
+	case *ast.FuncLit:
+		callee, err := l.lowerFuncLit(fun, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		args, err := l.lowerCallArgs(call.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return callee, args, nil
+	case *ast.SelectorExpr:
+		if l.isFmtPrintln(fun) {
+			args, err := l.lowerPrintlnArgs(call.Args)
+			if err != nil {
+				return nil, nil, err
+			}
+			return &ir.ShimFunc{Name: "println"}, args, nil
+		}
+		if sel, ok := l.pkg.Info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
+			callee, err := l.lowerMethodValue(fun, sel)
+			if err != nil {
+				return nil, nil, err
+			}
+			args, err := l.lowerCallArgs(call.Args)
+			if err != nil {
+				return nil, nil, err
+			}
+			return callee, args, nil
+		}
+		return nil, nil, l.errf(call.Pos(), "a deferred call to %s.%s is not supported yet", exprName(fun.X), fun.Sel.Name)
+	case *ast.Ident:
+		if _, ok := l.pkg.Info.Uses[fun].(*types.Builtin); ok {
+			return nil, nil, l.errf(call.Pos(), "a deferred builtin call %s is not supported yet", fun.Name)
+		}
+		args, err := l.lowerCallArgs(call.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &ir.Ident{Name: fun.Name}, args, nil
+	default:
+		return nil, nil, l.errf(call.Pos(), "a deferred call target %T is not supported yet", call.Fun)
 	}
 }
 

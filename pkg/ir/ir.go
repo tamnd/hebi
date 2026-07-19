@@ -258,6 +258,22 @@ type DerefSet struct {
 	Value Expr
 }
 
+// DeferBlock wraps the statements of a function that runs deferred calls. It
+// lowers to a _defers list, a try over Body, and a finally that runs the pushed
+// calls in last-in-first-out order, matching Go's rule that a function's deferred
+// calls run in reverse of the order they were deferred as the function returns.
+type DeferBlock struct{ Body []Stmt }
+
+// DeferPush records a deferred call at the point the defer statement runs, which
+// lowers to appending the callable and its argument tuple to the _defers list.
+// The arguments are the values captured at the defer site, so a later change to a
+// variable is not seen by the deferred call, matching Go's evaluation of deferred
+// arguments at the defer statement rather than at the call.
+type DeferPush struct {
+	Func Expr
+	Args []Expr
+}
+
 // LabeledBreak marks a Go break that names an outer loop. It is a transient node
 // the lowering emits at the break site and the labeled-break pass rewrites away
 // into a flag set and a plain break before the module is verified, so it never
@@ -280,6 +296,8 @@ func (*RangeMap) isStmt()        {}
 func (*SetField) isStmt()        {}
 func (*SetIndex) isStmt()        {}
 func (*DerefSet) isStmt()        {}
+func (*DeferBlock) isStmt()      {}
+func (*DeferPush) isStmt()       {}
 func (*IfStmt) isStmt()          {}
 func (*ForStmt) isStmt()         {}
 func (*ForRange) isStmt()        {}
@@ -520,6 +538,11 @@ type Intrinsic struct {
 	Args []Expr
 }
 
+// ShimFunc is a bare reference to a runtime function, rather than a call to it. A
+// deferred fmt.Println captures the println callable itself so the finally can
+// invoke it later, so the value is the shim function without its arguments.
+type ShimFunc struct{ Name string }
+
 // AddrField is the address of a struct field, &s.Field. It lowers to a FieldPtr
 // over the struct object and the field name, which reads and writes the live
 // field, so a write through the pointer is visible in the struct. Container is
@@ -601,6 +624,7 @@ func (*MethodCall) isExpr()  {}
 func (*MethodValue) isExpr() {}
 func (*MethodExpr) isExpr()  {}
 func (*Intrinsic) isExpr()   {}
+func (*ShimFunc) isExpr()    {}
 func (*AddrField) isExpr()   {}
 func (*AddrIndex) isExpr()   {}
 func (*Deref) isExpr()       {}
