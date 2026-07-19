@@ -5622,6 +5622,7 @@ func (l *lowerer) pkgFunc(sel *ast.SelectorExpr, path string) (string, bool) {
 var timeFuncs = map[string]string{
 	"Date":      "time_date",
 	"FixedZone": "time_fixed_zone",
+	"Parse":     "time_parse",
 }
 
 // lowerTimeFunc lowers a call to the standard time package. Sleep pauses the

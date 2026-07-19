@@ -2548,7 +2548,7 @@ _ZERO_TIME_SEC = -62135596800
 
 def _days_from_civil(y, m, d):
     y -= 1 if m <= 2 else 0
-    era = (y if y >= 0 else y - 399) // 400
+    era = y // 400
     yoe = y - era * 400
     doy = (153 * (m - 3 if m > 2 else m + 9) + 2) // 5 + d - 1
     doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
@@ -2557,7 +2557,7 @@ def _days_from_civil(y, m, d):
 
 def _civil_from_days(z):
     z += 719468
-    era = (z if z >= 0 else z - 146096) // 146097
+    era = z // 146097
     doe = z - era * 146097
     yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
     y = yoe + era * 400
@@ -3031,6 +3031,388 @@ def _time_format(t, layout):
         elif std == "frac9":
             out.append(_time_frac(t._nsec, arg, True))
     return "".join(out)
+
+
+class _TimeParseError:
+    """Go's *time.ParseError, what time.Parse returns when a value does not fit its
+    layout. Its Error reads the way Go's does: the cannot-parse form names the layout
+    piece and the value text that did not match, and the message form appends a range
+    complaint such as month out of range. The fields are Go strings, so bytes."""
+
+    __slots__ = ("Layout", "Value", "LayoutElem", "ValueElem", "Message")
+
+    def __init__(self, layout, value, layoutelem, valueelem, message):
+        self.Layout = layout
+        self.Value = value
+        self.LayoutElem = layoutelem
+        self.ValueElem = valueelem
+        self.Message = message
+
+    def Error(self):
+        if self.Message == "":
+            s = ("parsing time " + _time_quote(self.Value) + " as " +
+                 _time_quote(self.Layout) + ": cannot parse " +
+                 _time_quote(self.ValueElem) + " as " + _time_quote(self.LayoutElem))
+        else:
+            s = "parsing time " + _time_quote(self.Value) + self.Message
+        return s.encode("utf-8")
+
+    def __str__(self):
+        return go_str(self.Error())
+
+
+class _TimeBad(Exception):
+    """A layout piece did not match the value: Go's errBad, caught to build the
+    cannot-parse ParseError."""
+
+
+class _TimeRange(Exception):
+    """A parsed field fell outside its range, carrying the field name Go names in the
+    out-of-range message."""
+
+    def __init__(self, what):
+        self.what = what
+
+
+def _time_quote(s):
+    """Go's quote for a ParseError element: wrap in double quotes, backslash-escape a
+    quote or backslash, and hex-escape a control byte."""
+    out = ['"']
+    for c in s:
+        if c == '"' or c == "\\":
+            out.append("\\")
+            out.append(c)
+        elif c < " ":
+            out.append("\\x%02x" % ord(c))
+        else:
+            out.append(c)
+    out.append('"')
+    return "".join(out)
+
+
+def _time_isdigit(s, i):
+    return i < len(s) and "0" <= s[i] <= "9"
+
+
+def _time_getnum(s, fixed):
+    """Go's getnum: one or two leading digits. A fixed field must supply both."""
+    if not _time_isdigit(s, 0):
+        raise _TimeBad()
+    if not _time_isdigit(s, 1):
+        if fixed:
+            raise _TimeBad()
+        return int(s[0]), s[1:]
+    return int(s[0]) * 10 + int(s[1]), s[2:]
+
+
+def _time_getnum3(s, fixed):
+    """Go's getnum3: up to three leading digits, all three when the field is fixed."""
+    n = 0
+    i = 0
+    while i < 3 and _time_isdigit(s, i):
+        n = n * 10 + int(s[i])
+        i += 1
+    if i == 0 or (fixed and i != 3):
+        raise _TimeBad()
+    return n, s[i:]
+
+
+def _time_lookup(names, val):
+    """Go's lookup: match one of names as a case-insensitive prefix of val and return
+    its index and the rest of val."""
+    low = val.lower()
+    for i, v in enumerate(names):
+        lv = v.lower()
+        if low[:len(lv)] == lv:
+            return i, val[len(v):]
+    raise _TimeBad()
+
+
+def _time_skip(value, prefix):
+    """Go's skip: consume the literal prefix from value, where a run of spaces in the
+    prefix matches a run of spaces in the value."""
+    while prefix:
+        if prefix[0] == " ":
+            if value and value[0] != " ":
+                raise _TimeBad()
+            prefix = prefix.lstrip(" ")
+            value = value.lstrip(" ")
+            continue
+        if not value or value[0] != prefix[0]:
+            raise _TimeBad()
+        prefix = prefix[1:]
+        value = value[1:]
+    return value
+
+
+def _time_parse_nanoseconds(value, nbytes):
+    """Go's parseNanoseconds: read the fractional second value[0:nbytes], where
+    value[0] is the point, and scale the digits up to a nanosecond count."""
+    if value[0] != "." and value[0] != ",":
+        raise _TimeBad()
+    if nbytes > 10:
+        nbytes = 10
+    digits = value[1:nbytes]
+    for c in digits:
+        if not ("0" <= c <= "9"):
+            raise _TimeBad()
+    ns = int(digits) if digits else 0
+    scale = 10 - nbytes
+    for _ in range(scale):
+        ns *= 10
+    return ns
+
+
+_SHORT_MONTHS = tuple(m[:3] for m in _MONTH_NAMES)
+_SHORT_WEEKDAYS = tuple(w[:3] for w in _WEEKDAY_NAMES)
+
+_ISO_TZ = ("isotz", "isoshorttz", "isosecondstz", "isocolontz", "isocolonsecondstz")
+
+
+def _days_in_month(month, year):
+    """The number of days in a month, counting a leap February as 29."""
+    if month == 2:
+        leap = (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+        return 29 if leap else 28
+    return (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[month - 1]
+
+
+def time_parse(layout, value):
+    """Go's time.Parse: read value against the reference-time layout and return the
+    Time it names, or the zero Time and a ParseError. The zone reads through UTC when
+    the layout carries no zone, and a numeric or Z zone lands the instant exactly; a
+    bare zone abbreviation needs the host local zone and is not on this slice."""
+    if isinstance(layout, (bytes, bytearray)):
+        layout = bytes(layout).decode("utf-8")
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8")
+    return _time_parse(layout, value, time_utc)
+
+
+def _time_parse(alayout, avalue, default_loc):
+    layout = alayout
+    value = avalue
+    am_set = False
+    pm_set = False
+    year = 0
+    month = -1
+    day = -1
+    yday = -1
+    hour = 0
+    minute = 0
+    sec = 0
+    nsec = 0
+    z = None
+    zone_offset = -1
+    zone_name = ""
+
+    def cannot(elem, valelem):
+        return (time_zero(), _TimeParseError(alayout, avalue, elem, valelem, ""))
+
+    while True:
+        prefix, std, arg, suffix = _next_std_chunk(layout)
+        stdstr = layout[len(prefix):len(layout) - len(suffix)]
+        try:
+            value = _time_skip(value, prefix)
+        except _TimeBad:
+            return cannot(prefix, value)
+        if std == "":
+            if value:
+                return (time_zero(), _TimeParseError(
+                    alayout, avalue, "", value, ": extra text: " + _time_quote(value)))
+            break
+        layout = suffix
+        hold = value
+        try:
+            if std == "year":
+                if len(value) < 2 or not _time_isdigit(value, 0) or not _time_isdigit(value, 1):
+                    raise _TimeBad()
+                yy = int(value[:2])
+                value = value[2:]
+                year = yy + 1900 if yy >= 69 else yy + 2000
+            elif std == "longyear":
+                if len(value) < 4 or not all(_time_isdigit(value, i) for i in range(4)):
+                    raise _TimeBad()
+                year = int(value[:4])
+                value = value[4:]
+            elif std == "month":
+                idx, value = _time_lookup(_SHORT_MONTHS, value)
+                month = idx + 1
+            elif std == "longmonth":
+                idx, value = _time_lookup(_MONTH_NAMES, value)
+                month = idx + 1
+            elif std in ("nummonth", "zeromonth"):
+                month, value = _time_getnum(value, std == "zeromonth")
+                if month <= 0 or month > 12:
+                    raise _TimeRange("month")
+            elif std == "weekday":
+                _, value = _time_lookup(_SHORT_WEEKDAYS, value)
+            elif std == "longweekday":
+                _, value = _time_lookup(_WEEKDAY_NAMES, value)
+            elif std in ("day", "underday", "zeroday"):
+                if std == "underday" and value[:1] == " ":
+                    value = value[1:]
+                day, value = _time_getnum(value, std == "zeroday")
+            elif std in ("underyearday", "zeroyearday"):
+                yday, value = _time_getnum3(value, std == "zeroyearday")
+            elif std == "hour":
+                hour, value = _time_getnum(value, False)
+                if hour < 0 or hour >= 24:
+                    raise _TimeRange("hour")
+            elif std in ("hour12", "zerohour12"):
+                hour, value = _time_getnum(value, std == "zerohour12")
+                if hour < 0 or hour > 12:
+                    raise _TimeRange("hour")
+            elif std in ("minute", "zerominute"):
+                minute, value = _time_getnum(value, std == "zerominute")
+                if minute < 0 or minute >= 60:
+                    raise _TimeRange("minute")
+            elif std in ("second", "zerosecond"):
+                sec, value = _time_getnum(value, std == "zerosecond")
+                if sec < 0 or sec >= 60:
+                    raise _TimeRange("second")
+                if value[:1] in (".", ",") and len(value) > 1 and "0" <= value[1] <= "9":
+                    nxt_prefix, nxt_std, nxt_arg, _ = _next_std_chunk(layout)
+                    if nxt_prefix == "" and nxt_std in ("frac0", "frac9"):
+                        pass
+                    else:
+                        i = 0
+                        while i < 9 and _time_isdigit(value, 1 + i):
+                            i += 1
+                        nsec = _time_parse_nanoseconds(value, 1 + i)
+                        value = value[1 + i:]
+            elif std == "pm_upper":
+                if len(value) < 2:
+                    raise _TimeBad()
+                p, value = value[:2], value[2:]
+                if p == "PM":
+                    pm_set = True
+                elif p == "AM":
+                    am_set = True
+                else:
+                    raise _TimeBad()
+            elif std == "pm_lower":
+                if len(value) < 2:
+                    raise _TimeBad()
+                p, value = value[:2], value[2:]
+                if p == "pm":
+                    pm_set = True
+                elif p == "am":
+                    am_set = True
+                else:
+                    raise _TimeBad()
+            elif std in ("isotz", "isoshorttz", "isosecondstz", "isocolontz",
+                         "isocolonsecondstz", "numtz", "numshorttz", "numsecondstz",
+                         "numcolontz", "numcolonsecondstz"):
+                if std in _ISO_TZ and value[:1] == "Z":
+                    value = value[1:]
+                    z = time_utc
+                else:
+                    if std in ("isocolontz", "numcolontz"):
+                        if len(value) < 6 or value[3] != ":":
+                            raise _TimeBad()
+                        sign, hh, mm, ssn, value = value[0], value[1:3], value[4:6], "00", value[6:]
+                    elif std in ("numshorttz", "isoshorttz"):
+                        if len(value) < 3:
+                            raise _TimeBad()
+                        sign, hh, mm, ssn, value = value[0], value[1:3], "00", "00", value[3:]
+                    elif std in ("isocolonsecondstz", "numcolonsecondstz"):
+                        if len(value) < 9 or value[3] != ":" or value[6] != ":":
+                            raise _TimeBad()
+                        sign, hh, mm, ssn, value = value[0], value[1:3], value[4:6], value[7:9], value[9:]
+                    elif std in ("isosecondstz", "numsecondstz"):
+                        if len(value) < 7:
+                            raise _TimeBad()
+                        sign, hh, mm, ssn, value = value[0], value[1:3], value[3:5], value[5:7], value[7:]
+                    else:
+                        if len(value) < 5:
+                            raise _TimeBad()
+                        sign, hh, mm, ssn, value = value[0], value[1:3], value[3:5], "00", value[5:]
+                    hr, _ = _time_getnum(hh, True)
+                    mi, _ = _time_getnum(mm, True)
+                    ss, _ = _time_getnum(ssn, True)
+                    zone_offset = (hr * 60 + mi) * 60 + ss
+                    if sign == "+":
+                        pass
+                    elif sign == "-":
+                        zone_offset = -zone_offset
+                    else:
+                        raise _TimeBad()
+            elif std == "tz":
+                if value[:3] == "UTC":
+                    z = time_utc
+                    value = value[3:]
+                else:
+                    j = 0
+                    while j < len(value) and "A" <= value[j] <= "Z":
+                        j += 1
+                    if j == 0:
+                        raise _TimeBad()
+                    zone_name, value = value[:j], value[j:]
+            elif std == "frac0":
+                ndigit = 1 + arg
+                if len(value) < ndigit:
+                    raise _TimeBad()
+                nsec = _time_parse_nanoseconds(value, ndigit)
+                value = value[ndigit:]
+            elif std == "frac9":
+                if (len(value) < 2 or (value[0] != "." and value[0] != ",")
+                        or not ("0" <= value[1] <= "9")):
+                    pass
+                else:
+                    i = 0
+                    while i < 9 and _time_isdigit(value, 1 + i):
+                        i += 1
+                    nsec = _time_parse_nanoseconds(value, 1 + i)
+                    value = value[1 + i:]
+        except _TimeRange as r:
+            return (time_zero(), _TimeParseError(
+                alayout, avalue, stdstr, value, ": " + r.what + " out of range"))
+        except _TimeBad:
+            return cannot(stdstr, hold)
+
+    if pm_set and hour < 12:
+        hour += 12
+    elif am_set and hour == 12:
+        hour = 0
+
+    if yday >= 0:
+        if yday < 1 or yday > (366 if _days_in_month(2, year) == 29 else 365):
+            return (time_zero(), _TimeParseError(
+                alayout, avalue, "", "", ": day-of-year out of range"))
+        m = 1
+        d = yday
+        while m <= 12 and d > _days_in_month(m, year):
+            d -= _days_in_month(m, year)
+            m += 1
+        if month >= 0 and (month != m or (day >= 0 and day != d)):
+            return (time_zero(), _TimeParseError(
+                alayout, avalue, "", "", ": day-of-year does not match day"))
+        month, day = m, d
+    else:
+        if month < 0:
+            month = 1
+        if day < 0:
+            day = 1
+
+    if day < 1 or day > _days_in_month(month, year):
+        return (time_zero(), _TimeParseError(
+            alayout, avalue, "", "", ": day out of range"))
+
+    if z is not None:
+        loc = z
+    elif zone_offset != -1:
+        if zone_offset == 0 and zone_name in ("", "UTC"):
+            loc = time_utc
+        else:
+            loc = time_fixed_zone(zone_name, zone_offset)
+    elif zone_name not in ("", "UTC"):
+        return (time_zero(), _TimeParseError(
+            alayout, avalue, "", "", ": zone " + _time_quote(zone_name) +
+            " needs the host local zone, not supported yet"))
+    else:
+        loc = default_loc
+    return (time_date(year, month, day, hour, minute, sec, nsec, loc), None)
 
 
 def _sleep(ns):
