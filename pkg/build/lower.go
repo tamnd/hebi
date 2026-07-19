@@ -225,6 +225,13 @@ func (l *lowerer) lowerInterfaceSpec(ts *ast.TypeSpec, it *types.Interface) (*ir
 // a pointer, slice, map, or the like, waits on a later slice and fails loudly
 // through zeroValueOfType.
 func (l *lowerer) structField(name string, t types.Type, pos token.Pos) (ir.StructField, error) {
+	if syncName, ok := syncTypeName(t); ok {
+		// A sync field builds its own runtime object per instance and shares it on
+		// copy, so it carries the constructor intrinsic as its zero and takes its own
+		// field kind rather than the value-struct path, which would emit a bare class
+		// name the module never defines.
+		return ir.StructField{Name: name, Kind: ir.FieldSync, Zero: &ir.Intrinsic{Name: syncName}}, nil
+	}
 	if _, ok := t.Underlying().(*types.Struct); ok {
 		named, ok := t.(*types.Named)
 		if !ok {
@@ -1715,6 +1722,88 @@ func (l *lowerer) lowerSelectRecvBind(a *ast.AssignStmt, valName, okName string)
 	return &ir.Tuple{Elems: []ir.Expr{&ir.IntLit{Text: "0"}, ch}}, binds, nil
 }
 
+// syncMethods maps each modeled sync type's methods to the runtime free function
+// that carries the operation. The runtime models a sync value as a shared
+// reference object and passes it as the first argument, so a method call lowers to
+// a plain intrinsic rather than a Python method, which also lets the crash guard
+// list the operations that panic the Go way by name.
+var syncMethods = map[string]map[string]string{
+	"Mutex": {
+		"Lock":    "mutex_lock",
+		"Unlock":  "mutex_unlock",
+		"TryLock": "mutex_try_lock",
+	},
+	"RWMutex": {
+		"Lock":     "rwmutex_lock",
+		"Unlock":   "rwmutex_unlock",
+		"RLock":    "rwmutex_rlock",
+		"RUnlock":  "rwmutex_runlock",
+		"TryLock":  "rwmutex_try_lock",
+		"TryRLock": "rwmutex_try_rlock",
+	},
+	"WaitGroup": {
+		"Add":  "waitgroup_add",
+		"Done": "waitgroup_done",
+		"Wait": "waitgroup_wait",
+	},
+	"Once": {
+		"Do": "once_do",
+	},
+}
+
+// syncTypeName reports whether t, ignoring a leading pointer, is one of the sync
+// package types the runtime models as a shared reference object, returning the
+// type's name. A sync value is never copied in Go, where copying a used one is a
+// vet error, so the runtime gives each its own object and shares it through a
+// pointer receiver, which is why the pointer and the value forms map to the same
+// object.
+func syncTypeName(t types.Type) (string, bool) {
+	if t == nil {
+		return "", false
+	}
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok {
+		return "", false
+	}
+	obj := named.Obj()
+	if obj.Pkg() == nil || obj.Pkg().Path() != "sync" {
+		return "", false
+	}
+	switch obj.Name() {
+	case "Mutex", "RWMutex", "WaitGroup", "Once":
+		return obj.Name(), true
+	}
+	return "", false
+}
+
+// lowerSyncMethod lowers a call to a method on a sync value to the runtime free
+// function that carries it, passing the receiver as the first argument. The
+// receiver lowers without a clone, since a sync value is a shared reference object
+// the pointer receiver reaches directly, and the remaining arguments lower plainly,
+// which covers Once.Do's function and WaitGroup.Add's delta.
+func (l *lowerer) lowerSyncMethod(e *ast.CallExpr, sel *ast.SelectorExpr, typ string) (ir.Expr, error) {
+	fn, ok := syncMethods[typ][sel.Sel.Name]
+	if !ok {
+		return nil, l.errf(e.Pos(), "sync.%s.%s is not supported yet", typ, sel.Sel.Name)
+	}
+	recv, err := l.lowerExpr(sel.X)
+	if err != nil {
+		return nil, err
+	}
+	args := []ir.Expr{recv}
+	for _, a := range e.Args {
+		arg, err := l.lowerExpr(a)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+	}
+	return &ir.Intrinsic{Name: fn, Args: args}, nil
+}
+
 // asPanicCall returns the call expression when x is a call to the builtin panic,
 // or nil otherwise, so lowerStmt can route it to the raise form rather than treat
 // it as a plain call expression. A user function named panic would resolve to a
@@ -1865,6 +1954,11 @@ func (l *lowerer) zeroValue(name *ast.Ident) (ir.Expr, error) {
 // through the single-precision helper. Any other type waits on a later slice and
 // fails loudly, which is also how an unsupported struct field type is caught.
 func (l *lowerer) zeroValueOfType(t types.Type, pos token.Pos) (ir.Expr, error) {
+	if name, ok := syncTypeName(t); ok {
+		// A sync value's zero value is a fresh runtime object, so var mu sync.Mutex
+		// and a sync-typed struct field each construct their own, never a shared one.
+		return &ir.Intrinsic{Name: name}, nil
+	}
 	if _, ok := t.Underlying().(*types.Struct); ok {
 		named, ok := t.(*types.Named)
 		if !ok {
@@ -3767,6 +3861,11 @@ func structOf(t types.Type) *types.Struct {
 // aggregate slices.
 func (l *lowerer) lowerCompositeLit(e *ast.CompositeLit) (ir.Expr, error) {
 	t := l.pkg.Info.TypeOf(e)
+	if name, ok := syncTypeName(t); ok {
+		// A sync composite literal, sync.Mutex{} or &sync.Mutex{}, is a fresh runtime
+		// object, the same one var mu sync.Mutex builds.
+		return &ir.Intrinsic{Name: name}, nil
+	}
 	if arr, ok := t.Underlying().(*types.Array); ok {
 		return l.lowerArrayLit(e, arr)
 	}
@@ -4543,6 +4642,9 @@ func (l *lowerer) lowerCall(e *ast.CallExpr) (ir.Expr, error) {
 		}
 		if name, ok := l.pkgFunc(fun, "time"); ok {
 			return l.lowerTimeFunc(e, name)
+		}
+		if typ, ok := syncTypeName(l.pkg.Info.TypeOf(fun.X)); ok {
+			return l.lowerSyncMethod(e, fun, typ)
 		}
 		if sel, ok := l.pkg.Info.Selections[fun]; ok {
 			switch sel.Kind() {

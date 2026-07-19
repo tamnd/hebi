@@ -118,6 +118,12 @@ const (
 	// it defaults to a fresh zero array built in the constructor body and copies
 	// element-wise through the array clone helper, never by sharing the list.
 	FieldArray
+	// FieldSync is a sync primitive field, a Mutex, RWMutex, WaitGroup, or Once:
+	// its zero value is a fresh runtime object built in the constructor body, so
+	// each instance owns its own, and copy shares the object since a sync value is
+	// a reference the pointer receiver reaches and copying a used one is a Go vet
+	// error the source would not contain.
+	FieldSync
 )
 
 // StructField is one field of a struct. Zero is the constructor default for a
