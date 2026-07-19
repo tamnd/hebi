@@ -1457,6 +1457,8 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 		return l.lowerRange(s, "")
 	case *ast.SwitchStmt:
 		return l.lowerSwitch(s)
+	case *ast.TypeSwitchStmt:
+		return l.lowerTypeSwitch(s)
 	case *ast.BranchStmt:
 		return l.lowerBranch(s)
 	case *ast.LabeledStmt:
@@ -2573,6 +2575,142 @@ func (l *lowerer) lowerSwitch(s *ast.SwitchStmt) ([]ir.Stmt, error) {
 		elseBlock = []ir.Stmt{branches[i]}
 	}
 	return append(pre, elseBlock...), nil
+}
+
+// lowerTypeSwitch lowers a type switch to an if/elif chain over the runtime type
+// check, faithful because the cases test in source order and the first match runs
+// with no fallthrough. The guard expression spills to a temporary so it runs once,
+// and each case tests its type list against that temporary. The guard variable, if
+// it is named, binds to the temporary per case: a single concrete case binds the
+// asserted type and clones a struct value out of the interface, while a multi-type
+// case, a nil case, or the default keeps the interface value, which is never a
+// struct value. The nil case matches the nil interface by identity, and the
+// default, wherever it is written, becomes the final else.
+func (l *lowerer) lowerTypeSwitch(s *ast.TypeSwitchStmt) ([]ir.Stmt, error) {
+	if s.Init != nil {
+		return nil, l.errf(s.Pos(), "type switch with an init statement is not supported yet")
+	}
+	var guard *ast.TypeAssertExpr
+	bindName := ""
+	switch a := s.Assign.(type) {
+	case *ast.ExprStmt:
+		guard, _ = a.X.(*ast.TypeAssertExpr)
+	case *ast.AssignStmt:
+		if id, ok := a.Lhs[0].(*ast.Ident); ok {
+			bindName = id.Name
+		}
+		guard, _ = a.Rhs[0].(*ast.TypeAssertExpr)
+	}
+	if guard == nil {
+		return nil, l.errf(s.Pos(), "type switch guard is not supported yet")
+	}
+	x, err := l.lowerExpr(guard.X)
+	if err != nil {
+		return nil, err
+	}
+	// A closure in the guard hoists above the switch, before the tag temporary.
+	pre := l.flushPendingDefs()
+	tagName := seqName("_typ", l.switchSeq)
+	l.switchSeq++
+	pre = append(pre, &ir.AssignStmt{Name: tagName, Value: x, Define: true})
+
+	// A type switch is a breakable scope, so an unlabeled break inside a case leaves
+	// the switch rather than an enclosing loop.
+	l.pushScope(scope{kind: scopeSwitch})
+	type clause struct {
+		cond ir.Expr // nil marks the default clause
+		body []ir.Stmt
+	}
+	var clauses []clause
+	for _, item := range s.Body.List {
+		cc, ok := item.(*ast.CaseClause)
+		if !ok {
+			l.popScope()
+			return nil, l.errf(item.Pos(), "type switch body item %T is not supported yet", item)
+		}
+		cond, err := l.typeCaseCond(tagName, cc.List)
+		if err != nil {
+			l.popScope()
+			return nil, err
+		}
+		body, _, err := l.lowerCaseBody(cc.Body)
+		if err != nil {
+			l.popScope()
+			return nil, err
+		}
+		if bindName != "" && bindName != "_" {
+			bind := &ir.AssignStmt{Name: bindName, Value: l.typeCaseBind(tagName, cc.List), Define: true}
+			body = append([]ir.Stmt{bind}, body...)
+		}
+		clauses = append(clauses, clause{cond: cond, body: body})
+	}
+	l.popScope()
+
+	var branches []*ir.IfStmt
+	var defaultBody []ir.Stmt
+	hasDefault := false
+	for _, c := range clauses {
+		if c.cond == nil {
+			defaultBody = c.body
+			hasDefault = true
+			continue
+		}
+		branches = append(branches, &ir.IfStmt{Cond: c.cond, Then: c.body})
+	}
+	if len(branches) == 0 {
+		// Only a default, or an empty type switch: no chain, just the default body.
+		return append(pre, defaultBody...), nil
+	}
+	var elseBlock []ir.Stmt
+	if hasDefault {
+		elseBlock = defaultBody
+	}
+	for i := len(branches) - 1; i >= 0; i-- {
+		branches[i].Else = elseBlock
+		elseBlock = []ir.Stmt{branches[i]}
+	}
+	return append(pre, elseBlock...), nil
+}
+
+// typeCaseCond builds a type switch case's condition, an or chain over its type
+// list. A concrete or interface type tests through the _assert_pass predicate, the
+// same check a one-result assertion runs, and the nil type tests the tag against
+// None by identity. An empty list is the default clause, which has no condition.
+func (l *lowerer) typeCaseCond(tag string, list []ast.Expr) (ir.Expr, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+	parts := make([]ir.Expr, len(list))
+	for i, e := range list {
+		if l.isNilExpr(e) {
+			parts[i] = &ir.BinaryExpr{Op: "is", X: &ir.Ident{Name: tag}, Y: &ir.NilInterface{}}
+			continue
+		}
+		info, err := l.assertTarget(l.pkg.Info.TypeOf(e), e)
+		if err != nil {
+			return nil, err
+		}
+		parts[i] = &ir.Intrinsic{Name: "_assert_pass", Args: []ir.Expr{&ir.Ident{Name: tag}, info.ref, &ir.BoolLit{Value: info.structural}}}
+	}
+	expr := parts[0]
+	for _, p := range parts[1:] {
+		expr = &ir.BinaryExpr{Op: "||", X: expr, Y: p}
+	}
+	return expr, nil
+}
+
+// typeCaseBind builds the value a named guard variable binds to in a case. A single
+// concrete case binds the asserted type, so a struct value is cloned out of the
+// interface the way a one-result assertion copies it; a multi-type case, a nil case,
+// or the default keeps the interface value itself, which is never a struct value.
+func (l *lowerer) typeCaseBind(tag string, list []ast.Expr) ir.Expr {
+	base := &ir.Ident{Name: tag}
+	if len(list) == 1 && !l.isNilExpr(list[0]) {
+		if clone := l.cloneForType(l.pkg.Info.TypeOf(list[0]), base); clone != nil {
+			return clone
+		}
+	}
+	return base
 }
 
 // lowerCaseBody lowers a case clause's statements, reporting whether the clause
