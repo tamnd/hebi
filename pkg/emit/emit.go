@@ -99,9 +99,73 @@ func Module(m *ir.Module) (string, error) {
 		}
 	}
 	if hasMain {
-		b.WriteString("\n\nif __name__ == \"__main__\":\n    main()\n")
+		if moduleUnwinds(m) {
+			// A panic that runs off the top of main crashes the Go way: the guard
+			// catches the escaping GoPanic and prints Go's banner before exiting with
+			// status 2, rather than letting Python print its own traceback. It is
+			// emitted only for a module that panics or defers, since only those raise a
+			// GoPanic that can reach here.
+			b.WriteString("\n\nif __name__ == \"__main__\":\n")
+			b.WriteString("    try:\n        main()\n")
+			fmt.Fprintf(&b, "    except %s.GoPanic as _p:\n        %s._crash(_p)\n", shim.Name, shim.Name)
+		} else {
+			b.WriteString("\n\nif __name__ == \"__main__\":\n    main()\n")
+		}
 	}
 	return b.String(), nil
+}
+
+// moduleUnwinds reports whether the module contains a panic or a defer anywhere,
+// the constructs that raise or propagate a GoPanic, so the entry guard that turns
+// an escaping panic into Go's crash surface is emitted only when one can arise.
+func moduleUnwinds(m *ir.Module) bool {
+	for _, sd := range m.Structs {
+		for _, method := range sd.Methods {
+			if blockUnwinds(method.Body) {
+				return true
+			}
+		}
+	}
+	for _, fn := range m.Funcs {
+		if blockUnwinds(fn.Body) {
+			return true
+		}
+	}
+	return false
+}
+
+func blockUnwinds(body []ir.Stmt) bool {
+	for _, s := range body {
+		switch s := s.(type) {
+		case *ir.Panic, *ir.DeferBlock, *ir.DeferPush, *ir.DeferReturn:
+			return true
+		case *ir.IfStmt:
+			if blockUnwinds(s.Then) || blockUnwinds(s.Else) {
+				return true
+			}
+		case *ir.ForStmt:
+			if blockUnwinds(s.Body) {
+				return true
+			}
+		case *ir.ForRange:
+			if blockUnwinds(s.Body) {
+				return true
+			}
+		case *ir.RangeMap:
+			if blockUnwinds(s.Body) {
+				return true
+			}
+		case *ir.RangeString:
+			if blockUnwinds(s.Body) {
+				return true
+			}
+		case *ir.FuncDef:
+			if blockUnwinds(s.Body) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // usesShim reports whether the module contains any intrinsic, which is the only
@@ -188,13 +252,21 @@ func blockUsesShim(body []ir.Stmt) bool {
 				return true
 			}
 		case *ir.DeferBlock:
-			if blockUsesShim(s.Body) {
+			// A reshaped defer block names the runtime's GoPanic and _run_defers in
+			// its except handler, so it needs the import regardless of its body.
+			if s.Reshape || blockUsesShim(s.Body) {
 				return true
 			}
 		case *ir.DeferPush:
 			if exprUsesShim(s.Func) || argsUseShim(s.Args) {
 				return true
 			}
+		case *ir.DeferReturn:
+			// A defer return calls the runtime's _run_defers.
+			return true
+		case *ir.Panic:
+			// A panic raises the runtime's GoPanic, and its value may reach the shim too.
+			return true
 		}
 	}
 	return false
@@ -540,6 +612,9 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		writeIndent(b, depth)
 		fmt.Fprintf(b, "%s.set(%s)\n", ptr, value)
 	case *ir.DeferBlock:
+		if s.Reshape {
+			return emitDeferReshape(b, s, depth)
+		}
 		writeIndent(b, depth)
 		b.WriteString("_defers = []\n")
 		writeIndent(b, depth)
@@ -553,6 +628,19 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		b.WriteString("for _fn, _args in reversed(_defers):\n")
 		writeIndent(b, depth+2)
 		b.WriteString("_fn(*_args)\n")
+	case *ir.DeferReturn:
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "%s._run_defers(_defers)\n", shim.Name)
+		writeIndent(b, depth)
+		b.WriteString(deferResultReturn(s.Results))
+		b.WriteString("\n")
+	case *ir.Panic:
+		value, err := emitExpr(s.Value)
+		if err != nil {
+			return err
+		}
+		writeIndent(b, depth)
+		fmt.Fprintf(b, "raise %s.GoPanic(%s)\n", shim.Name, value)
 	case *ir.DeferPush:
 		fn, err := emitExpr(s.Func)
 		if err != nil {
@@ -616,6 +704,77 @@ func emitStmt(b *strings.Builder, s ir.Stmt, depth int) error {
 		return fmt.Errorf("emit: unsupported statement type %T", s)
 	}
 	return nil
+}
+
+// emitDeferReshape writes the try-and-except shape a function needs when a
+// deferred call reads or changes a named result or calls recover. The body runs
+// under a try that ends by running the deferred calls and returning the result
+// variables, which covers a function that falls off its end or reaches a bare
+// return. Each explicit return inside the body is a DeferReturn that runs the
+// deferred calls before it hands the results back. The except catches an escaping
+// GoPanic, runs the deferred calls, and then, if a deferred recover consumed the
+// panic, returns the result variables as the deferred calls left them; otherwise
+// it re-raises so the panic keeps unwinding. Every exit runs the deferred calls
+// exactly once.
+func emitDeferReshape(b *strings.Builder, s *ir.DeferBlock, depth int) error {
+	writeIndent(b, depth)
+	b.WriteString("_defers = []\n")
+	writeIndent(b, depth)
+	b.WriteString("try:\n")
+	if err := emitBlock(b, s.Body, depth+1); err != nil {
+		return err
+	}
+	if !endsTerminated(s.Body) {
+		writeIndent(b, depth+1)
+		fmt.Fprintf(b, "%s._run_defers(_defers)\n", shim.Name)
+		writeIndent(b, depth+1)
+		b.WriteString(deferResultReturn(s.Results))
+		b.WriteString("\n")
+	}
+	writeIndent(b, depth)
+	fmt.Fprintf(b, "except %s.GoPanic as _p:\n", shim.Name)
+	writeIndent(b, depth+1)
+	fmt.Fprintf(b, "%s._run_defers(_defers)\n", shim.Name)
+	writeIndent(b, depth+1)
+	b.WriteString("if not _p.recovered:\n")
+	writeIndent(b, depth+2)
+	b.WriteString("raise\n")
+	writeIndent(b, depth+1)
+	b.WriteString(deferResultReturn(s.Results))
+	b.WriteString("\n")
+	return nil
+}
+
+// endsTerminated reports whether a reshaped body's last statement already leaves
+// the function on every path, either a DeferReturn that drains the defers and
+// returns or a Panic that raises. When it does, the try needs no trailing normal
+// exit, since control never falls off the end. A body that can fall through, such
+// as a void function that recovers and returns implicitly, has no such tail and
+// still needs the trailing drain and return.
+func endsTerminated(body []ir.Stmt) bool {
+	if len(body) == 0 {
+		return false
+	}
+	switch body[len(body)-1].(type) {
+	case *ir.DeferReturn, *ir.Panic:
+		return true
+	default:
+		return false
+	}
+}
+
+// deferResultReturn renders the return a reshaped deferring function hands back:
+// a bare return for no results, the single name for one, and a parenthesized tuple
+// for several, so the emitted return matches the function's result arity.
+func deferResultReturn(results []string) string {
+	switch len(results) {
+	case 0:
+		return "return"
+	case 1:
+		return "return " + results[0]
+	default:
+		return "return (" + strings.Join(results, ", ") + ")"
+	}
 }
 
 // emitElse writes an if statement's else part. An else block that is exactly one

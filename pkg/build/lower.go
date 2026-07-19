@@ -158,6 +158,16 @@ type lowerer struct {
 	// return in a function with named results returns these, so the lowerer needs
 	// them in hand while it walks the body.
 	resultNames []string
+	// deferReshape is set while lowering a deferring function whose deferred calls
+	// read or change a named result or call recover, so its body needs the try and
+	// except reshape rather than the plain finally. A return in such a body lowers to
+	// a DeferReturn that runs the deferred calls before it hands the results back.
+	deferReshape bool
+	// deferResults holds the result variable names a reshaped deferring function
+	// returns, in declaration order, empty for a void function. A DeferReturn reads
+	// these to build its handoff, and the reshape block returns them on the recovered
+	// panic path.
+	deferResults []string
 	// pendingDefs holds the nested defs a closure lowering hoisted, waiting to be
 	// flushed just above the statement whose expression created them. A multi
 	// statement function literal cannot be an expression in Python, so it lowers to
@@ -286,6 +296,10 @@ func (l *lowerer) lowerFunc(fd *ast.FuncDecl) (*ir.Func, error) {
 	if fd.Body == nil {
 		return nil, l.errf(fd.Pos(), "function %s has no body", fd.Name.Name)
 	}
+	if err := l.beginDefer(fd); err != nil {
+		return nil, err
+	}
+	defer func() { l.deferReshape = false; l.deferResults = nil }()
 	l.boxed = l.computeBoxed(fd)
 	l.aliased = l.computeAliased(fd)
 	l.instancePtr = l.computeInstancePtrs(fd, l.aliased)
@@ -340,6 +354,10 @@ func (l *lowerer) lowerMethod(fd *ast.FuncDecl) (*ir.StructDef, *ir.Method, erro
 		return nil, nil, err
 	}
 	defer func() { l.resultNames = nil }()
+	if err := l.beginDefer(fd); err != nil {
+		return nil, nil, err
+	}
+	defer func() { l.deferReshape = false; l.deferResults = nil }()
 	l.boxed = l.computeBoxed(fd)
 	l.aliased = l.computeAliased(fd)
 	l.instancePtr = l.computeInstancePtrs(fd, l.aliased)
@@ -452,6 +470,9 @@ func (l *lowerer) beginResults(fields *ast.FieldList) ([]ir.Stmt, error) {
 // since the caller receives an independent value, which is the copy-on-return site
 // of the value-semantics rule.
 func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
+	if l.deferReshape {
+		return l.lowerReshapedReturn(s)
+	}
 	if len(s.Results) == 0 {
 		if len(l.resultNames) == 0 {
 			return []ir.Stmt{&ir.ReturnStmt{}}, nil
@@ -482,6 +503,31 @@ func (l *lowerer) lowerReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
 		elems[i] = l.copyIfValueRead(r, value)
 	}
 	return []ir.Stmt{&ir.ReturnStmt{Value: &ir.Tuple{Elems: elems}}}, nil
+}
+
+// lowerReshapedReturn lowers a return inside a reshaped deferring function. The
+// deferred calls run after the results are set and may still mutate a named
+// result, so a return cannot hand its values straight back. Each explicit return
+// value is first assigned into its named result variable, then an ir.DeferReturn
+// drains the defer stack and returns the result variables. A bare return skips
+// the assignment, since the named results already hold what a bare return means.
+func (l *lowerer) lowerReshapedReturn(s *ast.ReturnStmt) ([]ir.Stmt, error) {
+	var stmts []ir.Stmt
+	if len(s.Results) > 0 {
+		if len(s.Results) != len(l.deferResults) {
+			return nil, l.errf(s.Pos(), "return with %d values in a deferring function with %d results is not supported yet", len(s.Results), len(l.deferResults))
+		}
+		for i, r := range s.Results {
+			value, err := l.lowerExpr(r)
+			if err != nil {
+				return nil, err
+			}
+			value = l.copyIfValueRead(r, value)
+			stmts = append(stmts, &ir.AssignStmt{Name: l.deferResults[i], Value: value})
+		}
+	}
+	stmts = append(stmts, &ir.DeferReturn{Results: l.deferResults})
+	return stmts, nil
 }
 
 // lowerFuncLit lowers a Go function literal to a closure. A literal whose body is
@@ -523,13 +569,19 @@ func (l *lowerer) lowerFuncLitDef(e *ast.FuncLit, params []string, captures []ir
 		return nil, err
 	}
 	saved := l.resultNames
+	savedReshape, savedResults := l.deferReshape, l.deferResults
+	l.deferReshape, l.deferResults = false, nil
+	restore := func() {
+		l.resultNames = saved
+		l.deferReshape, l.deferResults = savedReshape, savedResults
+	}
 	prelude, err := l.beginResults(e.Type.Results)
 	if err != nil {
-		l.resultNames = saved
+		restore()
 		return nil, err
 	}
 	body, err := l.lowerBlock(e.Body)
-	l.resultNames = saved
+	restore()
 	if err != nil {
 		return nil, err
 	}
@@ -907,17 +959,83 @@ func (l *lowerer) resultObjects(fields *ast.FieldList) map[types.Object]bool {
 
 // wrapDefers wraps a lowered function body in a DeferBlock when the source
 // contains a defer, so the body runs under a try whose finally fires the deferred
-// calls in reverse order. A body with no defer is left flat. A deferred function
-// literal that reads a named result would need the deferred calls to run before
-// the result is read, which waits on the recover slice, so it is diagnosed here.
+// calls in reverse order. A body with no defer is left flat. A reshaping frame,
+// one with named results or a deferred recover, carries its result names on the
+// block, so the block's emitter can drain the defers and return the results after
+// an unrecovered panic unwinds through them.
 func (l *lowerer) wrapDefers(fd *ast.FuncDecl, body []ir.Stmt) ([]ir.Stmt, error) {
 	if !bodyHasDefer(fd.Body) {
 		return body, nil
 	}
-	if l.deferReadsNamedResult(fd) {
-		return nil, l.errf(fd.Pos(), "a deferred call that reads a named result is not supported yet")
+	return []ir.Stmt{&ir.DeferBlock{Body: body, Reshape: l.deferReshape, Results: l.deferResults}}, nil
+}
+
+// beginDefer records on the lowerer whether the function being lowered reshapes
+// its defers, and if so the result variable names the reshaped body returns. A
+// function with no defer never reshapes. A function whose deferred calls may run
+// after a return and still change a named result, either because it has named
+// results or because a deferred call recovers, reshapes: its returns route through
+// the defer stack rather than hand a value straight back. A deferred recover in a
+// function with unnamed non-void results has no result variable to return after
+// the unwind, so it is diagnosed rather than lowered to a body that would drop the
+// recovered result.
+func (l *lowerer) beginDefer(fd *ast.FuncDecl) error {
+	l.deferReshape = false
+	l.deferResults = nil
+	if !bodyHasDefer(fd.Body) {
+		return nil
 	}
-	return []ir.Stmt{&ir.DeferBlock{Body: body}}, nil
+	if len(l.resultNames) > 0 {
+		l.deferReshape = true
+		l.deferResults = append([]string(nil), l.resultNames...)
+		return nil
+	}
+	if l.deferHasRecover(fd) {
+		if !resultsAreVoid(fd.Type.Results) {
+			return l.errf(fd.Pos(), "a deferred recover in a function with unnamed results is not supported yet")
+		}
+		l.deferReshape = true
+	}
+	return nil
+}
+
+// resultsAreVoid reports whether a result list carries no values, so a reshaped
+// body returns nothing after its defers unwind.
+func resultsAreVoid(fields *ast.FieldList) bool {
+	return fields == nil || len(fields.List) == 0
+}
+
+// deferHasRecover reports whether a deferred call in the function's own frame calls
+// the builtin recover, directly or inside the deferred function literal's body. A
+// recover in a nested non-deferred closure belongs to that closure's frame, so the
+// walk does not descend into one.
+func (l *lowerer) deferHasRecover(fd *ast.FuncDecl) bool {
+	found := false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		d, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		ast.Inspect(d.Call, func(m ast.Node) bool {
+			call, ok := m.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if b, ok := l.pkg.Info.Uses[id].(*types.Builtin); ok && b.Name() == "recover" {
+				found = true
+			}
+			return true
+		})
+		return false
+	})
+	return found
 }
 
 // bodyHasDefer reports whether a function body contains a defer statement in its
@@ -934,45 +1052,6 @@ func bodyHasDefer(body *ast.BlockStmt) bool {
 			return false
 		}
 		return true
-	})
-	return found
-}
-
-// deferReadsNamedResult reports whether a deferred function literal in the
-// function's own frame reads one of its named results. Such a read must see the
-// value a return sets and any change the deferred call makes, which needs the
-// return-through-the-finally shape the recover slice brings, so this slice
-// diagnoses it rather than emit a body that reads a stale result. A named result
-// passed as a deferred argument is snapshotted at the defer site, so it is not a
-// live read and does not trip this check.
-func (l *lowerer) deferReadsNamedResult(fd *ast.FuncDecl) bool {
-	results := l.resultObjects(fd.Type.Results)
-	if len(results) == 0 {
-		return false
-	}
-	found := false
-	ast.Inspect(fd.Body, func(n ast.Node) bool {
-		if _, ok := n.(*ast.FuncLit); ok {
-			return false
-		}
-		d, ok := n.(*ast.DeferStmt)
-		if !ok {
-			return true
-		}
-		ast.Inspect(d.Call, func(m ast.Node) bool {
-			lit, ok := m.(*ast.FuncLit)
-			if !ok {
-				return true
-			}
-			ast.Inspect(lit.Body, func(k ast.Node) bool {
-				if id, ok := k.(*ast.Ident); ok && results[l.pkg.Info.ObjectOf(id)] {
-					found = true
-				}
-				return true
-			})
-			return false
-		})
-		return false
 	})
 	return found
 }
@@ -1213,6 +1292,9 @@ func (l *lowerer) lowerStmt(s ast.Stmt) ([]ir.Stmt, error) {
 	case *ast.LabeledStmt:
 		return l.lowerLabeled(s)
 	case *ast.ExprStmt:
+		if panicCall := l.asPanicCall(s.X); panicCall != nil {
+			return l.lowerPanic(panicCall)
+		}
 		x, err := l.lowerExpr(s.X)
 		if err != nil {
 			return nil, err
@@ -1242,6 +1324,46 @@ func (l *lowerer) lowerDefer(s *ast.DeferStmt) ([]ir.Stmt, error) {
 		return nil, err
 	}
 	return []ir.Stmt{&ir.DeferPush{Func: fn, Args: args}}, nil
+}
+
+// asPanicCall returns the call expression when x is a call to the builtin panic,
+// or nil otherwise, so lowerStmt can route it to the raise form rather than treat
+// it as a plain call expression. A user function named panic would resolve to a
+// non-builtin object and not match.
+func (l *lowerer) asPanicCall(x ast.Expr) *ast.CallExpr {
+	call, ok := x.(*ast.CallExpr)
+	if !ok {
+		return nil
+	}
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	if b, ok := l.pkg.Info.Uses[id].(*types.Builtin); ok && b.Name() == "panic" {
+		return call
+	}
+	return nil
+}
+
+// lowerPanic lowers a panic call to an ir.Panic that raises a GoPanic carrying the
+// argument. A panic with a nil argument raises the runtime's PanicNilError from Go
+// 1.21 on, matching the language change that made panic(nil) a run-time error; an
+// older file version has no such error, so it is diagnosed rather than lowered to a
+// panic with a nil value the surface would render wrong.
+func (l *lowerer) lowerPanic(call *ast.CallExpr) ([]ir.Stmt, error) {
+	arg := call.Args[0]
+	if l.pkg.Info.Types[arg].IsNil() {
+		if version.Compare(l.fileVersion(call.Pos()), "go1.21") >= 0 {
+			return []ir.Stmt{&ir.Panic{Value: &ir.Intrinsic{Name: "PanicNilError"}}}, nil
+		}
+		return nil, l.errf(call.Pos(), "panic with a nil argument before go1.21 is not supported yet")
+	}
+	value, err := l.lowerExpr(arg)
+	if err != nil {
+		return nil, err
+	}
+	value = l.copyIfValueRead(arg, value)
+	return []ir.Stmt{&ir.Panic{Value: value}}, nil
 }
 
 // lowerDeferCallee splits a deferred call into the callable value and the
@@ -3488,6 +3610,11 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		return l.lowerDelete(e)
 	case "clear":
 		return l.lowerClear(e)
+	case "recover":
+		if len(e.Args) != 0 {
+			return nil, l.errf(e.Pos(), "recover takes no arguments")
+		}
+		return &ir.Intrinsic{Name: "_recover"}, nil
 	default:
 		return nil, l.errf(e.Pos(), "builtin %s is not supported yet", fun.Name)
 	}
