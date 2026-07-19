@@ -1047,6 +1047,25 @@ def chan_recv(ch):
     return value
 
 
+def chan_recv_ok(ch):
+    """Receive a value and the ok flag, Go's v, ok := <-ch and the range form.
+
+    ok is false when the channel is closed and drained, which is what ends a
+    range over a channel. A nil channel blocks forever, so the flag never comes.
+    """
+    if ch is None:
+        _block_forever()
+    return ch.recv()
+
+
+def chan_close(ch):
+    """Close a channel, Go's close(ch). Closing a nil channel panics, and the
+    close method panics on an already closed channel, matching Go."""
+    if ch is None:
+        raise GoPanic("close of nil channel")
+    ch.close()
+
+
 def _block_forever():
     """Park the current goroutine on a condition that is never signaled.
 

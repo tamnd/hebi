@@ -211,12 +211,16 @@ func stmtUnwinds(s ir.Stmt) bool {
 // so an expression carrying one can crash the Go way even when its arguments cannot.
 // The one-result type assertion panics when the interface does not hold the asserted
 // type, and integer division and remainder panic on a zero divisor; the comma-ok
-// _type_assert_ok and the float _fdiv never panic.
+// _type_assert_ok and the float _fdiv never panic. A send on a closed channel and a
+// close of a closed or nil channel panic, so chan_send and chan_close carry the
+// crash the guard must account for; a receive never panics.
 var panicIntrinsics = map[string]bool{
 	"_type_assert": true,
 	"_idiv":        true,
 	"_imod":        true,
 	"_quo":         true,
+	"chan_send":    true,
+	"chan_close":   true,
 }
 
 // exprUnwinds reports whether evaluating an expression can raise a GoPanic. A

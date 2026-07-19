@@ -1994,6 +1994,9 @@ func (l *lowerer) lowerMultiAssign(s *ast.AssignStmt) ([]ir.Stmt, error) {
 			if ta, ok := astUnparen(s.Rhs[0]).(*ast.TypeAssertExpr); ok {
 				return l.lowerTypeAssertCommaOk(s, ta)
 			}
+			if u, ok := astUnparen(s.Rhs[0]).(*ast.UnaryExpr); ok && u.Op == token.ARROW {
+				return l.lowerRecvCommaOk(s, u)
+			}
 			return l.lowerMapCommaOk(s)
 		}
 		return nil, l.errf(s.Pos(), "multiple assignment is not supported yet")
@@ -2149,6 +2152,36 @@ func (l *lowerer) lowerTypeAssertCommaOk(s *ast.AssignStmt, ta *ast.TypeAssertEx
 		}
 	}
 	return out, nil
+}
+
+// lowerRecvCommaOk lowers the two-value receive v, ok := <-ch, which binds the
+// received value and a boolean that is true while the channel is open and false
+// once it is closed and drained. It becomes a tuple assignment from the
+// chan_recv_ok helper, which returns the value and the flag, the flag being what
+// a program tests to stop reading a closed channel. A struct or array value is
+// received out of the channel already unshared, since the buffer released it, so
+// no clone is owed here, matching that the value the sender copied in is the only
+// reference the receiver takes.
+func (l *lowerer) lowerRecvCommaOk(s *ast.AssignStmt, u *ast.UnaryExpr) ([]ir.Stmt, error) {
+	valName := tupleName(s.Lhs[0])
+	okName := tupleName(s.Lhs[1])
+	if valName == "" || okName == "" {
+		return nil, l.errf(s.Pos(), "the comma-ok receive binds two plain names")
+	}
+	for _, t := range s.Lhs {
+		if id, ok := t.(*ast.Ident); ok && l.isBoxedIdent(id) {
+			return nil, l.errf(id.Pos(), "assignment to the address-taken variable %s in a comma-ok receive is not supported yet", id.Name)
+		}
+	}
+	ch, err := l.lowerExpr(u.X)
+	if err != nil {
+		return nil, err
+	}
+	return []ir.Stmt{&ir.TupleAssign{
+		Names:  []string{valName, okName},
+		Value:  &ir.Intrinsic{Name: "chan_recv_ok", Args: []ir.Expr{ch}},
+		Define: s.Tok == token.DEFINE,
+	}}, nil
 }
 
 // tupleName returns the name of a comma-ok target, or the empty string when the
@@ -3079,6 +3112,9 @@ func (l *lowerer) lowerRange(s *ast.RangeStmt, label string) ([]ir.Stmt, error) 
 	if mp, ok := srcType.Underlying().(*types.Map); ok {
 		return l.lowerRangeMap(s, mp, label)
 	}
+	if _, ok := srcType.Underlying().(*types.Chan); ok {
+		return l.lowerRangeChan(s, label)
+	}
 	basic, ok := srcType.Underlying().(*types.Basic)
 	if !ok {
 		return nil, l.errf(s.Pos(), "range over %s is not supported yet", srcType)
@@ -3186,6 +3222,43 @@ func (l *lowerer) lowerRangeMap(s *ast.RangeStmt, mp *types.Map, label string) (
 	}
 	body = append(pre, body...)
 	return []ir.Stmt{&ir.RangeMap{Key: keyName, Value: valName, Source: src, Body: body, Label: label}}, nil
+}
+
+// lowerRangeChan lowers for v := range ch, which receives from the channel until
+// it is closed and drained, binding each received value to v. Go's range over a
+// channel yields a single value and no index, so a second variable is rejected.
+// It becomes an unconditional loop that receives with the comma-ok helper at the
+// top and breaks once the ok flag is false, the same termination the two-value
+// receive gives a hand-written loop. The received value is unshared, released by
+// the channel buffer, so no per-iteration clone is owed.
+func (l *lowerer) lowerRangeChan(s *ast.RangeStmt, label string) ([]ir.Stmt, error) {
+	if s.Value != nil {
+		return nil, l.errf(s.Pos(), "range over a channel binds a single value")
+	}
+	src, err := l.lowerExpr(s.X)
+	if err != nil {
+		return nil, err
+	}
+	valName := rangeIdent(s.Key)
+	if valName == "" {
+		valName = "_"
+	}
+	okName := seqName("_ok", l.rangeSeq)
+	l.rangeSeq++
+	body, err := l.lowerLoopBlock(s.Body, label)
+	if err != nil {
+		return nil, err
+	}
+	recv := &ir.TupleAssign{
+		Names: []string{valName, okName},
+		Value: &ir.Intrinsic{Name: "chan_recv_ok", Args: []ir.Expr{src}},
+	}
+	brk := &ir.IfStmt{
+		Cond: &ir.UnaryExpr{Op: "!", X: &ir.Ident{Name: okName}},
+		Then: []ir.Stmt{&ir.Break{}},
+	}
+	loop := &ir.ForStmt{Body: append([]ir.Stmt{recv, brk}, body...), Label: label}
+	return []ir.Stmt{loop}, nil
 }
 
 func (l *lowerer) lowerExpr(e ast.Expr) (ir.Expr, error) {
@@ -4449,6 +4522,8 @@ func (l *lowerer) lowerBuiltin(e *ast.CallExpr, fun *ast.Ident, _ *types.Builtin
 		return l.lowerDelete(e)
 	case "clear":
 		return l.lowerClear(e)
+	case "close":
+		return l.lowerClose(e)
 	case "recover":
 		if len(e.Args) != 0 {
 			return nil, l.errf(e.Pos(), "recover takes no arguments")
@@ -4496,6 +4571,25 @@ func (l *lowerer) lowerClear(e *ast.CallExpr) (ir.Expr, error) {
 		return nil, err
 	}
 	return &ir.Intrinsic{Name: "_map_clear", Args: []ir.Expr{m}}, nil
+}
+
+// lowerClose lowers close(ch) to the chan_close intrinsic, which marks the
+// channel closed so future sends panic and pending and future receives return
+// the zero value with ok false. Closing a nil channel or an already closed
+// channel panics, which the intrinsic reproduces, so close carries the panic
+// behavior the crash guard accounts for.
+func (l *lowerer) lowerClose(e *ast.CallExpr) (ir.Expr, error) {
+	if len(e.Args) != 1 {
+		return nil, l.errf(e.Pos(), "close takes one argument")
+	}
+	if _, ok := l.pkg.Info.TypeOf(e.Args[0]).Underlying().(*types.Chan); !ok {
+		return nil, l.errf(e.Pos(), "close of %s is not supported yet", l.pkg.Info.TypeOf(e.Args[0]))
+	}
+	ch, err := l.lowerExpr(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Intrinsic{Name: "chan_close", Args: []ir.Expr{ch}}, nil
 }
 
 // lowerCopy lowers copy(dst, src) to the _slice_copy intrinsic, which moves the
@@ -4575,17 +4669,23 @@ func (l *lowerer) lowerMake(e *ast.CallExpr) (ir.Expr, error) {
 	}
 	if ch, ok := t.Underlying().(*types.Chan); ok {
 		// An unbuffered channel is a rendezvous, capacity zero. A buffered channel
-		// takes a capacity argument and waits on its own slice. The element zero
-		// factory is what a receive on a closed channel returns, built fresh each
-		// call so a struct zero is never shared.
+		// carries a capacity argument, which the Chan wrapper reads to block a send
+		// only once the buffer is full. The element zero factory is what a receive on
+		// a closed channel returns, built fresh each call so a struct zero is never
+		// shared.
+		capacity := ir.Expr(&ir.IntLit{Text: "0"})
 		if len(e.Args) > 1 {
-			return nil, l.errf(e.Pos(), "a buffered channel is not supported yet")
+			cap, err := l.lowerExpr(e.Args[1])
+			if err != nil {
+				return nil, err
+			}
+			capacity = cap
 		}
 		zero, err := l.zeroValueOfType(ch.Elem(), e.Pos())
 		if err != nil {
 			return nil, err
 		}
-		return &ir.Intrinsic{Name: "Chan", Args: []ir.Expr{&ir.IntLit{Text: "0"}, &ir.Lambda{Body: zero}}}, nil
+		return &ir.Intrinsic{Name: "Chan", Args: []ir.Expr{capacity, &ir.Lambda{Body: zero}}}, nil
 	}
 	slice, ok := t.Underlying().(*types.Slice)
 	if !ok {

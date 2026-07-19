@@ -1,7 +1,6 @@
 package build
 
 import (
-	"path/filepath"
 	"testing"
 )
 
@@ -62,14 +61,94 @@ func TestChannelEmit(t *testing.T) {
 	}
 }
 
-// TestBufferedChannelDiagnosed pins that a buffered channel is diagnosed rather
-// than silently treated as unbuffered, since its capacity changes the blocking
-// behavior and it lands on its own slice.
-func TestBufferedChannelDiagnosed(t *testing.T) {
+// TestBufferedChannel checks the buffered surface against go run. A buffered
+// channel lets a sender deposit up to the capacity without a waiting receiver, so
+// a producer can run ahead, and a full channel blocks the next send until a
+// receive frees a slot. close then lets a range drain what is buffered and stop.
+func TestBufferedChannel(t *testing.T) {
 	t.Parallel()
-	src := writeModule(t, "package main\n\nfunc main() {\n\tch := make(chan int, 4)\n\t_ = ch\n}\n")
-	out := filepath.Join(t.TempDir(), "out")
-	if _, err := Build(src, out); err == nil {
-		t.Fatal("expected a diagnostic for a buffered channel, got none")
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{
+			"a buffered channel takes several sends before any receive",
+			"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tch := make(chan int, 3)\n\tch <- 1\n\tch <- 2\n\tch <- 3\n\tfmt.Println(<-ch, <-ch, <-ch)\n}\n",
+		},
+		{
+			"a range over a closed buffered channel drains it and stops",
+			"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tch := make(chan int, 3)\n\tch <- 1\n\tch <- 2\n\tch <- 3\n\tclose(ch)\n\ttotal := 0\n\tfor v := range ch {\n\t\ttotal += v\n\t}\n\tfmt.Println(total)\n}\n",
+		},
+		{
+			"a full buffered channel blocks the sender until a receiver frees a slot",
+			"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tch := make(chan int, 1)\n\tdone := make(chan bool)\n\tgo func() {\n\t\tch <- 1\n\t\tch <- 2\n\t\tclose(ch)\n\t\tdone <- true\n\t}()\n\tfmt.Println(<-ch)\n\tfmt.Println(<-ch)\n\t<-done\n}\n",
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestChannelCloseAndCommaOk checks close and the two-value receive against go
+// run. A comma-ok receive reports whether the channel was still open, so a reader
+// can tell a real zero from a closed channel, and a range over a closed channel
+// stops once it has drained the buffer.
+func TestChannelCloseAndCommaOk(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{
+			"a comma-ok receive reports open then closed",
+			"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tch := make(chan int, 1)\n\tch <- 7\n\tclose(ch)\n\tv, ok := <-ch\n\tfmt.Println(v, ok)\n\tv, ok = <-ch\n\tfmt.Println(v, ok)\n}\n",
+		},
+		{
+			"a range over a closed unbuffered channel sees every sent value",
+			"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tch := make(chan int)\n\tgo func() {\n\t\tfor i := 0; i < 4; i++ {\n\t\t\tch <- i\n\t\t}\n\t\tclose(ch)\n\t}()\n\tsum := 0\n\tfor v := range ch {\n\t\tsum += v\n\t}\n\tfmt.Println(sum)\n}\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProgramMatchesGo(t, tt.source)
+		})
+	}
+}
+
+// TestBufferedChannelEmit pins the buffered forms: make of a buffered channel
+// carries its capacity, close routes through the close helper, a comma-ok receive
+// keeps the ok flag through the two-value helper, and a range over a channel
+// becomes a while loop that receives and breaks on the ok flag.
+func TestBufferedChannelEmit(t *testing.T) {
+	t.Parallel()
+	src := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tch := make(chan int, 2)\n\tch <- 1\n\tclose(ch)\n\tv, ok := <-ch\n\tfmt.Println(v, ok)\n\tfor x := range ch {\n\t\tfmt.Println(x)\n\t}\n}\n"
+	got := emitOf(t, src)
+	for _, want := range []string{
+		"_hebirt.Chan(2, lambda: 0)",
+		"_hebirt.chan_close(ch)",
+		"_hebirt.chan_recv_ok(ch)",
+	} {
+		if !bytesContains(got, want) {
+			t.Errorf("buffered channel emit missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestCloseClosedChannelCrashes pins that closing an already closed channel
+// crashes the Go way, a GoPanic that escapes main and exits two, rather than
+// passing silently.
+func TestCloseClosedChannelCrashes(t *testing.T) {
+	t.Parallel()
+	assertProgramCrashesLikeGo(t, "package main\n\nfunc main() {\n\tch := make(chan int)\n\tclose(ch)\n\tclose(ch)\n}\n")
+}
+
+// TestSendOnClosedChannelCrashes pins that a send on a closed channel crashes the
+// Go way rather than depositing into a closed buffer.
+func TestSendOnClosedChannelCrashes(t *testing.T) {
+	t.Parallel()
+	assertProgramCrashesLikeGo(t, "package main\n\nfunc main() {\n\tch := make(chan int, 1)\n\tclose(ch)\n\tch <- 1\n}\n")
 }
