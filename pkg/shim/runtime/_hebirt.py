@@ -11,6 +11,8 @@ import math
 import os
 import struct
 import sys
+import threading
+import time
 
 
 def go_str(value):
@@ -905,6 +907,48 @@ def _crash(p):
     sys.stderr.write("goroutine 1 [running]:\n")
     sys.stderr.flush()
     os._exit(2)
+
+
+# Goroutines. A Go goroutine is an independently scheduled call, and the compiled
+# tier runs each on its own OS thread so a real stack backs local escapes and a
+# blocking call blocks only its own thread. The thread is a daemon, so it is
+# abandoned when main returns rather than joined, exactly as Go drops live
+# goroutines when the main goroutine finishes.
+
+
+def go(fn, *args):
+    """Spawn fn(*args) on a new daemon OS thread, Go's go statement.
+
+    A panic that runs off the top of a goroutine crashes the whole program, it
+    does not just kill the one goroutine, so the body runs under a handler that
+    turns an escaping panic into the same banner and exit 2 an unrecovered panic
+    in main produces. A Python thread otherwise prints a traceback and lets the
+    process live on, which would silently diverge from Go, so the fallback catch
+    forces the crash for any escaping exception. The arguments are evaluated in
+    the caller before go is entered, matching Go's evaluation of a go statement's
+    call arguments at the point the statement runs.
+    """
+
+    def _run():
+        try:
+            fn(*args)
+        except GoPanic as _p:
+            _crash(_p)
+        except BaseException as _exc:  # noqa: BLE001
+            _crash(GoPanic(_exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _sleep(ns):
+    """Pause the current goroutine for a Duration, Go's time.Sleep.
+
+    The argument is a Duration in nanoseconds, and Python's time.sleep takes
+    seconds, so the count is scaled. A zero or negative Duration returns at once,
+    the way Go's time.Sleep does, without touching the clock.
+    """
+    if ns > 0:
+        time.sleep(ns / 1e9)
 
 
 # String helpers. A Go string is Python bytes, so byte indexing, length, and
